@@ -1,0 +1,2019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vsoul AI Studio · Local 300 DPI Photo & Uniform Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #090b0e;
+      --surface: #111419;
+      --surface-2: #181d24;
+      --surface-hover: #1f252e;
+      --border: #242b35;
+      --border-focus: #3d4757;
+      --gold: #d4af37;
+      --gold-dim: #9a7b20;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --text: #f0f3f6;
+      --muted: #8b949e;
+      --muted-dark: #4b5563;
+      --success: #22c55e;
+      --warn: #eab308;
+      --error: #ef4444;
+      --radius: 12px;
+      --font-display: 'Cinzel', serif;
+      --font-body: 'Plus Jakarta Sans', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-body);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ─── Header ─── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.9rem 2rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .logo-name {
+      font-family: var(--font-display);
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      background: linear-gradient(135deg, #fff 40%, var(--gold) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .logo-tag {
+      font-family: var(--font-mono);
+      font-size: 0.65rem;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      border-left: 1px solid var(--border);
+      padding-left: 0.75rem;
+      text-transform: uppercase;
+    }
+    .header-pills {
+      display: flex;
+      gap: 0.6rem;
+      align-items: center;
+    }
+    .pill {
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      padding: 0.3rem 0.7rem;
+      border-radius: 9999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .pill.active {
+      color: var(--success);
+      border-color: rgba(34,197,94,0.3);
+      background: rgba(34,197,94,0.06);
+    }
+
+    /* ─── Layout ─── */
+    .app {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 1.5rem;
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 1.5rem 2rem;
+      flex: 1;
+      width: 100%;
+    }
+    @media (max-width: 1024px) {
+      .app { grid-template-columns: 1fr; }
+    }
+
+    /* ─── Workspace ─── */
+    .workspace {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      min-width: 0;
+    }
+
+    .workspace-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .section-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+    }
+    .section-sub {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.15rem;
+    }
+
+    /* ─── Primary Tabs ─── */
+    .tabs-nav {
+      display: flex;
+      gap: 0.4rem;
+      background: var(--surface);
+      padding: 0.3rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 0.5rem 1.1rem;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .tab-btn:hover {
+      color: #fff;
+      background: var(--surface-2);
+    }
+    .tab-btn.active {
+      color: #fff;
+      background: var(--surface-2);
+      border: 1px solid var(--border-focus);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+
+    /* ─── Dropzones ─── */
+    .dropzone {
+      background: var(--surface);
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 180px;
+    }
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--gold);
+      background: rgba(212,175,55,0.03);
+    }
+    .dz-icon {
+      font-size: 2.2rem;
+      margin-bottom: 0.4rem;
+      line-height: 1;
+    }
+    .dz-text {
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: #fff;
+      margin-bottom: 0.25rem;
+    }
+    .dz-sub {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+
+    /* Preview inside dropzone */
+    .dz-preview-wrap {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+      width: 100%;
+    }
+    .dz-preview-img {
+      max-height: 140px;
+      max-width: 220px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      object-fit: contain;
+      background: #000;
+    }
+    .dz-preview-meta {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--text);
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    /* ─── Buttons ─── */
+    .btn-primary {
+      background: linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);
+      color: #000;
+      font-family: var(--font-body);
+      font-size: 0.88rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      padding: 0.85rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      width: 100%;
+    }
+    .btn-primary:hover:not(:disabled) {
+      opacity: 0.92;
+      box-shadow: 0 4px 16px rgba(212,175,55,0.3);
+      transform: translateY(-1px);
+    }
+    .btn-primary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-action {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      padding: 0.6rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn-action:hover {
+      background: var(--surface-hover);
+      border-color: var(--border-focus);
+    }
+
+    /* ─── Comparison / Output ─── */
+    .compare-wrap {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+    }
+    @media (max-width: 640px) {
+      .compare-wrap { grid-template-columns: 1fr; }
+    }
+    .compare-box {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      align-items: center;
+      background: var(--surface-2);
+      padding: 0.85rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .compare-header {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .compare-label {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #fff;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .badge-info {
+      font-family: var(--font-mono);
+      font-size: 0.62rem;
+      color: var(--gold);
+      background: rgba(212,175,55,0.1);
+      padding: 0.2rem 0.45rem;
+      border-radius: 4px;
+      border: 1px solid rgba(212,175,55,0.25);
+    }
+    .compare-img {
+      width: 100%;
+      max-height: 480px;
+      object-fit: contain;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #050608;
+    }
+    .enhance-after-stage {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border-radius: 6px;
+      background: #050608;
+    }
+    .enhance-after-stage .compare-img {
+      display: block;
+      transition: filter 180ms ease, opacity 220ms ease;
+    }
+    .enhance-after-stage.is-processing .compare-img {
+      filter: brightness(0.3) saturate(0.45);
+    }
+    .enhance-after-stage.is-revealing .compare-img {
+      animation: enhance-result-reveal 360ms ease-out;
+    }
+    .enhance-result-overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 0.7rem;
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      background: rgba(5, 6, 8, 0.86);
+      pointer-events: none;
+    }
+    .enhance-after-stage.is-processing .enhance-result-overlay { display: flex; }
+    .enhance-result-spinner {
+      width: 2rem;
+      height: 2rem;
+      border: 3px solid rgba(212, 175, 55, 0.22);
+      border-top-color: var(--gold);
+      border-radius: 50%;
+      animation: enhance-result-spin 0.85s linear infinite;
+    }
+    @keyframes enhance-result-spin { to { transform: rotate(360deg); } }
+    @keyframes enhance-result-reveal {
+      from { opacity: 0.35; transform: scale(1.015); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .uniform-after-stage {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border-radius: 6px;
+      background: #050608;
+    }
+    .uniform-after-stage .compare-img {
+      display: block;
+      transition: filter 180ms ease, opacity 220ms ease;
+    }
+    .uniform-after-stage.is-processing .compare-img { filter: brightness(0.3) saturate(0.45); }
+    .uniform-after-stage.is-revealing .compare-img { animation: enhance-result-reveal 360ms ease-out; }
+    .uniform-result-overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 0.7rem;
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      background: rgba(5, 6, 8, 0.86);
+      pointer-events: none;
+    }
+    .uniform-after-stage.is-processing .uniform-result-overlay { display: flex; }
+    .uniform-fit-animation {
+      position: relative;
+      width: 92px;
+      height: 112px;
+    }
+    .uniform-fit-head {
+      position: absolute;
+      top: 4px;
+      left: 34px;
+      width: 24px;
+      height: 29px;
+      border: 2px solid rgba(255,255,255,0.82);
+      border-radius: 48% 48% 44% 44%;
+      background: rgba(255,255,255,0.08);
+    }
+    .uniform-fit-neck {
+      position: absolute;
+      top: 30px;
+      left: 41px;
+      width: 10px;
+      height: 13px;
+      border: 2px solid rgba(255,255,255,0.72);
+      border-top: 0;
+    }
+    .uniform-fit-outline {
+      position: absolute;
+      left: 11px;
+      bottom: 3px;
+      width: 70px;
+      height: 65px;
+      border: 2px dashed rgba(255,255,255,0.32);
+      border-radius: 15px 15px 7px 7px;
+    }
+    .uniform-fit-garment {
+      position: absolute;
+      left: 8px;
+      top: 35px;
+      width: 76px;
+      height: 70px;
+      border: 2px solid var(--gold);
+      border-radius: 15px 15px 7px 7px;
+      background: rgba(17, 29, 45, 0.9);
+      box-shadow: 0 0 18px rgba(215, 169, 73, 0.22);
+      animation: uniform-garment-fit 1.7s ease-in-out infinite;
+    }
+    .uniform-fit-garment::before {
+      content: '';
+      position: absolute;
+      left: 23px;
+      top: -2px;
+      width: 26px;
+      height: 17px;
+      border: 2px solid var(--gold);
+      border-top: 0;
+      border-radius: 0 0 13px 13px;
+      background: #111d2d;
+    }
+    .uniform-fit-garment::after {
+      content: '';
+      position: absolute;
+      top: 17px;
+      bottom: 5px;
+      left: 36px;
+      width: 2px;
+      background: rgba(215, 169, 73, 0.75);
+    }
+    @keyframes uniform-garment-fit {
+      0% { opacity: 0; transform: translateY(-18px) scale(0.9); }
+      24% { opacity: 1; transform: translateY(0) scale(1.03); }
+      42%, 68% { opacity: 1; transform: translateY(0) scale(1); }
+      100% { opacity: 0.42; transform: translateY(2px) scale(0.98); }
+    }
+
+    /* ─── Status & Progress ─── */
+    .progress-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+    }
+    .progress-title { color: #fff; font-weight: 600; }
+    .progress-pct { color: var(--gold); }
+    .progress-track {
+      height: 6px;
+      background: var(--surface-2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--gold-dim), var(--gold));
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+    .progress-msg {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+
+    /* ─── Bulk Batch List ─── */
+    .bulk-stats-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.75rem;
+    }
+    .bulk-stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem;
+      text-align: center;
+    }
+    .bulk-stat-num {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #fff;
+      display: block;
+    }
+    .bulk-stat-label {
+      font-family: var(--font-mono);
+      font-size: 0.62rem;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    .bulk-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      max-height: 420px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .bulk-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem 0.85rem;
+      display: grid;
+      grid-template-columns: 48px 1fr auto;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .bulk-thumb {
+      width: 48px;
+      height: 48px;
+      border-radius: 6px;
+      object-fit: cover;
+      border: 1px solid var(--border);
+      background: #000;
+    }
+    .bulk-item-name {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bulk-item-status {
+      font-family: var(--font-mono);
+      font-size: 0.62rem;
+      color: var(--muted);
+    }
+
+    /* ─── Sidebar ─── */
+    aside {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .card-title {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .control-label {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.35rem;
+      display: block;
+    }
+    .select-input {
+      width: 100%;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      padding: 0.55rem;
+      border-radius: 7px;
+      outline: none;
+    }
+    .select-input:focus { border-color: var(--border-focus); }
+    .resolution-presets {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.45rem;
+    }
+    .resolution-preset {
+      height: 42px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface-2);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .resolution-preset:hover,
+    .resolution-preset.is-selected { border-color: var(--border-focus); }
+    .resolution-preset.is-selected { color: var(--accent); box-shadow: 0 0 12px rgba(59,130,246,0.14); }
+    .backdrop-presets {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.65rem;
+    }
+    .backdrop-preset {
+      min-height: 82px;
+      padding: 0.6rem 0.4rem;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface-2);
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.45rem;
+    }
+    .backdrop-preset:hover,
+    .backdrop-preset.is-selected { border-color: var(--border-focus); }
+    .backdrop-preset.is-selected { box-shadow: 0 0 14px rgba(59,130,246,0.16); }
+    .backdrop-swatch {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.28);
+    }
+    .backdrop-custom {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      margin-top: 0.75rem;
+    }
+    .backdrop-custom-swatch {
+      width: 52px;
+      height: 40px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface-2);
+      cursor: pointer;
+    }
+    .backdrop-custom-swatch input[type="color"] {
+      width: 100%;
+      height: 100%;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+    }
+    .backdrop-hex-input {
+      min-width: 0;
+      flex: 1;
+      height: 40px;
+      padding: 0 0.7rem;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface-2);
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      outline: none;
+    }
+    .backdrop-hex-input:focus { border-color: var(--border-focus); }
+    @media (max-width: 520px) {
+      .backdrop-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    /* ─── Toast ─── */
+    .toast-wrap {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      z-index: 1000;
+    }
+    .toast {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 0.65rem 1rem;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      animation: fadeIn 0.2s ease;
+    }
+    .toast.success { border-color: rgba(34,197,94,0.5); color: var(--success); }
+    .toast.error { border-color: rgba(239,68,68,0.5); color: var(--error); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+
+  <!-- ─── Header ─── -->
+  <header>
+    <div class="logo">
+      <span class="logo-name">Vsoul</span>
+      <span class="logo-tag">Self-Hosted AI · 100% Local GPU</span>
+    </div>
+    <div class="header-pills">
+      <span class="pill" id="pill-gpu">GPU: Detecting…</span>
+      <span class="pill" id="pill-backend">Backend: Connecting…</span>
+      <span class="pill active">Offline 300 DPI</span>
+    </div>
+  </header>
+
+  <!-- ─── Main Content ─── -->
+  <div class="app">
+
+    <!-- ─── Left: Workspace ─── -->
+    <div class="workspace">
+
+      <!-- Navigation & Title Header -->
+      <div class="workspace-header">
+        <div>
+          <h1 class="section-title">AI Portrait & Uniform Studio</h1>
+          <p class="section-sub">Local neural inference · Qwen-Image-Edit & CatVTON Virtual Try-On</p>
+        </div>
+        <div class="tabs-nav">
+          <button class="tab-btn active" id="tab-enhance" onclick="switchTab('enhance')">✦ Enhance</button>
+          <button class="tab-btn" id="tab-uniform" onclick="switchTab('uniform')">👔 Uniform</button>
+          <button class="tab-btn" id="tab-bulk" onclick="switchTab('bulk')">⊞ Bulk</button>
+        </div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <!-- 1. ENHANCE PANEL (Qwen-Edit Studio Enhancer)                     -->
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <div id="enhance-panel" style="display:flex;flex-direction:column;gap:1.2rem;">
+
+        <!-- Single dropzone with interactive Preview -->
+        <div class="dropzone" id="enhance-dz" onclick="document.getElementById('enhance-file-input').click()">
+          <input type="file" id="enhance-file-input" accept="image/*" style="display:none" onchange="handleEnhanceFileSelect(this.files[0])" />
+
+          <div id="enhance-dz-empty">
+            <div class="dz-icon">✦</div>
+            <div class="dz-text">Drop student / portrait photo here</div>
+            <div class="dz-sub">PNG · JPG · WEBP · BMP — Qwen studio portrait generation</div>
+          </div>
+
+          <div class="dz-preview-wrap" id="enhance-dz-preview">
+            <img class="dz-preview-img" id="enhance-input-preview-img" src="" alt="Input Photo Preview" />
+            <div class="dz-preview-meta">
+              <span id="enhance-preview-name" style="font-weight:600;color:#fff;"></span>
+              <span class="badge-info" id="enhance-preview-dims"></span>
+              <span class="badge-info" id="enhance-preview-size"></span>
+            </div>
+            <div style="font-size:0.68rem;color:var(--gold);margin-top:0.2rem;">Click to change photo</div>
+          </div>
+        </div>
+
+        <!-- Quick Controls -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
+          <div>
+            <span class="control-label">Passport Backdrop</span>
+            <div class="backdrop-presets" data-backdrop-group="enhance" role="group" aria-label="Passport backdrop presets">
+              <button class="backdrop-preset" type="button" data-color="#DD6A61" aria-label="Red backdrop"><span class="backdrop-swatch" style="background:#DD6A61"></span><span>RED</span></button>
+              <button class="backdrop-preset" type="button" data-color="#77BF91" aria-label="Green backdrop"><span class="backdrop-swatch" style="background:#77BF91"></span><span>GREEN</span></button>
+              <button class="backdrop-preset" type="button" data-color="#047EF6" aria-label="Blue backdrop"><span class="backdrop-swatch" style="background:#5D98C4"></span><span>BLUE</span></button>
+              <button class="backdrop-preset is-selected" type="button" data-color="#FFFFFF" aria-label="White backdrop" aria-pressed="true"><span class="backdrop-swatch" style="background:#FFFFFF"></span><span>WHITE</span></button>
+            </div>
+            <div class="backdrop-custom">
+              <label class="backdrop-custom-swatch" for="enhance-bg-color" title="Custom backdrop color"><input id="enhance-bg-color" type="color" value="#FFFFFF" aria-label="Custom passport backdrop color" /></label>
+              <input class="backdrop-hex-input" id="enhance-bg-hex" value="#FFFFFF" maxlength="7" spellcheck="false" aria-label="Backdrop hex color" />
+            </div>
+          </div>
+          <div>
+            <span class="control-label">Print Export Resolution</span>
+            <div class="resolution-presets" data-resolution-group="enhance" role="group" aria-label="Print export resolution">
+              <button class="resolution-preset is-selected" type="button" data-factor="1" aria-pressed="true" title="Native studio resolution">1×</button>
+              <button class="resolution-preset" type="button" data-factor="2" aria-label="2 times high definition" title="High-definition print">2×</button>
+              <button class="resolution-preset" type="button" data-factor="4" aria-label="4 times ultra high definition" title="Ultra-HD large format">4×</button>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn-primary" id="enhance-run-btn" disabled onclick="startEnhance()">
+          ✦ Enhance Portrait
+        </button>
+
+        <!-- Progress Box with Cancel / Retry -->
+        <div class="progress-box" id="enhance-progress" style="display:none">
+          <div class="progress-header">
+            <span class="progress-title" id="enhance-progress-title">Enhancing Portrait</span>
+            <span class="progress-pct" id="enhance-pct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="enhance-fill" style="width:0%"></div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;">
+            <div class="progress-msg" id="enhance-msg" style="flex:1;">Processing…</div>
+            <div style="display:flex;gap:0.4rem;">
+              <button class="btn-action" id="enhance-cancel-btn" onclick="cancelEnhance()" style="font-size:0.68rem;padding:0.25rem 0.6rem;color:var(--error);border-color:rgba(239,68,68,0.3);">✕ Cancel</button>
+              <button class="btn-action" id="enhance-retry-btn" onclick="startEnhance()" style="display:none;font-size:0.68rem;padding:0.25rem 0.6rem;color:var(--gold);border-color:var(--gold-dim);">↻ Retry</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Before / After Compare Container -->
+        <div class="compare-wrap" id="enhance-compare" style="display:none">
+          <div class="compare-box">
+            <div class="compare-header">
+              <span class="compare-label">Original Photo (Before)</span>
+              <span class="badge-info" id="enhance-before-badge">Input Photo</span>
+            </div>
+            <img class="compare-img" id="enhance-img-before" src="" alt="Original Photo (Before)" />
+          </div>
+          <div class="compare-box">
+            <div class="compare-header">
+              <span class="compare-label">Enhanced Photo (After)</span>
+              <span class="badge-info" id="enhance-after-badge">300 DPI HD</span>
+            </div>
+            <div class="enhance-after-stage" id="enhance-after-stage">
+              <img class="compare-img" id="enhance-img-after" src="" alt="Enhanced Photo (After)" />
+              <div class="enhance-result-overlay" aria-live="polite">
+                <span class="enhance-result-spinner" aria-hidden="true"></span>
+                <span>Generating enhanced photo</span>
+              </div>
+            </div>
+            <div id="enhance-download-row" style="display:none;gap:0.5rem;width:100%;margin-top:0.4rem;">
+              <a id="enhance-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
+                ↓ Download Enhanced Image (<span id="enhance-dl-name-display"></span>)
+              </a>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <!-- 2. UNIFORM PANEL (Qwen VL + Qwen Image Edit)                    -->
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <div id="uniform-panel" style="display:none;flex-direction:column;gap:1.2rem;">
+
+        <!-- Two slots: Person + Uniform with Preview -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+          <div>
+            <span class="control-label" style="margin-bottom:0.4rem;">1. Student / Person Photo <span style="color:#ef4444;">*</span></span>
+            <div class="dropzone" id="person-dz" style="min-height:160px;" onclick="document.getElementById('uniform-person-input').click()">
+              <input type="file" id="uniform-person-input" accept="image/*" style="display:none" onchange="handleUniformPersonSelect(this.files[0])" />
+
+              <div id="uniform-person-empty">
+                <div class="dz-icon">👤</div>
+                <div class="dz-text" style="font-size:0.85rem;">Click or drop Student Photo</div>
+                <div class="dz-sub">The original face and neck are preserved while the uniform is fitted</div>
+              </div>
+
+              <div class="dz-preview-wrap" id="uniform-person-preview">
+                <img class="dz-preview-img" id="uniform-person-preview-img" src="" alt="Student Photo" />
+                <div class="dz-preview-meta">
+                  <span id="uniform-person-preview-name" style="font-weight:600;color:#fff;"></span>
+                  <span class="badge-info" id="uniform-person-preview-dims"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <span class="control-label" style="margin-bottom:0.4rem;">2. Uniform Template Photo <span style="color:#ef4444;">*</span></span>
+            <div class="dropzone" id="uniform-dz" style="min-height:160px;" onclick="document.getElementById('uniform-cloth-input').click()">
+              <input type="file" id="uniform-cloth-input" accept="image/*" style="display:none" onchange="handleUniformClothSelect(this.files[0])" />
+
+              <div id="uniform-cloth-empty">
+                <div class="dz-icon">👔</div>
+                <div class="dz-text" style="font-size:0.85rem;">Click or drop Uniform Photo</div>
+                <div class="dz-sub">Qwen uses this photo as the exact uniform reference</div>
+              </div>
+
+              <div class="dz-preview-wrap" id="uniform-cloth-preview">
+                <img class="dz-preview-img" id="uniform-cloth-preview-img" src="" alt="Uniform Template" />
+                <div class="dz-preview-meta">
+                  <span id="uniform-cloth-preview-name" style="font-weight:600;color:#fff;"></span>
+                  <span class="badge-info" id="uniform-cloth-preview-dims"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Backdrop -->
+        <div style="display:grid;grid-template-columns:minmax(0, 1fr);gap:0.75rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
+          <div>
+            <span class="control-label">Passport Backdrop</span>
+            <div class="backdrop-presets" data-backdrop-group="uniform" role="group" aria-label="Passport backdrop presets">
+              <button class="backdrop-preset" type="button" data-color="#DD6A61" aria-label="Red backdrop">
+                <span class="backdrop-swatch" style="background:#DD6A61"></span><span>RED</span>
+              </button>
+              <button class="backdrop-preset" type="button" data-color="#77BF91" aria-label="Green backdrop">
+                <span class="backdrop-swatch" style="background:#77BF91"></span><span>GREEN</span>
+              </button>
+              <button class="backdrop-preset is-selected" type="button" data-color="#047EF6" aria-label="Blue backdrop" aria-pressed="true">
+                <span class="backdrop-swatch" style="background:#047EF6"></span><span>BLUE</span>
+              </button>
+              <button class="backdrop-preset" type="button" data-color="#FFFFFF" aria-label="White backdrop">
+                <span class="backdrop-swatch" style="background:#FFFFFF"></span><span>WHITE</span>
+              </button>
+            </div>
+            <div class="backdrop-custom">
+              <label class="backdrop-custom-swatch" for="uniform-bg-color" title="Custom backdrop color">
+                <input id="uniform-bg-color" type="color" value="#047EF6" aria-label="Custom passport backdrop color" />
+              </label>
+              <input class="backdrop-hex-input" id="uniform-bg-hex" value="#047EF6" maxlength="7" spellcheck="false" aria-label="Backdrop hex color" />
+            </div>
+          </div>
+        </div>
+
+        <button class="btn-primary" id="uniform-run-btn" disabled onclick="startUniformSwap()">
+          👔 Swap School Uniform
+        </button>
+
+        <!-- Progress Box with Cancel / Retry -->
+        <div class="progress-box" id="uniform-progress" style="display:none">
+          <div class="progress-header">
+            <span class="progress-title">Qwen Uniform Fitting</span>
+            <span class="progress-pct" id="uniform-pct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="uniform-fill" style="width:0%"></div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;">
+            <div class="progress-msg" id="uniform-msg" style="flex:1;">Initializing…</div>
+            <div style="display:flex;gap:0.4rem;">
+              <button class="btn-action" id="uniform-cancel-btn" onclick="cancelUniformSwap()" style="font-size:0.68rem;padding:0.25rem 0.6rem;color:var(--error);border-color:rgba(239,68,68,0.3);">✕ Cancel</button>
+              <button class="btn-action" id="uniform-retry-btn" onclick="startUniformSwap()" style="display:none;font-size:0.68rem;padding:0.25rem 0.6rem;color:var(--gold);border-color:var(--gold-dim);">↻ Retry</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Uniform Result Compare -->
+        <div class="compare-wrap" id="uniform-compare" style="display:none">
+          <div class="compare-box">
+            <div class="compare-header">
+              <span class="compare-label">Original Person (Before)</span>
+              <span class="badge-info">Input Photo</span>
+            </div>
+            <img class="compare-img" id="uniform-img-before" src="" alt="Original Person (Before)" />
+          </div>
+          <div class="compare-box">
+            <div class="compare-header">
+              <span class="compare-label">Uniform Fitted (After)</span>
+              <span class="badge-info" id="uniform-after-badge">Source Preview</span>
+            </div>
+            <div class="uniform-after-stage" id="uniform-after-stage">
+              <img class="compare-img" id="uniform-img-after" src="" alt="Uniform Fitted (After)" />
+              <div class="uniform-result-overlay" aria-live="polite">
+                <div class="uniform-fit-animation" aria-hidden="true">
+                  <span class="uniform-fit-head"></span>
+                  <span class="uniform-fit-neck"></span>
+                  <span class="uniform-fit-outline"></span>
+                  <span class="uniform-fit-garment"></span>
+                </div>
+                <span id="uniform-loading-copy">Aligning uniform</span>
+              </div>
+            </div>
+            <div id="uniform-download-row" style="display:none;gap:0.5rem;width:100%;margin-top:0.4rem;">
+              <a id="uniform-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
+                ↓ Download Uniform Portrait (<span id="uniform-dl-name-display"></span>)
+              </a>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <!-- 3. BULK PANEL (Qwen-Edit Bulk Enhancer)                          -->
+      <!-- ════════════════════════════════════════════════════════════════ -->
+      <div id="bulk-panel" style="display:none;flex-direction:column;gap:1.2rem;">
+
+        <!-- Multi-file dropzone -->
+        <div class="dropzone" id="bulk-dz" onclick="document.getElementById('bulk-files-input').click()">
+          <input type="file" id="bulk-files-input" accept="image/*" multiple style="display:none" onchange="handleBulkFilesSelect(this.files)" />
+          <div class="dz-icon">⊞</div>
+          <div class="dz-text" style="font-size:1.05rem;">Select or drop multiple student portraits</div>
+          <div class="dz-sub">PNG · JPG · WEBP · BMP — Qwen-Edit Batch Studio Relighting & Enhancer · up to 200 photos</div>
+        </div>
+
+        <!-- Batch Studio Settings -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
+          <div>
+            <span class="control-label">Batch Studio Backdrop</span>
+            <div class="backdrop-presets" data-backdrop-group="bulk" role="group" aria-label="Batch studio backdrop presets">
+              <button class="backdrop-preset" type="button" data-color="#DD6A61" aria-label="Red backdrop"><span class="backdrop-swatch" style="background:#DD6A61"></span><span>RED</span></button>
+              <button class="backdrop-preset" type="button" data-color="#77BF91" aria-label="Green backdrop"><span class="backdrop-swatch" style="background:#77BF91"></span><span>GREEN</span></button>
+              <button class="backdrop-preset is-selected" type="button" data-color="#047EF6" aria-label="Blue backdrop" aria-pressed="true"><span class="backdrop-swatch" style="background:#5D98C4"></span><span>BLUE</span></button>
+              <button class="backdrop-preset" type="button" data-color="#FFFFFF" aria-label="White backdrop"><span class="backdrop-swatch" style="background:#FFFFFF"></span><span>WHITE</span></button>
+            </div>
+            <div class="backdrop-custom">
+              <label class="backdrop-custom-swatch" for="bulk-bg-color" title="Custom backdrop color"><input id="bulk-bg-color" type="color" value="#047EF6" aria-label="Custom batch backdrop color" /></label>
+              <input class="backdrop-hex-input" id="bulk-bg-hex" value="#047EF6" maxlength="7" spellcheck="false" aria-label="Batch backdrop hex color" />
+            </div>
+          </div>
+          <div>
+            <span class="control-label">Batch Export Resolution</span>
+            <div class="resolution-presets" data-resolution-group="bulk" role="group" aria-label="Batch export resolution">
+              <button class="resolution-preset is-selected" type="button" data-factor="1" aria-pressed="true" title="Native studio resolution">1×</button>
+              <button class="resolution-preset" type="button" data-factor="2" aria-label="2 times high definition" title="High-definition print">2×</button>
+              <button class="resolution-preset" type="button" data-factor="4" aria-label="4 times ultra high definition" title="Ultra-HD print">4×</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stats Bar -->
+        <div class="bulk-stats-bar" id="bulk-stats-bar" style="display:none">
+          <div class="bulk-stat">
+            <span class="bulk-stat-num" id="bs-total">0</span>
+            <span class="bulk-stat-label">Selected</span>
+          </div>
+          <div class="bulk-stat">
+            <span class="bulk-stat-num" id="bs-done" style="color:var(--success)">0</span>
+            <span class="bulk-stat-label">Completed</span>
+          </div>
+          <div class="bulk-stat">
+            <span class="bulk-stat-num" id="bs-proc" style="color:var(--gold)">0</span>
+            <span class="bulk-stat-label">Processing</span>
+          </div>
+          <div class="bulk-stat">
+            <span class="bulk-stat-num" id="bs-fail" style="color:var(--error)">0</span>
+            <span class="bulk-stat-label">Failed</span>
+          </div>
+        </div>
+
+        <!-- Overall Progress -->
+        <div class="progress-box" id="bulk-overall-bar" style="display:none">
+          <div class="progress-header">
+            <span class="progress-title">Batch Progress</span>
+            <span class="progress-pct" id="bulk-overall-pct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="bulk-overall-fill" style="width:0%"></div>
+          </div>
+          <div class="progress-msg" id="bulk-overall-msg">—</div>
+        </div>
+
+        <!-- Items Queue List -->
+        <div class="bulk-list" id="bulk-list"></div>
+
+        <!-- Action Row -->
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+          <button class="btn-primary" id="bulk-start-btn" disabled onclick="startBulkEnhance()" style="flex:1;">
+            ✦ Enhance All (Qwen Bulk)
+          </button>
+          <button class="btn-action" id="bulk-cancel-btn" onclick="cancelBulkEnhance()" style="display:none;color:var(--error);border-color:rgba(239,68,68,0.3);">
+            ✕ Cancel Batch
+          </button>
+          <button class="btn-action" id="bulk-retry-btn" onclick="retryFailedBulk()" style="display:none;color:var(--warn);border-color:rgba(234,179,8,0.3);">
+            ↻ Retry Failed
+          </button>
+          <button class="btn-action" id="bulk-zip-btn" onclick="downloadAllAsZip()" style="display:none;color:var(--gold);border-color:var(--gold-dim);">
+            ↓ ZIP All
+          </button>
+          <button class="btn-action" id="bulk-clear-btn" onclick="clearBulkQueue()" style="display:none;">
+            ✕ Clear
+          </button>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- ─── Right: System & Info Sidebar ─── -->
+    <aside>
+
+      <!-- GPU & System Card -->
+      <div class="card">
+        <div class="card-title">Local Engine Hardware</div>
+        <div style="font-family:var(--font-mono);font-size:0.75rem;line-height:1.6;color:var(--text);" id="sidebar-gpu-info">
+          <div><span style="color:var(--muted)">Device:</span> NVIDIA RTX 5050 Laptop GPU</div>
+          <div><span style="color:var(--muted)">Acceleration:</span> CUDA 13.0 Enabled</div>
+          <div><span style="color:var(--muted)">Privacy:</span> 100% On-Premise / Local</div>
+        </div>
+      </div>
+
+      <!-- Pipeline Specifications -->
+      <div class="card">
+        <div class="card-title">Active AI Pipelines</div>
+        <div style="display:flex;flex-direction:column;gap:0.6rem;font-size:0.75rem;color:var(--text);">
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span>✦ Qwen Studio Enhancer</span>
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span>👔 CatVTON Try-On</span>
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span>✂ BiRefNet-HR Matting</span>
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span>🔍 Real-ESRGAN Upscale</span>
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span>✨ GFPGAN Face Restorer</span>
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Export Presets -->
+      <div class="card">
+        <div class="card-title">ID Standard Presets</div>
+        <div style="font-family:var(--font-mono);font-size:0.7rem;color:var(--muted);line-height:1.5;">
+          <div>• Aspect Ratio: 3:4 Studio Canvas</div>
+          <div>• Resolution: 600 × 800 to 1152 × 1536 px</div>
+          <div>• Print Quality: 300 DPI Standard</div>
+          <div>• Standard Blue: <span style="color:#047ef6">#047EF6</span></div>
+          <div>• Standard White: <span style="color:#ffffff">#FFFFFF</span></div>
+        </div>
+      </div>
+
+    </aside>
+
+  </div>
+
+  <!-- ─── Toast Container ─── -->
+  <div class="toast-wrap" id="toasts"></div>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script>
+    const API = '/api';
+
+    // ─── State ─────────────────────────────────────────────────────────────
+    let enhanceState = {
+      file: null,
+      processing: false,
+      origName: '',
+      abortController: null,
+      ticker: null
+    };
+
+    let uniformState = {
+      personFile: null,
+      uniformFile: null,
+      jobId: null,
+      pollInterval: null,
+      abortController: null
+    };
+
+    let bulkState = {
+      items: [],
+      processing: false,
+      cancelled: false
+    };
+
+    // ─── Toast ─────────────────────────────────────────────────────────────
+    function toast(msg, type = 'info') {
+      const wrap = document.getElementById('toasts');
+      const el = document.createElement('div');
+      el.className = `toast ${type}`;
+      el.textContent = msg;
+      wrap.appendChild(el);
+      setTimeout(() => {
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 300);
+      }, 3500);
+    }
+
+    // ─── Tab Switching ─────────────────────────────────────────────────────
+    function switchTab(tab) {
+      ['enhance', 'uniform', 'bulk'].forEach(t => {
+        const btn = document.getElementById(`tab-${t}`);
+        const panel = document.getElementById(`${t}-panel`);
+        if (btn) btn.classList.toggle('active', t === tab);
+        if (panel) panel.style.display = t === tab ? 'flex' : 'none';
+      });
+    }
+
+    // ─── 1. ENHANCE (Single File Qwen Studio) ──────────────────────────────
+    function handleEnhanceFileSelect(file) {
+      if (!file) return;
+      enhanceState.file = file;
+      enhanceState.origName = file.name;
+
+      const r = new FileReader();
+      r.onload = e => {
+        const dataUrl = e.target.result;
+
+        // Render inside Dropzone Preview
+        document.getElementById('enhance-dz-empty').style.display = 'none';
+        const dzPreview = document.getElementById('enhance-dz-preview');
+        dzPreview.style.display = 'flex';
+
+        const previewImg = document.getElementById('enhance-input-preview-img');
+        previewImg.src = dataUrl;
+        document.getElementById('enhance-preview-name').textContent = file.name;
+        document.getElementById('enhance-preview-size').textContent = `${(file.size / 1024).toFixed(1)} KB`;
+
+        previewImg.onload = () => {
+          const dims = `${previewImg.naturalWidth}×${previewImg.naturalHeight} px`;
+          document.getElementById('enhance-preview-dims').textContent = dims;
+          document.getElementById('enhance-before-badge').textContent = `Input (${dims})`;
+        };
+
+        // Render immediately in Comparison "Original Photo (Before)" card
+        const imgBefore = document.getElementById('enhance-img-before');
+        imgBefore.src = dataUrl;
+
+        const imgAfter = document.getElementById('enhance-img-after');
+        imgAfter.src = dataUrl;
+        setEnhanceAfterState('ready');
+        document.getElementById('enhance-after-badge').textContent = 'Source Preview';
+
+        document.getElementById('enhance-dl-name-display').textContent = file.name;
+        document.getElementById('enhance-compare').style.display = 'grid';
+        document.getElementById('enhance-run-btn').disabled = false;
+      };
+      r.readAsDataURL(file);
+    }
+
+    async function cancelEnhance() {
+      const jobId = enhanceState.jobId;
+      if (enhanceState.abortController) {
+        enhanceState.abortController.abort();
+      }
+      if (jobId) {
+        try {
+          await fetch(`${API}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+        } catch (err) {
+          console.warn('Server-side job cancellation failed', err);
+        }
+      }
+      if (enhanceState.pollInterval) {
+        clearInterval(enhanceState.pollInterval);
+        enhanceState.pollInterval = null;
+      }
+      enhanceState.processing = false;
+      setEnhanceAfterState('ready');
+      document.getElementById('enhance-after-badge').textContent = 'Source Preview';
+      document.getElementById('enhance-run-btn').disabled = false;
+      document.getElementById('enhance-cancel-btn').style.display = 'none';
+      document.getElementById('enhance-retry-btn').style.display = 'inline-flex';
+      document.getElementById('enhance-msg').textContent = 'Enhancement cancelled. Click Retry to run again.';
+      enhanceState.jobId = null;
+      toast('Enhancement cancelled', 'info');
+    }
+
+    function setEnhanceAfterState(state) {
+      const stage = document.getElementById('enhance-after-stage');
+      const downloadRow = document.getElementById('enhance-download-row');
+      stage.classList.toggle('is-processing', state === 'processing');
+      if (state !== 'complete') stage.classList.remove('is-revealing');
+      downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
+    }
+
+    async function startEnhance() {
+      if (!enhanceState.file || enhanceState.processing) return;
+
+      const btn = document.getElementById('enhance-run-btn');
+      btn.disabled = true;
+      enhanceState.processing = true;
+      enhanceState.abortController = new AbortController();
+      setEnhanceAfterState('processing');
+      document.getElementById('enhance-after-badge').textContent = 'Generating...';
+
+      const pBox = document.getElementById('enhance-progress');
+      const fillEl = document.getElementById('enhance-fill');
+      const pctEl = document.getElementById('enhance-pct');
+      const msgEl = document.getElementById('enhance-msg');
+      const cancelBtn = document.getElementById('enhance-cancel-btn');
+      const retryBtn = document.getElementById('enhance-retry-btn');
+
+      pBox.style.display = 'flex';
+      cancelBtn.style.display = 'inline-flex';
+      retryBtn.style.display = 'none';
+
+      fillEl.style.width = '8%';
+      pctEl.textContent = '8%';
+      msgEl.textContent = 'Uploading photo to AI studio queue…';
+
+      try {
+        const bgColor = getBackdropRgb('enhance', '#FFFFFF');
+        const upscaleFactor = getResolutionFactor('enhance');
+        const fd = new FormData();
+        fd.append('file', enhanceState.file);
+        fd.append('background_color', bgColor);
+        fd.append('upscale_factor', upscaleFactor);
+        fd.append('width', 600);
+        fd.append('height', 800);
+        fd.append('steps', 20);
+
+        const resp = await fetch(`${API}/qwen/enhance`, {
+          method: 'POST',
+          body: fd,
+          signal: enhanceState.abortController.signal
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+          throw new Error(err.detail || `Enhance failed (HTTP ${resp.status})`);
+        }
+
+        const data = await resp.json();
+        enhanceState.jobId = data.job_id;
+        pollEnhanceJob(data.job_id);
+
+      } catch (err) {
+        cancelBtn.style.display = 'none';
+        retryBtn.style.display = 'inline-flex';
+        btn.disabled = false;
+        enhanceState.processing = false;
+        if (err.name === 'AbortError') {
+          msgEl.textContent = 'Enhancement cancelled. Click Retry to run again.';
+        } else {
+          msgEl.textContent = `Enhance error: ${err.message}`;
+          toast(err.message, 'error');
+        }
+        setEnhanceAfterState('ready');
+        document.getElementById('enhance-after-badge').textContent = 'Source Preview';
+      }
+    }
+
+    function pollEnhanceJob(jobId) {
+      if (enhanceState.pollInterval) clearInterval(enhanceState.pollInterval);
+
+      const pBox = document.getElementById('enhance-progress');
+      const fillEl = document.getElementById('enhance-fill');
+      const pctEl = document.getElementById('enhance-pct');
+      const msgEl = document.getElementById('enhance-msg');
+      const cancelBtn = document.getElementById('enhance-cancel-btn');
+      const retryBtn = document.getElementById('enhance-retry-btn');
+      const btn = document.getElementById('enhance-run-btn');
+
+      enhanceState.pollInterval = setInterval(async () => {
+        try {
+          const resp = await fetch(`${API}/job/${jobId}`);
+          if (!resp.ok) return;
+          const job = await resp.json();
+
+          if (job.status === 'queued') {
+            const posText = job.queue_position > 0 ? ` (Position #${job.queue_position} in queue)` : '';
+            fillEl.style.width = '12%';
+            pctEl.textContent = '12%';
+            msgEl.textContent = `Waiting in queue${posText}…`;
+          } else if (job.status === 'processing') {
+            const prog = Math.max(15, Math.min(job.progress || 35, 95));
+            fillEl.style.width = `${prog}%`;
+            pctEl.textContent = `${prog}%`;
+            msgEl.textContent = job.message || 'Processing on GPU (1-by-1)…';
+          } else if (job.status === 'done') {
+            clearInterval(enhanceState.pollInterval);
+            enhanceState.processing = false;
+            btn.disabled = false;
+            fillEl.style.width = '100%';
+            pctEl.textContent = '100%';
+            msgEl.textContent = '✓ Enhancement Complete!';
+            cancelBtn.style.display = 'none';
+
+            const rawPath = (job && (job.output_path || job.result_url)) || '';
+            const outUrl = (typeof rawPath === 'string' && rawPath.startsWith('http')) ? rawPath : `/${String(rawPath).replace(/^\/+/, '')}?t=${Date.now()}`;
+            const afterImg = document.getElementById('enhance-img-after');
+            afterImg.onload = () => {
+              setEnhanceAfterState('complete');
+              const stage = document.getElementById('enhance-after-stage');
+              stage.classList.remove('is-revealing');
+              requestAnimationFrame(() => stage.classList.add('is-revealing'));
+              document.getElementById('enhance-after-badge').textContent = `${afterImg.naturalWidth}×${afterImg.naturalHeight} px · 300 DPI`;
+            };
+            afterImg.src = outUrl;
+
+            const downloadName = (job.metadata && job.metadata.download_name) || job.original_filename || enhanceState.origName || 'enhanced.png';
+            const dlBtn = document.getElementById('enhance-dl-btn');
+            dlBtn.href = outUrl;
+            dlBtn.download = downloadName;
+            document.getElementById('enhance-dl-name-display').textContent = downloadName;
+            document.getElementById('enhance-compare').style.display = 'grid';
+
+            toast('✦ Qwen Studio Enhancement complete!', 'success');
+
+          } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
+            clearInterval(enhanceState.pollInterval);
+            enhanceState.processing = false;
+            btn.disabled = false;
+            cancelBtn.style.display = 'none';
+            retryBtn.style.display = 'inline-flex';
+            msgEl.textContent = `Failed: ${job.message || 'Error occurred'}`;
+            toast(`Enhancement failed: ${job.message || 'Error'}`, 'error');
+            setEnhanceAfterState('ready');
+            document.getElementById('enhance-after-badge').textContent = 'Source Preview';
+          }
+        } catch (e) {}
+      }, 4000);
+    }
+
+
+    // ─── 2. UNIFORM SWAP (CatVTON / IDM-VTON) ──────────────────────────────
+    function handleUniformPersonSelect(file) {
+      if (!file) return;
+      uniformState.personFile = file;
+
+      const r = new FileReader();
+      r.onload = e => {
+        document.getElementById('uniform-person-empty').style.display = 'none';
+        const pWrap = document.getElementById('uniform-person-preview');
+        pWrap.style.display = 'flex';
+
+        const pImg = document.getElementById('uniform-person-preview-img');
+        pImg.src = e.target.result;
+        document.getElementById('uniform-person-preview-name').textContent = file.name;
+
+        pImg.onload = () => {
+          document.getElementById('uniform-person-preview-dims').textContent = `${pImg.naturalWidth}×${pImg.naturalHeight} px`;
+        };
+
+        document.getElementById('uniform-img-before').src = e.target.result;
+        document.getElementById('uniform-img-after').src = e.target.result;
+        setUniformAfterState('ready');
+        document.getElementById('uniform-after-badge').textContent = 'Source Preview';
+        document.getElementById('uniform-compare').style.display = 'grid';
+      };
+      r.readAsDataURL(file);
+
+      checkUniformReady();
+    }
+
+    function handleUniformClothSelect(file) {
+      if (!file) return;
+      uniformState.uniformFile = file;
+
+      const r = new FileReader();
+      r.onload = e => {
+        document.getElementById('uniform-cloth-empty').style.display = 'none';
+        const cWrap = document.getElementById('uniform-cloth-preview');
+        cWrap.style.display = 'flex';
+
+        const cImg = document.getElementById('uniform-cloth-preview-img');
+        cImg.src = e.target.result;
+        document.getElementById('uniform-cloth-preview-name').textContent = file.name;
+
+        cImg.onload = () => {
+          document.getElementById('uniform-cloth-preview-dims').textContent = `${cImg.naturalWidth}×${cImg.naturalHeight} px`;
+        };
+      };
+      r.readAsDataURL(file);
+
+      checkUniformReady();
+    }
+
+    function checkUniformReady() {
+      const ready = uniformState.personFile && uniformState.uniformFile;
+      document.getElementById('uniform-run-btn').disabled = !ready;
+    }
+
+    function cancelUniformSwap() {
+      if (uniformState.pollInterval) {
+        clearInterval(uniformState.pollInterval);
+        uniformState.pollInterval = null;
+      }
+      if (uniformState.abortController) {
+        uniformState.abortController.abort();
+      }
+      setUniformAfterState('ready');
+      document.getElementById('uniform-after-badge').textContent = 'Source Preview';
+      document.getElementById('uniform-run-btn').disabled = false;
+      document.getElementById('uniform-cancel-btn').style.display = 'none';
+      document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
+      document.getElementById('uniform-msg').textContent = 'Uniform swap cancelled. Click Retry to run again.';
+      toast('Uniform swap cancelled', 'info');
+    }
+
+    function setUniformAfterState(state) {
+      const stage = document.getElementById('uniform-after-stage');
+      const downloadRow = document.getElementById('uniform-download-row');
+      stage.classList.toggle('is-processing', state === 'processing');
+      if (state !== 'complete') stage.classList.remove('is-revealing');
+      downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
+    }
+
+    function setUniformLoadingCopy(message) {
+      const copy = document.getElementById('uniform-loading-copy');
+      const text = String(message || '').toLowerCase();
+      if (text.includes('analyz') || text.includes('measur')) copy.textContent = 'Measuring fit';
+      else if (text.includes('background') || text.includes('studio')) copy.textContent = 'Setting studio backdrop';
+      else if (text.includes('collar') || text.includes('seam')) copy.textContent = 'Settling collar and shoulders';
+      else if (text.includes('upload')) copy.textContent = 'Preparing uniform';
+      else copy.textContent = 'Aligning uniform';
+    }
+
+    function normalizeBackdropHex(value) {
+      const hex = String(value || '').trim();
+      return /^#[0-9a-f]{6}$/i.test(hex) ? hex.toUpperCase() : null;
+    }
+
+    function setBackdropColor(group, value) {
+      const hex = normalizeBackdropHex(value);
+      if (!hex) return false;
+      document.getElementById(`${group}-bg-color`).value = hex;
+      document.getElementById(`${group}-bg-hex`).value = hex;
+      document.querySelectorAll(`.backdrop-presets[data-backdrop-group="${group}"] .backdrop-preset`).forEach((button) => {
+        const selected = button.dataset.color.toUpperCase() === hex;
+        button.classList.toggle('is-selected', selected);
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      });
+      return true;
+    }
+
+    function getBackdropRgb(group, fallback = '#047EF6') {
+      const hex = document.getElementById(`${group}-bg-hex`).value;
+      const normalized = normalizeBackdropHex(hex) || fallback;
+      return [0, 2, 4].map(offset => parseInt(normalized.slice(offset, offset + 2), 16)).join(',');
+    }
+
+    ['enhance', 'uniform', 'bulk'].forEach((group) => {
+      document.querySelectorAll(`.backdrop-presets[data-backdrop-group="${group}"] .backdrop-preset`).forEach((button) => {
+        button.addEventListener('click', () => setBackdropColor(group, button.dataset.color));
+      });
+      document.getElementById(`${group}-bg-color`).addEventListener('input', (event) => {
+        setBackdropColor(group, event.target.value);
+      });
+      document.getElementById(`${group}-bg-hex`).addEventListener('change', (event) => {
+        if (!setBackdropColor(group, event.target.value)) {
+          event.target.value = document.getElementById(`${group}-bg-color`).value.toUpperCase();
+        }
+      });
+    });
+
+    function setResolutionFactor(group, value) {
+      const factor = Number(value);
+      if (![1, 2, 4].includes(factor)) return 1;
+      document.querySelectorAll(`.resolution-presets[data-resolution-group="${group}"] .resolution-preset`).forEach((button) => {
+        const selected = Number(button.dataset.factor) === factor;
+        button.classList.toggle('is-selected', selected);
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      });
+      return factor;
+    }
+
+    function getResolutionFactor(group) {
+      const selected = document.querySelector(`.resolution-presets[data-resolution-group="${group}"] .resolution-preset.is-selected`);
+      return selected ? Number(selected.dataset.factor) : 1;
+    }
+
+    ['enhance', 'bulk'].forEach((group) => {
+      document.querySelectorAll(`.resolution-presets[data-resolution-group="${group}"] .resolution-preset`).forEach((button) => {
+        button.addEventListener('click', () => setResolutionFactor(group, button.dataset.factor));
+      });
+    });
+
+    async function startUniformSwap() {
+      if (!uniformState.personFile || !uniformState.uniformFile) return;
+
+      const btn = document.getElementById('uniform-run-btn');
+      btn.disabled = true;
+      uniformState.abortController = new AbortController();
+      setUniformAfterState('processing');
+      setUniformLoadingCopy('Uploading');
+      document.getElementById('uniform-after-badge').textContent = 'Fitting...';
+
+      const pBox = document.getElementById('uniform-progress');
+      pBox.style.display = 'flex';
+      document.getElementById('uniform-cancel-btn').style.display = 'inline-flex';
+      document.getElementById('uniform-retry-btn').style.display = 'none';
+      document.getElementById('uniform-fill').style.width = '15%';
+      document.getElementById('uniform-pct').textContent = '15%';
+      document.getElementById('uniform-msg').textContent = 'Uploading student & uniform images…';
+
+      try {
+        const fd = new FormData();
+        fd.append('person_file', uniformState.personFile);
+        fd.append('uniform_file', uniformState.uniformFile);
+        fd.append('engine', 'qwen-image-edit');
+        fd.append('fit_mode', 'Qwen VL + Qwen Image Edit (20-Step)');
+        fd.append('bg_color', getBackdropRgb('uniform'));
+
+        const resp = await fetch(`${API}/uniform`, {
+          method: 'POST',
+          body: fd,
+          signal: uniformState.abortController.signal
+        });
+        if (!resp.ok) throw new Error(`Uniform swap request failed (HTTP ${resp.status})`);
+        const data = await resp.json();
+
+        uniformState.jobId = data.job_id;
+        document.getElementById('uniform-fill').style.width = '35%';
+        document.getElementById('uniform-pct').textContent = '35%';
+        document.getElementById('uniform-msg').textContent = 'Measuring the portrait and fitting the uploaded uniform…';
+        setUniformLoadingCopy('Measuring fit');
+
+        pollUniformJob(data.job_id);
+
+      } catch (err) {
+        document.getElementById('uniform-cancel-btn').style.display = 'none';
+        document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
+        btn.disabled = false;
+        setUniformAfterState('ready');
+        document.getElementById('uniform-after-badge').textContent = 'Source Preview';
+        if (err.name === 'AbortError') {
+          document.getElementById('uniform-msg').textContent = 'Uniform swap cancelled.';
+        } else {
+          document.getElementById('uniform-msg').textContent = `Failed: ${err.message}`;
+          toast(err.message, 'error');
+        }
+      }
+    }
+
+    function pollUniformJob(jobId) {
+      if (uniformState.pollInterval) clearInterval(uniformState.pollInterval);
+
+      uniformState.pollInterval = setInterval(async () => {
+        try {
+          const resp = await fetch(`${API}/job/${jobId}`);
+          if (!resp.ok) return;
+          const job = await resp.json();
+
+          document.getElementById('uniform-fill').style.width = `${job.progress || 50}%`;
+          document.getElementById('uniform-pct').textContent = `${job.progress || 50}%`;
+          document.getElementById('uniform-msg').textContent = job.message || 'Processing…';
+          setUniformLoadingCopy(job.message);
+
+          if (job.status === 'done') {
+            clearInterval(uniformState.pollInterval);
+            document.getElementById('uniform-progress').style.display = 'none';
+            document.getElementById('uniform-run-btn').disabled = false;
+
+            const url = job.result_url ? `${job.result_url}?t=${Date.now()}` : `/${job.output_path}?t=${Date.now()}`;
+            const afterImg = document.getElementById('uniform-img-after');
+            afterImg.onload = () => {
+              setUniformAfterState('complete');
+              const stage = document.getElementById('uniform-after-stage');
+              stage.classList.remove('is-revealing');
+              requestAnimationFrame(() => stage.classList.add('is-revealing'));
+              document.getElementById('uniform-after-badge').textContent = `${afterImg.naturalWidth}×${afterImg.naturalHeight} px · 300 DPI`;
+            };
+            afterImg.src = url;
+
+            // Preserve student photo filename
+            const dlName = (job.original_filename || job.metadata?.download_name || (uniformState.personFile && uniformState.personFile.name) || 'portrait.png');
+            const dlBtn = document.getElementById('uniform-dl-btn');
+            dlBtn.href = url;
+            dlBtn.download = dlName;
+            document.getElementById('uniform-dl-name-display').textContent = dlName;
+            document.getElementById('uniform-compare').style.display = 'grid';
+            toast('👔 School uniform fitted successfully!', 'success');
+
+          } else if (job.status === 'failed') {
+            clearInterval(uniformState.pollInterval);
+            document.getElementById('uniform-cancel-btn').style.display = 'none';
+            document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
+            document.getElementById('uniform-msg').textContent = `Failed: ${job.message || 'Error occurred'}`;
+            document.getElementById('uniform-run-btn').disabled = false;
+            setUniformAfterState('ready');
+            document.getElementById('uniform-after-badge').textContent = 'Source Preview';
+            toast(`Uniform fitting failed: ${job.message}`, 'error');
+          }
+        } catch (e) {}
+      }, 4000);
+    }
+
+    // ─── 3. BULK ENHANCER (Qwen-Edit Batch) ────────────────────────────────
+    function handleBulkFilesSelect(files) {
+      if (!files || !files.length) return;
+      for (const file of files) {
+        bulkState.items.push({
+          id: 'item_' + Math.random().toString(36).slice(2, 9),
+          file: file,
+          name: file.name,
+          status: 'queued',
+          progress: 0,
+          message: 'Queued',
+          resultUrl: null,
+          retries: 0
+        });
+      }
+      renderBulkList();
+      updateBulkStats();
+      document.getElementById('bulk-start-btn').disabled = false;
+      document.getElementById('bulk-stats-bar').style.display = 'grid';
+      document.getElementById('bulk-clear-btn').style.display = 'inline-flex';
+    }
+
+    function renderBulkList() {
+      const list = document.getElementById('bulk-list');
+      list.innerHTML = '';
+      for (const item of bulkState.items) {
+        const row = document.createElement('div');
+        row.className = 'bulk-item';
+        row.id = `row_${item.id}`;
+
+        row.innerHTML = `
+          <img class="bulk-thumb" id="thumb_${item.id}" src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>" />
+          <div style="min-width:0;">
+            <div class="bulk-item-name">${item.name}</div>
+            <div class="bulk-item-status" id="msg_${item.id}">${item.message}</div>
+          </div>
+          <div id="act_${item.id}">
+            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--muted);">${item.progress}%</span>
+          </div>
+        `;
+        list.appendChild(row);
+
+        // Immediate thumbnail preview of input photo
+        const r = new FileReader();
+        r.onload = e => {
+          const el = document.getElementById(`thumb_${item.id}`);
+          if (el) el.src = e.target.result;
+        };
+        r.readAsDataURL(item.file);
+      }
+    }
+
+    function updateBulkStats() {
+      const total = bulkState.items.length;
+      const done = bulkState.items.filter(i => i.status === 'done').length;
+      const proc = bulkState.items.filter(i => i.status === 'processing').length;
+      const fail = bulkState.items.filter(i => i.status === 'failed').length;
+
+      document.getElementById('bs-total').textContent = total;
+      document.getElementById('bs-done').textContent = done;
+      document.getElementById('bs-proc').textContent = proc;
+      document.getElementById('bs-fail').textContent = fail;
+
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      document.getElementById('bulk-overall-pct').textContent = `${pct}%`;
+      document.getElementById('bulk-overall-fill').style.width = `${pct}%`;
+
+      if (done > 0) {
+        document.getElementById('bulk-zip-btn').style.display = 'inline-flex';
+      }
+      if (fail > 0) {
+        document.getElementById('bulk-retry-btn').style.display = 'inline-flex';
+      } else {
+        document.getElementById('bulk-retry-btn').style.display = 'none';
+      }
+    }
+
+    function cancelBulkEnhance() {
+      bulkState.cancelled = true;
+      bulkState.processing = false;
+      document.getElementById('bulk-start-btn').disabled = false;
+      document.getElementById('bulk-cancel-btn').style.display = 'none';
+      document.getElementById('bulk-overall-msg').textContent = 'Batch paused / cancelled by user.';
+      toast('Batch processing cancelled', 'info');
+      updateBulkStats();
+    }
+
+    function retryFailedBulk() {
+      const failed = bulkState.items.filter(i => i.status === 'failed');
+      for (const item of failed) {
+        item.status = 'queued';
+        item.message = 'Queued for retry';
+        item.progress = 0;
+        updateBulkItemUI(item);
+      }
+      updateBulkStats();
+      startBulkEnhance();
+    }
+
+    async function retrySingleBulkItem(itemId) {
+      const item = bulkState.items.find(i => i.id === itemId);
+      if (item) {
+        item.status = 'queued';
+        item.progress = 0;
+        item.message = 'Queued';
+        updateBulkItemUI(item);
+        updateBulkStats();
+        await processBulkItem(item);
+      }
+    }
+
+    async function startBulkEnhance() {
+      if (bulkState.processing) return;
+      bulkState.processing = true;
+      bulkState.cancelled = false;
+      document.getElementById('bulk-start-btn').disabled = true;
+      document.getElementById('bulk-cancel-btn').style.display = 'inline-flex';
+      document.getElementById('bulk-overall-bar').style.display = 'flex';
+
+      const queued = bulkState.items.filter(i => i.status === 'queued' || i.status === 'failed');
+
+      for (const item of queued) {
+        if (bulkState.cancelled) break;
+        await processBulkItem(item);
+      }
+
+      bulkState.processing = false;
+      document.getElementById('bulk-start-btn').disabled = false;
+      document.getElementById('bulk-cancel-btn').style.display = 'none';
+      updateBulkStats();
+      if (!bulkState.cancelled) {
+        toast('⊞ Batch Enhancement complete!', 'success');
+      }
+    }
+
+    async function processBulkItem(item) {
+      item.status = 'queued';
+      item.progress = 5;
+      item.message = 'Queued in processing line…';
+      updateBulkItemUI(item);
+      updateBulkStats();
+
+      try {
+        const bgColor = getBackdropRgb('bulk');
+        const upscaleFactor = getResolutionFactor('bulk');
+
+        const fd = new FormData();
+        fd.append('file', item.file);
+        fd.append('background_color', bgColor);
+        fd.append('upscale_factor', upscaleFactor);
+        fd.append('width', 600);
+        fd.append('height', 800);
+        fd.append('steps', 20);
+        fd.append('priority', 'bulk');
+
+        const resp = await fetch(`${API}/qwen/enhance`, { method: 'POST', body: fd });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+          throw new Error(err.detail || `HTTP ${resp.status}`);
+        }
+
+        const data = await resp.json();
+        const jobId = data.job_id;
+
+        // Poll job in queue until done
+        await new Promise((resolve, reject) => {
+          const pollTimer = setInterval(async () => {
+            if (bulkState.cancelled) {
+              clearInterval(pollTimer);
+              resolve();
+              return;
+            }
+            try {
+              const jResp = await fetch(`${API}/job/${jobId}`);
+              if (!jResp.ok) return;
+              const job = await jResp.json();
+
+              if (job.status === 'queued') {
+                item.status = 'queued';
+                item.progress = 10;
+                item.message = job.queue_position > 0 ? `Position #${job.queue_position} in queue` : 'Queued…';
+                updateBulkItemUI(item);
+              } else if (job.status === 'processing') {
+                item.status = 'processing';
+                item.progress = Math.max(15, Math.min(job.progress || 35, 95));
+                item.message = job.message || 'Processing on GPU…';
+                updateBulkItemUI(item);
+              } else if (job.status === 'done') {
+                clearInterval(pollTimer);
+                const rawOut = (job && (job.output_path || job.result_url)) || '';
+                const outUrl = (typeof rawOut === 'string' && rawOut.startsWith('http')) ? rawOut : `/${String(rawOut).replace(/^\/+/, '')}?t=${Date.now()}`;
+                item.resultUrl = outUrl;
+                item.downloadName = (job.metadata && job.metadata.download_name) || item.name;
+
+                const thumb = document.getElementById(`thumb_${item.id}`);
+                if (thumb && rawOut) thumb.src = outUrl;
+
+                updateBulkItemUI(item);
+                updateBulkStats();
+                resolve();
+              } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
+                clearInterval(pollTimer);
+                item.status = 'failed';
+                item.progress = 0;
+                item.message = job.message || 'Failed';
+                updateBulkItemUI(item);
+                updateBulkStats();
+                resolve();
+              }
+            } catch (e) {}
+          }, 4000);
+        });
+
+      } catch (err) {
+        item.status = 'failed';
+        item.progress = 0;
+        item.message = err.message || 'Failed';
+        updateBulkItemUI(item);
+        updateBulkStats();
+      }
+    }
+
+
+    function updateBulkItemUI(item) {
+      const msg = document.getElementById(`msg_${item.id}`);
+      const act = document.getElementById(`act_${item.id}`);
+      if (msg) msg.textContent = item.message;
+      if (act) {
+        if (item.status === 'done' && item.resultUrl) {
+          const dlName = item.downloadName || item.name;
+          act.innerHTML = `<a class="btn-action" href="${item.resultUrl}" download="${dlName}" style="font-size:0.65rem;padding:0.25rem 0.6rem;color:var(--gold);">↓ ${dlName}</a>`;
+        } else if (item.status === 'failed') {
+          act.innerHTML = `<button class="btn-action" onclick="retrySingleBulkItem('${item.id}')" style="font-size:0.62rem;padding:0.2rem 0.5rem;color:var(--warn);border-color:rgba(234,179,8,0.3);">↻ Retry</button>`;
+        } else {
+          act.innerHTML = `<span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--muted);">${item.progress}%</span>`;
+        }
+      }
+    }
+
+    async function downloadAllAsZip() {
+      const completed = bulkState.items.filter(i => i.status === 'done' && i.resultUrl);
+      if (!completed.length) return;
+
+      toast('Building ZIP archive preserving all original filenames…', 'info');
+      const zip = new JSZip();
+
+      for (const item of completed) {
+        try {
+          const r = await fetch(item.resultUrl);
+          const b = await r.blob();
+          // Use EXACT input name for each entry in ZIP
+          const zipEntryName = item.downloadName || item.name;
+          zip.file(zipEntryName, b);
+        } catch (e) {}
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Vsoul_Studio_Enhanced_${Date.now()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast('ZIP downloaded!', 'success');
+    }
+
+    function clearBulkQueue() {
+      bulkState.items = [];
+      renderBulkList();
+      updateBulkStats();
+      document.getElementById('bulk-stats-bar').style.display = 'none';
+      document.getElementById('bulk-overall-bar').style.display = 'none';
+      document.getElementById('bulk-zip-btn').style.display = 'none';
+      document.getElementById('bulk-clear-btn').style.display = 'none';
+      document.getElementById('bulk-start-btn').disabled = true;
+    }
+
+    // ─── Health Check ──────────────────────────────────────────────────────
+    async function checkHealth() {
+      try {
+        const r = await fetch(`${API}/health`);
+        const d = await r.json();
+        const pillB = document.getElementById('pill-backend');
+        const pillG = document.getElementById('pill-gpu');
+
+        pillB.textContent = 'Backend: Online';
+        pillB.classList.add('active');
+
+        if (d.gpu && d.gpu.available) {
+          pillG.textContent = `GPU: ${d.gpu.name || 'CUDA Ready'}`;
+          pillG.classList.add('active');
+        } else {
+          pillG.textContent = 'GPU: CPU Fallback';
+        }
+      } catch (e) {
+        document.getElementById('pill-backend').textContent = 'Backend: Connecting…';
+      }
+    }
+
+    checkHealth();
+    setInterval(checkHealth, 30000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+# GUSUQ-WebUI VRAM Optimization Policies for Qwen-Image-Edit
+# Configures memory offloading thresholds for low, mid, and high VRAM GPUs
+
+low_vram:
+  description: "Sequential model offloading for 8GB-12GB GPUs (RTX 5050 Laptop / RTX 4060)"
+  text_encoder_device: "cuda"
+  transformer_device: "cuda"
+  vae_device: "cuda"
+  sequential_offload: true
+  empty_cache_after_step: true
+  enable_attention_slicing: true
+  enable_vae_tiling: true
+  max_sequence_length: 128
+  default_inference_steps: 4
+
+mid_vram:
+  description: "Model-wise offloading for 16GB GPUs (RTX 4080 / RTX 3090)"
+  text_encoder_device: "cpu"
+  transformer_device: "cuda"
+  vae_device: "cuda"
+  sequential_offload: false
+  empty_cache_after_step: false
+  enable_attention_slicing: false
+  enable_vae_tiling: false
+  max_sequence_length: 256
+  default_inference_steps: 4
+
+high_vram:
+  description: "Full resident VRAM execution for 24GB+ GPUs (RTX 4090 / A100)"
+  text_encoder_device: "cuda"
+  transformer_device: "cuda"
+  vae_device: "cuda"
+  sequential_offload: false
+  empty_cache_after_step: false
+  enable_attention_slicing: false
+  enable_vae_tiling: false
+  max_sequence_length: 512
+  default_inference_steps: 4
