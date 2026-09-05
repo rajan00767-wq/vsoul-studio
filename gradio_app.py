@@ -79,14 +79,18 @@ def _save_matching_input(image: Image.Image, source: Any, fallback: str = "resul
     dest.parent.mkdir(parents=True, exist_ok=True)
     rgb = image.convert("RGB")
     suffix = dest.suffix.lower()
+    temp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
     if suffix in {".jpg", ".jpeg"}:
-        rgb.save(dest, format="JPEG", quality=95, dpi=(300, 300))
+        rgb.save(temp, format="JPEG", quality=95, dpi=(300, 300))
     elif suffix == ".webp":
-        rgb.save(dest, format="WEBP", quality=95)
+        rgb.save(temp, format="WEBP", quality=95)
     else:
         if suffix != ".png":
             dest = dest.with_suffix(".png")
-        rgb.save(dest, format="PNG", dpi=(300, 300))
+            temp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
+        rgb.save(temp, format="PNG", dpi=(300, 300))
+    # Publish only a completed image; StaticFiles must never read a partial write.
+    os.replace(temp, dest)
     return dest
 
 
