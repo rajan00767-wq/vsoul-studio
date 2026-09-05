@@ -46,7 +46,10 @@ logger = get_logger(__name__)
 
 MODELS_DIR = Path("models/qwen_image_edit")
 GGUF_PATH = MODELS_DIR / "qwen-image-edit-2511-Q4_K_M.gguf"
-CONFIG_PATH = MODELS_DIR / "transformer/config.json"
+# Keep the GGUF architecture definition in the application, rather than the
+# mutable model cache.  The 2511 GGUF requires the 64-channel Edit model
+# configuration; an older cached 128-channel file leaves parameters on meta.
+CONFIG_PATH = Path("config/qwen_image_edit_2511_transformer.json")
 LORA_FILE = Path("models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True, parents=True)
@@ -775,12 +778,6 @@ class QwenEditPipeline:
             config=CONFIG_PATH.resolve().as_posix(),
             quantization_config=quant_cfg,
             torch_dtype=self.dtype,
-            # Loading the GGUF model through Accelerate's meta-device path can
-            # leave parameters unmaterialized before its implicit `.to()` call.
-            # The base 20-step path then fails with "Cannot copy out of meta
-            # tensor".  Load concrete weights first; chunked execution below
-            # remains responsible for the low-VRAM runtime policy.
-            low_cpu_mem_usage=False,
         )
         transformer.forward = types.MethodType(_chunked_transformer_forward, transformer)
         transformer._qwen_deadline = deadline
