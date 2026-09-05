@@ -775,6 +775,12 @@ class QwenEditPipeline:
             config=CONFIG_PATH.resolve().as_posix(),
             quantization_config=quant_cfg,
             torch_dtype=self.dtype,
+            # Loading the GGUF model through Accelerate's meta-device path can
+            # leave parameters unmaterialized before its implicit `.to()` call.
+            # The base 20-step path then fails with "Cannot copy out of meta
+            # tensor".  Load concrete weights first; chunked execution below
+            # remains responsible for the low-VRAM runtime policy.
+            low_cpu_mem_usage=False,
         )
         transformer.forward = types.MethodType(_chunked_transformer_forward, transformer)
         transformer._qwen_deadline = deadline
