@@ -777,7 +777,7 @@
       <div class="workspace-header">
         <div>
           <h1 class="section-title">AI Portrait & Uniform Studio</h1>
-          <p class="section-sub">Local neural inference · Qwen-Image-Edit & CatVTON Virtual Try-On</p>
+          <p class="section-sub">Local neural inference · Qwen Image Edit 2511 & Qwen2.5-VL</p>
         </div>
         <div class="tabs-nav">
           <button class="tab-btn active" id="tab-enhance" onclick="switchTab('enhance')">✦ Enhance</button>
@@ -1139,23 +1139,23 @@
         <div class="card-title">Active AI Pipelines</div>
         <div style="display:flex;flex-direction:column;gap:0.6rem;font-size:0.75rem;color:var(--text);">
           <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span>✦ Qwen Studio Enhancer</span>
+            <span>✦ Qwen Image Edit 2511</span>
             <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span>👔 CatVTON Try-On</span>
+            <span>◈ Qwen2.5-VL Visual Analysis</span>
             <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span>✂ BiRefNet-HR Matting</span>
+            <span>◉ Identity Quality Gate</span>
             <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span>🔍 Real-ESRGAN Upscale</span>
+            <span>▣ Passport Crop & Framing</span>
             <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span>✨ GFPGAN Face Restorer</span>
+            <span>● Selected Background Composer</span>
             <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--success);">● Active</span>
           </div>
         </div>
@@ -1448,7 +1448,7 @@
     }
 
 
-    // ─── 2. UNIFORM SWAP (CatVTON / IDM-VTON) ──────────────────────────────
+    // ─── 2. UNIFORM SWAP (Qwen Image Edit + Qwen-VL) ───────────────────────
     function handleUniformPersonSelect(file) {
       if (!file) return;
       uniformState.personFile = file;
