@@ -354,6 +354,8 @@ class QwenEditPipeline:
     def __init__(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+        self.last_qwen_candidate_path: Optional[Path] = None
+        self.last_qwen_identity_accepted: Optional[bool] = None
         logger.info("[QWEN_EDIT_PIPELINE] Initialized on device: %s (%s)", self.device, self.dtype)
 
     def _to_pil(self, img_input: Union[str, Path, bytes, Image.Image]) -> Image.Image:
@@ -856,6 +858,7 @@ class QwenEditPipeline:
         # the generated portrait instead of hiding that decision in the final.
         qwen_debug_path = OUTPUTS_DIR / f"{job_id}_qwen_raw.png"
         raw_diffused.save(qwen_debug_path, format="PNG")
+        self.last_qwen_candidate_path = qwen_debug_path
         logger.info("[QWEN_EDIT_ENHANCER] Saved pre-validation Qwen output -> %s", qwen_debug_path)
 
         # ── Step 5: High-Fidelity Identity Lock & Optical Detail Restoration ──
@@ -865,6 +868,7 @@ class QwenEditPipeline:
         qwen_portrait_accepted = preserve_source_clothing or self._has_acceptable_portrait_identity(
             input_resized, raw_diffused
         )
+        self.last_qwen_identity_accepted = qwen_portrait_accepted
         # The enhancement UI is a Qwen Image Edit workflow.  Its final must be
         # the model's decoded image, followed only by passport framing in the
         # caller.  A QA fallback here used to replace a raw Qwen result with a

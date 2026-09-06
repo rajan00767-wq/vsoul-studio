@@ -137,7 +137,7 @@ async def _execute_queued_job(job_id: str, job: dict):
             background_color = metadata.get("background_color", "white")
             bg_name, custom_hex = map_client_background(str(background_color))
 
-            named_path, msg = await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 lambda: process_single_enhance(
                     input_path,
@@ -158,6 +158,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                     int(metadata.get("steps", 20)),
                 ),
             )
+            named_path, msg, candidate_path = (*result, None)[:3]
             if not named_path:
                 raise RuntimeError(msg or "Enhancement failed")
 
@@ -176,6 +177,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                 message="✓ Enhancement Complete",
                 output_path=rel_out,
                 result_url=f"/{rel_out}",
+                candidate_path=(f"outputs/{Path(candidate_path).name}" if candidate_path else None),
                 original_filename=orig_filename,
                 completed_at=str(time.time()),
             )
@@ -335,10 +337,12 @@ async def _execute_queued_job(job_id: str, job: dict):
             logger.info("[QUEUE_WORKER_DONE] Orchestrator job=%s -> %s", job_id, output_path)
 
     except JobCancelledError:
+        _js.remove_from_queue(job_id)
         logger.info("[QUEUE_WORKER] Job %s cancelled during processing", job_id)
         return
     except Exception as exc:
         logger.exception("[QUEUE_WORKER] Job %s failed: %s", job_id, exc)
+        _js.remove_from_queue(job_id)
         if (_js.get_job(job_id) or {}).get("status") == "cancelled":
             return
         _js.update_job(
@@ -374,6 +378,7 @@ async def _queue_worker_loop():
                 continue
 
             if job.get("status") in ("done", "failed", "cancelled"):
+                _js.remove_from_queue(job_id)
                 continue
 
             logger.info("[QUEUE_WORKER] Processing job %s strictly 1-by-1", job_id)

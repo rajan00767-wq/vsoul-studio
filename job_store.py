@@ -288,6 +288,7 @@ def kill_stuck_processing_jobs(max_age_seconds: int = 300) -> list:
                            message="Enhancement failed. Retry?",
                            completed_at=str(now),
                            error_message=f"Timed out after {int(now-last)}s without progress")
+                remove_from_queue(job_id)
                 killed.append(job_id)
     except Exception:
         pass

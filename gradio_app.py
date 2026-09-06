@@ -1445,6 +1445,7 @@ def process_single_enhance(
             prompt = build_dynamic_identity_prompt(image, bg_desc, qwen_prompt, vl_brief)
 
             _, glasses_negative = _glasses_prompt_bits(image)
+            from pipelines.qwen_edit_pipeline import qwen_service
             res_path = gusuq_pipeline.edit_image(
                 # Qwen produces the most natural portrait when it sees the
                 # original photograph directly; an imperfect matte guide
@@ -1494,6 +1495,32 @@ def process_single_enhance(
                 progress_cb=bridge,
             )
             qwen_pil = Image.open(str(res_path)).convert("RGB")
+            candidate_path = None
+            # The identity-preserved output remains the default, but retain a
+            # reviewable version of a rejected Qwen restoration so the user can
+            # make the final visual decision in the browser.
+            raw_candidate_path = getattr(qwen_service, "last_qwen_candidate_path", None)
+            candidate_rejected = getattr(qwen_service, "last_qwen_identity_accepted", True) is False
+            if candidate_rejected and raw_candidate_path and Path(raw_candidate_path).is_file():
+                candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
+                candidate_pil = apply_selected_background_matte(candidate_pil, tuple(reversed(frame_bg_bgr)))
+                if passport_format and passport_format != "Original Dimensions (Enhanced)":
+                    candidate_bgr = cv2.cvtColor(np.array(candidate_pil), cv2.COLOR_RGB2BGR)
+                    candidate_pil = Image.fromarray(cv2.cvtColor(
+                        photo_restorer.frame_passport_photo(
+                            candidate_bgr,
+                            target_format=passport_format,
+                            bg_color_bgr=frame_bg_bgr,
+                            headroom_ratio=0.26,
+                            head_height_ratio=0.56,
+                        ),
+                        cv2.COLOR_BGR2RGB,
+                    ))
+                candidate_path = _save_matching_input(
+                    candidate_pil,
+                    OUTPUTS_DIR / f"qwen_candidate_{Path(res_path).stem}.png",
+                    fallback="qwen_candidate.png",
+                )
             # Repair only Qwen's pale/coloured artificial hair streaks from
             # the aligned source hair. The conservative blend preserves Qwen's
             # restored face and curls rather than regenerating a new hairstyle.
@@ -1527,7 +1554,11 @@ def process_single_enhance(
             elapsed = time.time() - t0
             progress(1.0, desc="Completed!")
             named_path = _save_matching_input(qwen_pil, image_source, fallback=Path(res_path).name)
-            return str(named_path), f"✅ Studio portrait completed in {elapsed:.2f}s. Saved as {named_path.name}"
+            return (
+                str(named_path),
+                f"✅ Studio portrait completed in {elapsed:.2f}s. Saved as {named_path.name}",
+                str(candidate_path) if candidate_path else None,
+            )
 
         elapsed = time.time() - t0
         progress(1.0, desc="Completed!")
