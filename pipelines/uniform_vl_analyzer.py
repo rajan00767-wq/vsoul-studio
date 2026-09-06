@@ -61,13 +61,14 @@ from 0.88 to 1.10. Do not identify, describe, or alter the person."""
 
     _PORTRAIT_PROMPT = """Inspect this portrait only to prepare a constrained image-edit plan.
 Return JSON only with keys: source_subject_count, crown_near_top_edge, hair_edge_risk,
-    direct_sunlight_present, head_hair_hotspot_present, glasses_present, headwear_present, headwear_description, clothing_description, garment_visibility, skin_tone, and hair_color.
+    direct_sunlight_present, head_hair_hotspot_present, glasses_present, headwear_present, headwear_description, clothing_description, garment_visibility, skin_tone, hair_color, face_orientation, expression, and jewelry_description.
 source_subject_count is the number of people visibly present in the source image. Do not infer people.
 crown_near_top_edge is true only when the top of the hair is close to the image edge.
     direct_sunlight_present is true for visible sun hot spots, hard directional subject shadows, or strong outdoor color spill anywhere on the person.
     head_hair_hotspot_present is true when bright sunlight, a white glare, or an overexposed highlight is visible on the forehead, scalp, hair, or hair clips, even if the rest of the person has soft lighting.
 clothing_description must be a short generic description of the visible source garment only.
 skin_tone must be a short visible colour description of the person's natural complexion. hair_color must be a short visible colour description of the natural hair, excluding sunlight glare and accessories.
+face_orientation and expression must describe only the visible camera pose and expression. jewelry_description must list only visible earrings, necklaces, chains, pendants, bindis, or ornaments; use 'none' when absent.
 Set headwear_present true for any cap, hat, helmet, headscarf, school cap, or other item worn on the head.
 When headwear_present is true, describe only its generic visible type, color, and placement.
 Use concise generic descriptions. Do not identify the person."""
@@ -87,6 +88,9 @@ Use concise generic descriptions. Do not identify the person."""
             "garment_visibility": "upper garment visible",
             "skin_tone": "source natural skin tone",
             "hair_color": "source natural hair color",
+            "face_orientation": "source camera orientation",
+            "expression": "source expression",
+            "jewelry_description": "visible source jewelry",
             "source": "fallback",
         }
         if not MODEL_DIR.is_dir():

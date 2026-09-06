@@ -884,7 +884,6 @@
               <a id="enhance-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
                 ↓ Download Enhanced Image (<span id="enhance-dl-name-display"></span>)
               </a>
-              <button id="enhance-candidate-toggle" class="btn-action" type="button" onclick="toggleEnhanceCandidate()" style="display:none;justify-content:center;">View Generated Candidate</button>
             </div>
           </div>
         </div>
@@ -1193,9 +1192,7 @@
       origName: '',
       abortController: null,
       ticker: null,
-      safeResultUrl: '',
-      candidateResultUrl: '',
-      showingCandidate: false
+      resultUrl: ''
     };
 
     let uniformState = {
@@ -1267,10 +1264,7 @@
 
         const imgAfter = document.getElementById('enhance-img-after');
         imgAfter.src = dataUrl;
-        enhanceState.safeResultUrl = '';
-        enhanceState.candidateResultUrl = '';
-        enhanceState.showingCandidate = false;
-        document.getElementById('enhance-candidate-toggle').style.display = 'none';
+        enhanceState.resultUrl = '';
         setEnhanceAfterState('ready');
         document.getElementById('enhance-after-badge').textContent = 'Source Preview';
 
@@ -1316,34 +1310,18 @@
       downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
     }
 
-    function renderEnhanceResult(url, isCandidate) {
+    function renderEnhanceResult(url) {
       const afterImg = document.getElementById('enhance-img-after');
       const dlBtn = document.getElementById('enhance-dl-btn');
-      const toggle = document.getElementById('enhance-candidate-toggle');
-      enhanceState.showingCandidate = Boolean(isCandidate);
       afterImg.onload = () => {
         setEnhanceAfterState('complete');
         const stage = document.getElementById('enhance-after-stage');
         stage.classList.remove('is-revealing');
         requestAnimationFrame(() => stage.classList.add('is-revealing'));
-        document.getElementById('enhance-after-badge').textContent = isCandidate
-          ? 'Generated Candidate - Review Identity'
-          : `${afterImg.naturalWidth}x${afterImg.naturalHeight} px - 300 DPI`;
+        document.getElementById('enhance-after-badge').textContent = `${afterImg.naturalWidth}x${afterImg.naturalHeight} px - 300 DPI`;
       };
       afterImg.src = url;
       dlBtn.href = url;
-      if (enhanceState.candidateResultUrl) {
-        toggle.style.display = 'inline-flex';
-        toggle.textContent = isCandidate ? 'View Identity-Preserved Result' : 'View Generated Candidate';
-      }
-    }
-
-    function toggleEnhanceCandidate() {
-      if (!enhanceState.candidateResultUrl) return;
-      renderEnhanceResult(
-        enhanceState.showingCandidate ? enhanceState.safeResultUrl : enhanceState.candidateResultUrl,
-        !enhanceState.showingCandidate,
-      );
     }
 
     async function startEnhance() {
@@ -1452,12 +1430,11 @@
             const rawPath = (job && (job.output_path || job.result_url)) || '';
             const outUrl = (typeof rawPath === 'string' && rawPath.startsWith('http')) ? rawPath : `/${String(rawPath).replace(/^\/+/, '')}?t=${Date.now()}`;
             const candidatePath = job && job.candidate_path;
-            enhanceState.safeResultUrl = outUrl;
-            enhanceState.candidateResultUrl = candidatePath
+            const candidateUrl = candidatePath
               ? `/${String(candidatePath).replace(/^\/+/, '')}?t=${Date.now()}`
               : '';
-            document.getElementById('enhance-candidate-toggle').style.display = 'none';
-            renderEnhanceResult(outUrl, false);
+            enhanceState.resultUrl = candidateUrl || outUrl;
+            renderEnhanceResult(enhanceState.resultUrl);
 
             const downloadName = (job.metadata && job.metadata.download_name) || job.original_filename || enhanceState.origName || 'enhanced.png';
             const dlBtn = document.getElementById('enhance-dl-btn');

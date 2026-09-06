@@ -509,11 +509,17 @@ def build_dynamic_identity_prompt(
     clothing_description = str((vl_brief or {}).get("clothing_description") or "source garment").strip()
     skin_tone = str((vl_brief or {}).get("skin_tone") or "source natural skin tone").strip()
     hair_color = str((vl_brief or {}).get("hair_color") or "source natural hair color").strip()
+    face_orientation = str((vl_brief or {}).get("face_orientation") or "source camera orientation").strip()
+    expression = str((vl_brief or {}).get("expression") or "source expression").strip()
+    jewelry_description = str((vl_brief or {}).get("jewelry_description") or "visible source jewelry").strip()
     # VL is advisory only. Keep its garment phrase short and neutral so it
     # cannot carry a fabricated scene or additional person into Qwen Edit.
     clothing_description = re.sub(r"[^a-zA-Z0-9 ,.-]", "", clothing_description)[:100] or "source garment"
     skin_tone = re.sub(r"[^a-zA-Z0-9 ,.-]", "", skin_tone)[:80] or "source natural skin tone"
     hair_color = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_color)[:80] or "source natural hair color"
+    face_orientation = re.sub(r"[^a-zA-Z0-9 ,.-]", "", face_orientation)[:80] or "source camera orientation"
+    expression = re.sub(r"[^a-zA-Z0-9 ,.-]", "", expression)[:80] or "source expression"
+    jewelry_description = re.sub(r"[^a-zA-Z0-9 ,.-]", "", jewelry_description)[:100] or "visible source jewelry"
     crop_note = (
         "Create exactly one centered, head-and-shoulders portrait of the uploaded person only. "
         "Keep the complete hair crown visible with clear blank headroom above it; never crop the top of the hair. "
@@ -546,12 +552,12 @@ def build_dynamic_identity_prompt(
         "Dark hair must remain naturally dark; never add white, grey, blue-metallic, or overexposed highlights. "
     )
     jewelry_lock = (
-        "Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, ring, or ornament. "
+        f"Visual analysis identifies {jewelry_description}. Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, ring, or ornament. "
         "Do not remove, hide, recolor, reshape, move, blur, merge, duplicate, or replace jewelry. "
         "Retain its real material, fine detail, placement, and natural reflections; do not invent additional jewelry. "
     )
     pose_lock = (
-        "Treat the uploaded camera geometry as a hard constraint: keep the exact head angle, head tilt, eye direction, "
+        f"Visual analysis identifies {face_orientation} with {expression}. Treat the uploaded camera geometry as a hard constraint: keep the exact head angle, head tilt, eye direction, "
         "shoulder line, torso orientation, body position, subject scale, and camera viewpoint. "
         "Do not turn the head, change the pose, rotate the body, alter the expression, recenter the person, or create a new camera angle. "
         "If the source is a focused front-facing camera portrait, it must remain the same focused front-facing portrait. "
@@ -1472,7 +1478,7 @@ def process_single_enhance(
                 # The selected backdrop is applied by the final matte. Keep
                 # edit guidance restrained so it restores the photographed
                 # person instead of repainting skin and hair colour.
-                true_cfg_scale=1.4,
+                true_cfg_scale=1.18,
                 # The API can request a four-step Qwen test. The Gradio UI
                 # keeps the quality default at twenty steps.
                 steps=max(1, int(qwen_steps)),
@@ -1481,8 +1487,8 @@ def process_single_enhance(
                 # Qwen needs a sufficiently large latent canvas to reconstruct
                 # fine hair, facial detail, and fabric from small phone photos.
                 # This is not a post-generation upscaler.
-                max_generation_dimension=640,
-                minimum_generation_dimension=640,
+                max_generation_dimension=704,
+                minimum_generation_dimension=704,
                 keep_generation_resolution=True,
                 # A second Qwen face pass re-generated the face instead of
                 # restoring it, so the full-portrait edit remains the only
