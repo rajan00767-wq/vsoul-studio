@@ -1268,6 +1268,11 @@ class QwenEditPipeline:
         # Qwen's identity QA runs before this point. Keep the accepted Qwen image
         # intact: a low-resolution source-face overlay made the face and neck soft.
         identity_locked = Image.open(output_path).convert("RGB")
+        # Qwen is used for the person/uniform edit. Its prompt can still return
+        # a near-match rather than the exact requested RGB at the canvas edge.
+        # Normalize only the corner-connected generated backdrop before crop;
+        # this leaves the subject, uniform, hair, and jewelry untouched.
+        identity_locked = self._replace_smooth_border_background(identity_locked, background_color)
         if progress_callback:
             progress_callback(96, "Cropping to school passport framing...")
         cropped = self._crop_school_passport_portrait(identity_locked, width, height)

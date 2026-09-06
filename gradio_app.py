@@ -145,6 +145,7 @@ def apply_selected_background_matte(image: Image.Image, target_rgb: Tuple[int, i
     """Use an isolated matte worker to replace only the generated backdrop."""
     cache_dir = Path("scratch/cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    project_root = Path(__file__).resolve().parent
     stamp = int(time.time() * 1000)
     input_path = cache_dir / f"qwen_matte_{stamp}.png"
     output_path = cache_dir / f"qwen_matte_{stamp}_out.png"
@@ -152,8 +153,13 @@ def apply_selected_background_matte(image: Image.Image, target_rgb: Tuple[int, i
     try:
         image.convert("RGB").save(input_path)
         worker_code = f'''import io
+import sys
 from pathlib import Path
 from PIL import Image
+# This worker runs from scratch/cache, not the application package. Make the
+# project imports explicit so a failed import cannot silently retain Qwen's
+# approximate backdrop instead of the user-selected RGB color.
+sys.path.insert(0, {str(project_root)!r})
 from pipelines.birefnet_service import background_removal
 
 input_path = Path({str(input_path.resolve())!r})
@@ -168,7 +174,7 @@ canvas.convert("RGB").save(output_path, format="PNG")
 '''
         worker_path.write_text(worker_code, encoding="utf-8")
         completed = subprocess.run(
-            [sys.executable, str(worker_path)], capture_output=True, text=True,
+            [sys.executable, str(worker_path)], cwd=str(project_root), capture_output=True, text=True,
         )
         if completed.returncode != 0 or not output_path.exists():
             raise RuntimeError(completed.stderr[-1200:] or "background matte worker failed")
@@ -254,12 +260,14 @@ def _run_qwen_2511_uniform_fit(
         prompt=(
             "Refine this school uniform portrait only where cloth meets the neck, shoulders, and sleeves. "
             "Preserve the person's exact face, hair, skin, expression, pose, and any real eyewear. "
+            "Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, "
+            "or ornament: retain its presence, shape, color, material, placement, and natural reflections. "
             "Preserve the exact uniform color, fabric pattern, badge, logo, buttons, collar design, and garment shape. "
             "Create a natural collar-to-neck contact with no double clothing layer, no exposed background fringe, "
             f"no added accessories, and no changed identity. Fit constraints from visual analysis: {constraint_text}."
         ),
         negative_prompt=(
-            "changed identity, altered face, different hair, glasses, sunglasses, new jewelry, extra collar, "
+            "changed identity, altered face, different hair, glasses, sunglasses, new jewelry, missing jewelry, altered jewelry, extra collar, "
             "double shirt, recolored uniform, missing badge, missing logo, cropped uniform, distorted shoulders, "
             "background leakage, halo, cutout edge, artifacts"
         ),
@@ -533,6 +541,11 @@ def build_dynamic_identity_prompt(
         "Preserve every visible hair clip and its placement. Do not bleach, silver, gloss, extend, restyle, or invent hair. "
         "Dark hair must remain naturally dark; never add white, grey, blue-metallic, or overexposed highlights. "
     )
+    jewelry_lock = (
+        "Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, ring, or ornament. "
+        "Do not remove, hide, recolor, reshape, move, blur, merge, duplicate, or replace jewelry. "
+        "Retain its real material, fine detail, placement, and natural reflections; do not invent additional jewelry. "
+    )
     pose_lock = (
         "Treat the uploaded camera geometry as a hard constraint: keep the exact head angle, head tilt, eye direction, "
         "shoulder line, torso orientation, body position, subject scale, and camera viewpoint. "
@@ -549,6 +562,7 @@ def build_dynamic_identity_prompt(
         "Correct compression noise, blur, and uneven exposure only; retain real skin texture, natural hair strands, and original dress weave. "
         + lighting_instruction
         + hair_instruction +
+        jewelry_lock +
         pose_lock +
         "Keep the original dress design, lace straps, fabric weave, color, and pose unchanged. Do not erase, blur, or turn the dress into blank white fabric. "
         "Do not add clothing layers, text, logos, accessories, or objects. "
@@ -568,7 +582,7 @@ def build_dynamic_identity_prompt(
         + background_lock
         + portrait_quality
         + f"Preserve the person's exact facial identity, age, expression, skin tone, eyes, hair, and {analysis['framing_desc']}. "
-        + f"Keep {analysis['cloth_desc']} photorealistic. {clothing_lock}{headwear_lock} Do not add glasses, jewelry, clothing, objects, or background elements. "
+        + f"Keep {analysis['cloth_desc']} photorealistic. {clothing_lock}{headwear_lock} Do not add glasses, new jewelry, clothing, objects, or background elements. "
         f"{glasses_pos}{crop_note}"
     )
     return prompt
@@ -1443,7 +1457,8 @@ def process_single_enhance(
                     "extra person, second face, extra hands, object, decoration, pattern, scenery, "
                     "altered identity, altered hair, altered clothing, cropped hair crown, text, watermark, "
                     "blur, plastic skin, distorted face, enlarged eyes, head turn, changed pose, body rotation, "
-                    "different camera angle, changed gaze, changed expression, recentered subject, " + glasses_negative
+                    "different camera angle, changed gaze, changed expression, recentered subject, missing jewelry, "
+                    "altered jewelry, duplicated jewelry, " + glasses_negative
                 ),
                 background_color=bg_desc,
                 # 1.15 was too weak for Qwen Image Edit to reliably replace
