@@ -884,7 +884,7 @@
               <a id="enhance-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
                 ↓ Download Enhanced Image (<span id="enhance-dl-name-display"></span>)
               </a>
-              <button id="enhance-candidate-toggle" class="btn-action" type="button" onclick="toggleEnhanceCandidate()" style="display:none;justify-content:center;">View Qwen Candidate</button>
+              <button id="enhance-candidate-toggle" class="btn-action" type="button" onclick="toggleEnhanceCandidate()" style="display:none;justify-content:center;">View Generated Candidate</button>
             </div>
           </div>
         </div>
@@ -975,7 +975,7 @@
         <!-- Progress Box with Cancel / Retry -->
         <div class="progress-box" id="uniform-progress" style="display:none">
           <div class="progress-header">
-            <span class="progress-title">Qwen Uniform Fitting</span>
+            <span class="progress-title">Uniform Fitting</span>
             <span class="progress-pct" id="uniform-pct">0%</span>
           </div>
           <div class="progress-track">
@@ -1102,7 +1102,7 @@
         <!-- Action Row -->
         <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
           <button class="btn-primary" id="bulk-start-btn" disabled onclick="startBulkEnhance()" style="flex:1;">
-            ✦ Enhance All (Qwen Bulk)
+            ✦ Enhance All
           </button>
           <button class="btn-action" id="bulk-cancel-btn" onclick="cancelBulkEnhance()" style="display:none;color:var(--error);border-color:rgba(239,68,68,0.3);">
             ✕ Cancel Batch
@@ -1327,14 +1327,14 @@
         stage.classList.remove('is-revealing');
         requestAnimationFrame(() => stage.classList.add('is-revealing'));
         document.getElementById('enhance-after-badge').textContent = isCandidate
-          ? 'Qwen Candidate - Review Identity'
+          ? 'Generated Candidate - Review Identity'
           : `${afterImg.naturalWidth}x${afterImg.naturalHeight} px - 300 DPI`;
       };
       afterImg.src = url;
       dlBtn.href = url;
       if (enhanceState.candidateResultUrl) {
         toggle.style.display = 'inline-flex';
-        toggle.textContent = isCandidate ? 'View Identity-Preserved Result' : 'View Qwen Candidate';
+        toggle.textContent = isCandidate ? 'View Identity-Preserved Result' : 'View Generated Candidate';
       }
     }
 
@@ -1367,9 +1367,9 @@
       cancelBtn.style.display = 'inline-flex';
       retryBtn.style.display = 'none';
 
-      fillEl.style.width = '8%';
-      pctEl.textContent = '8%';
-      msgEl.textContent = 'Uploading photo to AI studio queue…';
+      fillEl.style.width = '0%';
+      pctEl.textContent = '0%';
+      msgEl.textContent = 'Uploading portrait…';
 
       try {
         const bgColor = getBackdropRgb('enhance', '#FFFFFF');
@@ -1432,11 +1432,11 @@
 
           if (job.status === 'queued') {
             const posText = job.queue_position > 0 ? ` (Position #${job.queue_position} in queue)` : '';
-            fillEl.style.width = '12%';
-            pctEl.textContent = '12%';
+            fillEl.style.width = '0%';
+            pctEl.textContent = '—';
             msgEl.textContent = `Waiting in queue${posText}…`;
           } else if (job.status === 'processing') {
-            const prog = Math.max(15, Math.min(job.progress || 35, 95));
+            const prog = Math.max(1, Math.min(job.progress || 1, 99));
             fillEl.style.width = `${prog}%`;
             pctEl.textContent = `${prog}%`;
             msgEl.textContent = job.message || 'Processing on GPU (1-by-1)…';
@@ -1465,7 +1465,7 @@
             document.getElementById('enhance-dl-name-display').textContent = downloadName;
             document.getElementById('enhance-compare').style.display = 'grid';
 
-            toast('✦ Qwen Studio Enhancement complete!', 'success');
+            toast('✦ Studio enhancement complete!', 'success');
 
           } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
             clearInterval(enhanceState.pollInterval);
@@ -1650,8 +1650,8 @@
       pBox.style.display = 'flex';
       document.getElementById('uniform-cancel-btn').style.display = 'inline-flex';
       document.getElementById('uniform-retry-btn').style.display = 'none';
-      document.getElementById('uniform-fill').style.width = '15%';
-      document.getElementById('uniform-pct').textContent = '15%';
+      document.getElementById('uniform-fill').style.width = '0%';
+      document.getElementById('uniform-pct').textContent = '0%';
       document.getElementById('uniform-msg').textContent = 'Uploading student & uniform images…';
 
       try {
@@ -1671,10 +1671,10 @@
         const data = await resp.json();
 
         uniformState.jobId = data.job_id;
-        document.getElementById('uniform-fill').style.width = '35%';
-        document.getElementById('uniform-pct').textContent = '35%';
-        document.getElementById('uniform-msg').textContent = 'Measuring the portrait and fitting the uploaded uniform…';
-        setUniformLoadingCopy('Measuring fit');
+        document.getElementById('uniform-fill').style.width = '0%';
+        document.getElementById('uniform-pct').textContent = '—';
+        document.getElementById('uniform-msg').textContent = 'Waiting in queue…';
+        setUniformLoadingCopy('Uploading');
 
         pollUniformJob(data.job_id);
 
@@ -1702,10 +1702,19 @@
           if (!resp.ok) return;
           const job = await resp.json();
 
-          document.getElementById('uniform-fill').style.width = `${job.progress || 50}%`;
-          document.getElementById('uniform-pct').textContent = `${job.progress || 50}%`;
-          document.getElementById('uniform-msg').textContent = job.message || 'Processing…';
-          setUniformLoadingCopy(job.message);
+          if (job.status === 'queued') {
+            const position = job.queue_position > 0 ? ` (Position #${job.queue_position})` : '';
+            document.getElementById('uniform-fill').style.width = '0%';
+            document.getElementById('uniform-pct').textContent = '—';
+            document.getElementById('uniform-msg').textContent = `Waiting in queue${position}…`;
+            setUniformLoadingCopy('Uploading');
+          } else if (job.status === 'processing') {
+            const progress = Math.max(1, Math.min(job.progress || 1, 99));
+            document.getElementById('uniform-fill').style.width = `${progress}%`;
+            document.getElementById('uniform-pct').textContent = `${progress}%`;
+            document.getElementById('uniform-msg').textContent = job.message || 'Fitting uniform…';
+            setUniformLoadingCopy(job.message);
+          }
 
           if (job.status === 'done') {
             clearInterval(uniformState.pollInterval);
@@ -1883,7 +1892,7 @@
 
     async function processBulkItem(item) {
       item.status = 'queued';
-      item.progress = 5;
+      item.progress = 0;
       item.message = 'Queued in processing line…';
       updateBulkItemUI(item);
       updateBulkStats();
@@ -1925,12 +1934,12 @@
 
               if (job.status === 'queued') {
                 item.status = 'queued';
-                item.progress = 10;
+                item.progress = 0;
                 item.message = job.queue_position > 0 ? `Position #${job.queue_position} in queue` : 'Queued…';
                 updateBulkItemUI(item);
               } else if (job.status === 'processing') {
                 item.status = 'processing';
-                item.progress = Math.max(15, Math.min(job.progress || 35, 95));
+                item.progress = Math.max(1, Math.min(job.progress || 1, 99));
                 item.message = job.message || 'Processing on GPU…';
                 updateBulkItemUI(item);
               } else if (job.status === 'done') {

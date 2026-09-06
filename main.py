@@ -106,21 +106,24 @@ async def _execute_queued_job(job_id: str, job: dict):
 
     try:
         if job_type == "qwen_enhance":
-            def _cb(n, desc="", status="processing", stage="qwen_diffusion"):
+            def _cb(n, desc="", status="processing", stage="portrait_processing"):
                 current_job = _js.get_job(job_id)
                 if current_job and current_job.get("status") == "cancelled":
                     raise JobCancelledError("Enhancement cancelled by user")
                 pct = int(round((n * 100) if isinstance(n, float) and n <= 1 else n))
+                current_progress = int((current_job or {}).get("progress") or 0)
                 _js.update_job(
                     job_id,
                     status=status,
-                    progress=min(99, max(1, pct)),
+                    # Pipeline stages can overlap slightly; never make the
+                    # user-facing percentage move backwards.
+                    progress=min(99, max(1, current_progress, pct)),
                     stage=stage,
                     message=desc or "Enhancing portrait…",
                     _last_update=str(time.time()),
                 )
 
-            _cb(0.08, "Starting studio enhancement…")
+            _cb(0.05, "Preparing portrait…")
 
             input_path = job.get("input_path")
             upscale_factor = int(metadata.get("upscale_factor", 1))
@@ -276,7 +279,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                 status="done",
                 stage="done",
                 progress=100,
-                message="Qwen VL analysis and 20-step Qwen Image Edit complete!",
+                message="School uniform fitting complete!",
                 output_path=rel_out,
                 result_url=f"/{rel_out}",
                 original_filename=orig_name,

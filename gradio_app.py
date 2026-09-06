@@ -507,9 +507,13 @@ def build_dynamic_identity_prompt(
     direct_sunlight = bool((vl_brief or {}).get("direct_sunlight_present", False))
     head_hair_hotspot = bool((vl_brief or {}).get("head_hair_hotspot_present", False))
     clothing_description = str((vl_brief or {}).get("clothing_description") or "source garment").strip()
+    skin_tone = str((vl_brief or {}).get("skin_tone") or "source natural skin tone").strip()
+    hair_color = str((vl_brief or {}).get("hair_color") or "source natural hair color").strip()
     # VL is advisory only. Keep its garment phrase short and neutral so it
     # cannot carry a fabricated scene or additional person into Qwen Edit.
     clothing_description = re.sub(r"[^a-zA-Z0-9 ,.-]", "", clothing_description)[:100] or "source garment"
+    skin_tone = re.sub(r"[^a-zA-Z0-9 ,.-]", "", skin_tone)[:80] or "source natural skin tone"
+    hair_color = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_color)[:80] or "source natural hair color"
     crop_note = (
         "Create exactly one centered, head-and-shoulders portrait of the uploaded person only. "
         "Keep the complete hair crown visible with clear blank headroom above it; never crop the top of the hair. "
@@ -537,7 +541,7 @@ def build_dynamic_identity_prompt(
         else "No headwear is visible. Do not add a cap, hat, helmet, scarf, or any head covering. "
     )
     hair_instruction = (
-        "Keep the original hairstyle, hair color, parting, hairline, curls, clips, and visible hair volume. "
+        f"Visual analysis identifies the source hair as {hair_color}. Keep that exact natural hair color, hairstyle, parting, hairline, curls, clips, and visible hair volume. "
         "Preserve every visible hair clip and its placement. Do not bleach, silver, gloss, extend, restyle, or invent hair. "
         "Dark hair must remain naturally dark; never add white, grey, blue-metallic, or overexposed highlights. "
     )
@@ -553,7 +557,7 @@ def build_dynamic_identity_prompt(
         "If the source is a focused front-facing camera portrait, it must remain the same focused front-facing portrait. "
     )
     lighting_instruction = (
-        "Use soft, even, neutral studio lighting. Correct visible harsh sunlight and deep shadows without changing natural skin tone, original hair color, dress color, or subject details. "
+        f"Visual analysis identifies the source complexion as {skin_tone}. Use soft, even, neutral studio lighting. Correct visible harsh sunlight and deep shadows without changing that skin tone, the analyzed hair color, dress color, or subject details. "
     )
     portrait_quality = (
         "Preserve the real face, age, expression, and identity exactly. Do not redraw facial anatomy, eyes, eyebrows, nose, or mouth. "
@@ -1417,7 +1421,7 @@ def process_single_enhance(
             # here caused it to paint that color into dark hair as rim light.
             # The selected color is applied separately after generation.
             bg_desc = bg_color_name
-            progress(0.10, desc="Analyzing garment and headroom with Qwen VL...")
+            progress(0.10, desc="Analyzing portrait framing and clothing details...")
             from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
             vl_brief = uniform_vl_analyzer.analyze_portrait(image)
             logger.info(
@@ -1465,7 +1469,10 @@ def process_single_enhance(
                 # 1.15 was too weak for Qwen Image Edit to reliably replace
                 # busy phone-photo backgrounds.  This remains conservative
                 # enough to retain the person's identity after face anchoring.
-                true_cfg_scale=2.5,
+                # The selected backdrop is applied by the final matte. Keep
+                # edit guidance restrained so it restores the photographed
+                # person instead of repainting skin and hair colour.
+                true_cfg_scale=1.4,
                 # The API can request a four-step Qwen test. The Gradio UI
                 # keeps the quality default at twenty steps.
                 steps=max(1, int(qwen_steps)),
@@ -1496,12 +1503,13 @@ def process_single_enhance(
             )
             qwen_pil = Image.open(str(res_path)).convert("RGB")
             candidate_path = None
-            # The identity-preserved output remains the default, but retain a
-            # reviewable version of a rejected Qwen restoration so the user can
-            # make the final visual decision in the browser.
+            # A face-embedding score can remain high even when diffusion gives
+            # a child a different expression, facial texture, or hairstyle.
+            # Keep every generated portrait as an explicit review candidate;
+            # the normal result remains the real uploaded subject with the
+            # requested backdrop and passport framing.
             raw_candidate_path = getattr(qwen_service, "last_qwen_candidate_path", None)
-            candidate_rejected = getattr(qwen_service, "last_qwen_identity_accepted", True) is False
-            if candidate_rejected and raw_candidate_path and Path(raw_candidate_path).is_file():
+            if raw_candidate_path and Path(raw_candidate_path).is_file():
                 candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
                 candidate_pil = apply_selected_background_matte(candidate_pil, tuple(reversed(frame_bg_bgr)))
                 if passport_format and passport_format != "Original Dimensions (Enhanced)":
@@ -1521,22 +1529,19 @@ def process_single_enhance(
                     OUTPUTS_DIR / f"qwen_candidate_{Path(res_path).stem}.png",
                     fallback="qwen_candidate.png",
                 )
-            # Repair only Qwen's pale/coloured artificial hair streaks from
-            # the aligned source hair. The conservative blend preserves Qwen's
-            # restored face and curls rather than regenerating a new hairstyle.
-            progress(0.91, desc="Restoring natural source hair tone...")
-            qwen_pil = photo_restorer.lock_source_hair(image, qwen_pil, strength=0.32)
-            # Keep the raw Qwen person intact. The isolated matte worker
-            # replaces only its grey/generated backdrop with the selected
-            # school-ID color, then exits to release its GPU memory.
+            # Do not auto-deliver a regenerated identity. Keep the real source
+            # subject, then apply only local, non-generative lighting repair.
+            progress(0.91, desc="Balancing harsh sunlight on the portrait...")
+            qwen_pil = photo_restorer.neutralize_direct_sunlight(image)
+            # The isolated matte worker replaces only the original backdrop
+            # with the selected school-ID color, then exits to release GPU memory.
             progress(0.93, desc="Applying the selected studio background...")
             qwen_pil = apply_selected_background_matte(
                 qwen_pil, tuple(reversed(frame_bg_bgr))
             )
 
-            # Return the accepted Qwen pixels unchanged, except for the
-            # user-selected passport framing requirement. Do not relight or
-            # rematte after Qwen because those steps alter hair and face detail.
+            # Keep the real subject unchanged apart from local highlight
+            # compression, the selected backdrop, and passport framing.
             if passport_format and passport_format != "Original Dimensions (Enhanced)":
                 qwen_bgr = cv2.cvtColor(np.array(qwen_pil), cv2.COLOR_RGB2BGR)
                 framed_bgr = photo_restorer.frame_passport_photo(

@@ -670,7 +670,7 @@ class QwenEditPipeline:
         )
 
         if progress_callback:
-            progress_callback(10, "📐 Preprocessing portrait dimensions & studio framing...")
+            progress_callback(10, "Preparing portrait dimensions and studio framing...")
 
         input_pil = self._to_pil(image_input).convert("RGB")
         w_orig, h_orig = input_pil.size
@@ -712,7 +712,7 @@ class QwenEditPipeline:
 
         # ── Step 1: Isolated Multimodal Conditioning Worker ──
         if progress_callback:
-            progress_callback(20, "🧠 Encoding multimodal prompt conditioning via isolated worker...")
+            progress_callback(20, "Preparing portrait guidance...")
 
         logger.info("[QWEN_EDIT_ENHANCER] Encoding conditioning via isolated worker...")
         check_deadline("prompt preparation")
@@ -770,8 +770,8 @@ class QwenEditPipeline:
         num_steps = max(2, min(steps or 4, 24))
         use_lightning_lora = num_steps <= 4
         if progress_callback:
-            mode_label = "4-Step Lightning" if use_lightning_lora else f"Base {num_steps}-Step Quality"
-            progress_callback(40, f"Initializing {mode_label} Diffusion Transformer...")
+            mode_label = "fast" if use_lightning_lora else "high-quality"
+            progress_callback(40, f"Initializing {mode_label} portrait restoration...")
 
         tokenizer = AutoTokenizer.from_pretrained((MODELS_DIR / "tokenizer").resolve().as_posix())
         processor = AutoProcessor.from_pretrained((MODELS_DIR / "processor").resolve().as_posix())
@@ -818,7 +818,7 @@ class QwenEditPipeline:
         def on_step_end(pipe, step_index, timestep, callback_kwargs):
             check_deadline(f"diffusion step {step_index + 1}/{num_steps}")
             pct = int(45 + (step_index + 1) / num_steps * 40)
-            msg = f"⚡ Qwen Generative Diffusion: Studio Relighting (Step {step_index + 1}/{num_steps})…"
+            msg = f"Restoring studio portrait detail (step {step_index + 1}/{num_steps})…"
             if progress_callback:
                 progress_callback(pct, msg)
             return callback_kwargs
@@ -851,7 +851,7 @@ class QwenEditPipeline:
 
         # ── Step 4: Decode Latents on CPU ──
         if progress_callback:
-            progress_callback(88, "🖼️ Decoding neural latents with CPU VAE...")
+            progress_callback(88, "Rendering high-detail portrait...")
         raw_diffused = _decode_cpu_latents(vae, output_latents, height=h, width=w)
         # Keep the unmodified Qwen output for stage-by-stage inspection. This
         # makes it clear whether a later identity check accepted or rejected
@@ -863,7 +863,7 @@ class QwenEditPipeline:
 
         # ── Step 5: High-Fidelity Identity Lock & Optical Detail Restoration ──
         if progress_callback:
-            progress_callback(92, "✨ Anchoring student identity, facial pores & jewelry luster...")
+            progress_callback(92, "Verifying identity and fine portrait detail...")
 
         qwen_portrait_accepted = preserve_source_clothing or self._has_acceptable_portrait_identity(
             input_resized, raw_diffused
@@ -989,7 +989,7 @@ class QwenEditPipeline:
         out_img.save(out_path, format="PNG", dpi=(300, 300))
 
         if progress_callback:
-            progress_callback(100, "✅ Studio portrait enhancement complete!")
+            progress_callback(100, "Studio portrait enhancement complete!")
 
         logger.info("[QWEN_EDIT_ENHANCER] Completed genuine Qwen enhancement in %.2fs -> %s", time.time() - t0, out_path)
         return out_path
@@ -1201,7 +1201,7 @@ class QwenEditPipeline:
         uniform_seed = zlib.crc32(str(self._parse_bg_color(background_color)).encode("ascii"), uniform_seed)
         uniform_seed &= 0x7FFFFFFF
         if progress_callback:
-            progress_callback(8, "Analyzing person and supplied uniform with Qwen VL...")
+            progress_callback(8, "Analyzing person and supplied uniform...")
 
         from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
         vl_plan = uniform_vl_analyzer.analyze(person_pil, template_pil)
@@ -1219,6 +1219,8 @@ class QwenEditPipeline:
                 "outer_neckline",
                 "sleeve_length",
                 "button_layout",
+                "badge_present",
+                "badge_location",
             )
         )
         hair_guide = ", ".join(
@@ -1227,12 +1229,21 @@ class QwenEditPipeline:
         )
         logger.info("[QWEN_ONLY_UNIFORM] job=%s VL plan: %s", job_id, plan)
         logger.info("[QWEN_ONLY_UNIFORM] job=%s stable fit seed=%d", job_id, uniform_seed)
+        template_has_badge = str(vl_plan.get("badge_present", "false")).strip().lower() in {"true", "yes", "present"}
+        badge_instruction = (
+            "A badge or emblem is visibly present in image 2. Preserve that exact visible badge: its shape, colors, border, "
+            f"and location ({vl_plan.get('badge_location', 'template location')}). Do not omit, move, recolor, replace, or invent it. "
+            if template_has_badge
+            else "No badge or emblem is visible in image 2. Do not invent one. "
+        )
 
         generated_prompt = prompt or (
-            "Replace every visible item of source clothing in image 1 with the exact uniform in image 2. Treat image 2 as a "
-            "strict, non-negotiable uniform specification: do not reinterpret, simplify, restyle, add, remove, or substitute "
-            "any garment layer, collar, sleeve, button, seam, fabric, color, or pattern. Never retain the source dress or "
-            "original clothing. Preserve the exact template fabric colors with no hue, saturation, brightness, or pattern change. "
+            "Replace every visible item of source clothing in image 1 with the exact uniform in image 2. Image 2 is a literal "
+            "garment source, never a style reference: each generated collar, shoulder, sleeve, chest, button, seam, fabric, "
+            "color, and pattern must correspond to a visible component in image 2. Treat image 2 as a strict, non-negotiable "
+            "uniform specification. Do not reinterpret, simplify, restyle, add, remove, substitute, or blend any garment layer. "
+            "Never retain source dress pixels or original-clothing colors. Preserve the exact template fabric colors with no hue, "
+            "saturation, brightness, texture, stripe, check, or pattern change. "
             "Create a natural Indian school ID portrait while preserving the same identity, "
             "expression, skin tone, pose, and hairstyle. Hair guide from image 1: "
             f"{hair_guide}. Preserve only those visible hair accessories in the same positions. Do not add, remove, move, "
@@ -1240,8 +1251,8 @@ class QwenEditPipeline:
             "curls, and volume; do not lighten, recolor, enlarge, or regenerate hair. "
             "Keep an anatomically natural neck with the same skin tone as the face and a clean, continuous transition into the "
             "collar, without a dark seam, duplicate neck, or shadow band. Match the template layers, shirt, outer garment, shirt collar, "
-            "outer neckline, sleeves, and buttons. Fit it naturally to the child's shoulders, neck, and upper chest. Omit all "
-            "badges, emblems, crests, logos, and name tags. Crop crown through upper chest, with shoulders and collar visible, "
+            "outer neckline, sleeves, and buttons exactly. Fit that unchanged template design naturally to the child's shoulders, neck, and upper chest. "
+            + badge_instruction + "Crop crown through upper chest, with shoulders and collar visible, "
             "never waist. Use flat exact RGB "
             f"{self._parse_bg_color(background_color)} background. VL garment guide: {plan}."
         )
@@ -1251,7 +1262,9 @@ class QwenEditPipeline:
             "oversized hair, overly dense hair, "
             "missing hair clip, added hair clip, added glasses, duplicate face, "
             "double neck, extra collar, neck seam, dark neck band, neck shadow, distorted uniform, source dress, original clothing, white dress, wrong uniform color, "
-            "wrong shirt pattern, wrong sleeve length, missing uniform layer, school emblem, crest, logo, name tag, badge, "
+            "wrong shirt pattern, wrong sleeve length, missing uniform layer, "
+            + ("missing template badge, altered template badge, invented extra badge, " if template_has_badge else "school emblem, crest, logo, name tag, badge, ")
+            +
             "missing buttons, invented tie, "
             "cropped head, outdoor background, foliage, brick wall, text, watermark, collage"
         )
@@ -1273,7 +1286,9 @@ class QwenEditPipeline:
             max_generation_dimension=576,
             keep_generation_resolution=False,
             use_birefnet_background=False,
-            true_cfg_scale=1.15,
+            # Uniform compliance needs stronger reference guidance than portrait
+            # restoration. The person and hair remain protected by the prompt.
+            true_cfg_scale=1.65,
             seed=uniform_seed,
         )
         # Qwen's identity QA runs before this point. Keep the accepted Qwen image

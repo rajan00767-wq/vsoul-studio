@@ -548,6 +548,56 @@ class PhotoRestorationService:
             return False
 
     @staticmethod
+    def neutralize_direct_sunlight(image_pil: Image.Image) -> Image.Image:
+        """Compress face and hair hot spots without regenerating subject pixels."""
+        image = np.array(image_pil.convert("RGB"))
+        h, w = image.shape[:2]
+        try:
+            bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            faces = _get_insight_app().get(bgr)
+            if not faces:
+                return image_pil
+
+            x1, y1, x2, y2 = [int(value) for value in faces[0].bbox]
+            face_w, face_h = max(24, x2 - x1), max(24, y2 - y1)
+            center_x = (x1 + x2) // 2
+            face_mask = np.zeros((h, w), dtype=np.uint8)
+            hair_mask = np.zeros((h, w), dtype=np.uint8)
+            # The forehead and cheeks receive broad, soft correction. Hair is
+            # separately bounded above the face so dark curls are not lightened.
+            cv2.ellipse(face_mask, (center_x, y1 + int(face_h * 0.48)),
+                        (int(face_w * 0.60), int(face_h * 0.58)), 0, 0, 360, 255, -1)
+            cv2.ellipse(hair_mask, (center_x, max(0, y1 + int(face_h * 0.10))),
+                        (int(face_w * 0.95), int(face_h * 0.82)), 0, 0, 360, 255, -1)
+            cv2.ellipse(hair_mask, (center_x, y1 + int(face_h * 0.50)),
+                        (int(face_w * 0.61), int(face_h * 0.62)), 0, 0, 360, 0, -1)
+
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            luminance = lab[:, :, 0]
+            face_alpha = cv2.GaussianBlur(face_mask, (31, 31), 7).astype(np.float32) / 255.0
+            hair_alpha = cv2.GaussianBlur(hair_mask, (31, 31), 7).astype(np.float32) / 255.0
+            # Only compress high local values: midtones and genuine facial
+            # detail are untouched. This removes direct-sun hot spots rather
+            # than applying a beauty filter or a global darkening.
+            # Outdoor highlights on medium-to-deep skin often clip warm/orange
+            # before reaching pure white, so use a lower local threshold.
+            face_hot = np.clip((luminance - 132.0) / 68.0, 0.0, 1.0) * face_alpha
+            hair_hot = np.clip((luminance - 112.0) / 78.0, 0.0, 1.0) * hair_alpha
+            luminance -= face_hot * 42.0
+            luminance -= hair_hot * 48.0
+            lab[:, :, 0] = np.clip(luminance, 0, 255)
+            # Strong sun can push skin toward orange. Blend chroma a little
+            # toward neutral only inside the face highlight mask.
+            lab[:, :, 1] += (128.0 - lab[:, :, 1]) * face_hot * 0.12
+            lab[:, :, 2] += (128.0 - lab[:, :, 2]) * face_hot * 0.08
+            corrected = cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+            logger.info("[LIGHTING] Compressed direct-sun highlights on source portrait")
+            return Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+        except Exception as exc:
+            logger.warning("[LIGHTING] Direct-sun correction skipped: %s", exc)
+            return image_pil
+
+    @staticmethod
     def lock_source_hair(
         orig_pil: Image.Image, portrait_pil: Image.Image, strength: float = 0.78
     ) -> Image.Image:
