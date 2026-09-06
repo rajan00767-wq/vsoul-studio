@@ -1223,38 +1223,31 @@ class QwenEditPipeline:
                 "badge_location",
             )
         )
-        hair_guide = ", ".join(
-            f"{key}={vl_plan.get(key, 'unknown')}"
-            for key in ("hair_style", "hair_color", "hair_accessories")
-        )
         logger.info("[QWEN_ONLY_UNIFORM] job=%s VL plan: %s", job_id, plan)
         logger.info("[QWEN_ONLY_UNIFORM] job=%s stable fit seed=%d", job_id, uniform_seed)
-        template_has_badge = str(vl_plan.get("badge_present", "false")).strip().lower() in {"true", "yes", "present"}
-        badge_instruction = (
-            "A badge or emblem is visibly present in image 2. Preserve that exact visible badge: its shape, colors, border, "
-            f"and location ({vl_plan.get('badge_location', 'template location')}). Do not omit, move, recolor, replace, or invent it. "
-            if template_has_badge
-            else "No badge or emblem is visible in image 2. Do not invent one. "
-        )
-
         generated_prompt = prompt or (
-            "Replace every visible item of source clothing in image 1 with the exact uniform in image 2. Image 2 is a literal "
+            "There are three images. Image 1 is the editable portrait. Image 2 is an immutable duplicate of the same person, "
+            "provided solely to lock the head, face, hair, clips, jewelry, expression, and pose. Image 3 is the exact uniform template. "
+            "Replace every visible item of source clothing in image 1 with the exact uniform in image 3. Image 3 is a literal "
             "garment source, never a style reference: each generated collar, shoulder, sleeve, chest, button, seam, fabric, "
-            "color, and pattern must correspond to a visible component in image 2. Treat image 2 as a strict, non-negotiable "
+            "color, and pattern must correspond to a visible component in image 3. Treat image 3 as a strict, non-negotiable "
             "uniform specification. Do not reinterpret, simplify, restyle, add, remove, substitute, or blend any garment layer. "
             "Never retain source dress pixels or original-clothing colors. Preserve the exact template fabric colors with no hue, "
             "saturation, brightness, texture, stripe, check, or pattern change. "
-            "Create a natural Indian school ID portrait while preserving the same identity, "
-            "expression, skin tone, pose, and hairstyle. Hair guide from image 1: "
-            f"{hair_guide}. Preserve only those visible hair accessories in the same positions. Do not add, remove, move, "
-            "or invent clips, bows, bands, headwear, or jewelry. Preserve the source hair silhouette, color, parting, length, "
-            "curls, and volume; do not lighten, recolor, enlarge, or regenerate hair. "
+            "Images 1 and 2 are the authoritative references for the person. Lock their complete head region: preserve the exact "
+            "face, expression, skin tone, pose, hair silhouette, hairline, parting, length, curls, volume, natural hair "
+            "color, and every visible hair accessory in its existing position. Do not regenerate, restyle, straighten, "
+            "braid, recolor, enlarge, trim, smooth, add, remove, or move any hair, clip, bow, band, headwear, or jewelry. "
+            "Image 3 is the only authority for the clothing. Its visible pixels override any textual garment label: copy "
+            "the actual collar construction, neckline, shirt pattern, vest shape, sleeve edge, seams, buttons, badge, and "
+            "fabric appearance from image 2 exactly, even if the visual-analysis wording differs. "
             "Keep an anatomically natural neck with the same skin tone as the face and a clean, continuous transition into the "
             "collar, without a dark seam, duplicate neck, or shadow band. Match the template layers, shirt, outer garment, shirt collar, "
             "outer neckline, sleeves, and buttons exactly. Fit that unchanged template design naturally to the child's shoulders, neck, and upper chest. "
-            + badge_instruction + "Crop crown through upper chest, with shoulders and collar visible, "
+            "Do not display any school badge, emblem, crest, logo, name tag, lettering, or patch, even if it appears on the uploaded template. "
+            "Crop crown through upper chest, with shoulders and collar visible, "
             "never waist. Use flat exact RGB "
-            f"{self._parse_bg_color(background_color)} background. VL garment guide: {plan}."
+            f"{self._parse_bg_color(background_color)} background."
         )
         negative_prompt = (
             "different person, altered identity, changed face, changed hairstyle, altered hairline, different hair part, "
@@ -1263,14 +1256,16 @@ class QwenEditPipeline:
             "missing hair clip, added hair clip, added glasses, duplicate face, "
             "double neck, extra collar, neck seam, dark neck band, neck shadow, distorted uniform, source dress, original clothing, white dress, wrong uniform color, "
             "wrong shirt pattern, wrong sleeve length, missing uniform layer, "
-            + ("missing template badge, altered template badge, invented extra badge, " if template_has_badge else "school emblem, crest, logo, name tag, badge, ")
-            +
+            "school emblem, crest, logo, name tag, badge, patch, lettering, "
             "missing buttons, invented tie, "
             "cropped head, outdoor background, foliage, brick wall, text, watermark, collage"
         )
         output_path = self.qwen_edit_enhancer(
             image_input=person_pil,
-            reference_images=[template_pil],
+            # Repeat the source person as a dedicated reference image. Qwen
+            # otherwise treats the only non-template image as fully editable
+            # and can restyle hair while fitting the uniform.
+            reference_images=[person_pil, template_pil],
             prompt=generated_prompt,
             negative_prompt=negative_prompt,
             job_id=job_id,
@@ -1286,9 +1281,9 @@ class QwenEditPipeline:
             max_generation_dimension=576,
             keep_generation_resolution=False,
             use_birefnet_background=False,
-            # Uniform compliance needs stronger reference guidance than portrait
-            # restoration. The person and hair remain protected by the prompt.
-            true_cfg_scale=1.65,
+            # Keep enough guidance to copy the uniform reference without
+            # overwhelming the locked source-person composition.
+            true_cfg_scale=1.35,
             seed=uniform_seed,
         )
         # Qwen's identity QA runs before this point. Keep the accepted Qwen image
