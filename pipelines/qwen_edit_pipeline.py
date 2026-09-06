@@ -603,9 +603,13 @@ class QwenEditPipeline:
             else:
                 torso_coverage = 0.0
             torso_present = torso_coverage >= 0.42
-            accepted = similarity >= 0.54 and torso_present
+            # A weak 0.54 gate accepted visibly regenerated faces, hair clips,
+            # and jewelry as long as they were broadly similar.  Keep Qwen's
+            # restoration only when it stays close enough to the source person
+            # for an ID-photo workflow.
+            accepted = similarity >= 0.62 and torso_present
             logger.info(
-                "[PORTRAIT_QA] Identity similarity=%.3f threshold=0.540 torso_coverage=%.2f accepted=%s",
+                "[PORTRAIT_QA] Identity similarity=%.3f threshold=0.620 torso_coverage=%.2f accepted=%s",
                 similarity, torso_coverage, accepted,
             )
             return accepted
@@ -866,7 +870,10 @@ class QwenEditPipeline:
         # caller.  A QA fallback here used to replace a raw Qwen result with a
         # source/BiRefNet composite, so users received a different photo from
         # the raw output they had reviewed during testing.
-        use_accepted_qwen_raw = not preserve_source_clothing
+        # The calculated QA decision must govern the raw-Qwen path.  Previously
+        # this ignored `qwen_portrait_accepted`, so a low-fidelity regeneration
+        # was returned even after the identity check had flagged it.
+        use_accepted_qwen_raw = not preserve_source_clothing and qwen_portrait_accepted
         if use_accepted_qwen_raw:
             # Do not blend, rematte, sharpen, or relight the decoded Qwen
             # portrait.  Those operations visibly alter its face and hair.
