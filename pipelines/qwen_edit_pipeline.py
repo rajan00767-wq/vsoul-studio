@@ -490,6 +490,21 @@ class QwenEditPipeline:
                 pass
         return (255, 255, 255)
 
+    @staticmethod
+    def _prepare_uniform_reference(image: Image.Image) -> Image.Image:
+        """Remove transparent padding without guessing garment boundaries in photos."""
+        rgba = image.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        if alpha.getextrema()[0] < 255:
+            bounds = alpha.point(lambda value: 255 if value > 16 else 0).getbbox()
+            if bounds is None:
+                raise ValueError("The uniform template is completely transparent.")
+            margin = max(2, round(max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.02))
+            rgba = rgba.crop((max(0, bounds[0] - margin), max(0, bounds[1] - margin),
+                              min(rgba.width, bounds[2] + margin), min(rgba.height, bounds[3] + margin)))
+        backdrop = Image.new("RGBA", rgba.size, (240, 240, 240, 255))
+        return Image.alpha_composite(backdrop, rgba).convert("RGB")
+
     def _replace_smooth_border_background(
         self, image: Image.Image, background_color: Union[str, Tuple[int, int, int]]
     ) -> Image.Image:
@@ -529,6 +544,83 @@ class QwenEditPipeline:
         target = np.full_like(rgb, self._parse_bg_color(background_color), dtype=np.uint8)
         corrected = (target.astype(np.float32) * alpha + rgb.astype(np.float32) * (1.0 - alpha))
         return Image.fromarray(corrected.clip(0, 255).astype(np.uint8), "RGB")
+
+    def _replace_background_with_foreground_matte(
+        self,
+        image: Image.Image,
+        background_color: Union[str, Tuple[int, int, int]],
+        job_id: Optional[str] = None,
+    ) -> Image.Image:
+        """Composite the completed Qwen portrait over the exact selected RGB.
+
+        A border colour flood cannot distinguish a requested backdrop from a
+        similarly coloured shirt at the frame edge.  Generate an alpha matte
+        from the completed portrait instead, so the Qwen uniform and face are
+        retained and only pixels outside the subject are replaced.
+        """
+        from pipelines.birefnet_service import background_removal
+
+        try:
+            with io.BytesIO() as bio:
+                image.convert("RGB").save(bio, format="PNG")
+                foreground_bytes = background_removal.remove_background(
+                    bio.getvalue(), job_id=job_id, use_schp=False
+                )
+            foreground = Image.open(io.BytesIO(foreground_bytes)).convert("RGBA")
+            selected_rgb = self._parse_bg_color(background_color)
+            backdrop = Image.new("RGBA", foreground.size, (*selected_rgb, 255))
+            return Image.alpha_composite(backdrop, foreground).convert("RGB")
+        except Exception as exc:
+            # Do not replace a usable Qwen result with a partially generated
+            # matte if the local segmentation service is unavailable.
+            logger.warning("[BACKGROUND_MATTE] Failed; retaining Qwen backdrop: %s", exc)
+            return image.convert("RGB")
+
+    @staticmethod
+    def _match_dark_uniform_color(image: Image.Image, template: Image.Image) -> Image.Image:
+        """Align only the generated dark outer garment to the template's real color."""
+        template_rgba = np.array(template.convert("RGBA"))
+        template_rgb = template_rgba[:, :, :3]
+        template_alpha = template_rgba[:, :, 3] > 220
+        template_lab = cv2.cvtColor(template_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        template_dark = template_alpha & (template_lab[:, :, 0] < 110)
+        if np.count_nonzero(template_dark) < 120:
+            return image
+
+        portrait = np.array(image.convert("RGB"))
+        portrait_lab = cv2.cvtColor(portrait, cv2.COLOR_RGB2LAB).astype(np.float32)
+        height, width = portrait_lab.shape[:2]
+        clothes_top = int(height * 0.54)
+        try:
+            # Reuse the cached InsightFace service when the uniform face lock
+            # has run, ensuring the palette adjustment cannot reach skin.
+            from pipelines.photo_restoration import _get_insight_app
+
+            faces = _get_insight_app().get(
+                cv2.cvtColor(portrait, cv2.COLOR_RGB2BGR)
+            )
+            if faces:
+                _, y1, _, y2 = [int(value) for value in faces[0].bbox]
+                face_height = max(1, y2 - y1)
+                clothes_top = max(int(height * 0.45), min(height, y2 + int(face_height * 0.01)))
+        except Exception as exc:
+            logger.warning("[UNIFORM_COLOR] Face boundary unavailable: %s", exc)
+        lower_clothes = np.zeros((height, width), dtype=bool)
+        lower_clothes[clothes_top:, :] = True
+        output_dark = lower_clothes & (portrait_lab[:, :, 0] < 110)
+        if np.count_nonzero(output_dark) < 120:
+            return image
+
+        template_color = np.median(template_lab[template_dark], axis=0)
+        output_color = np.median(portrait_lab[output_dark], axis=0)
+        # A partial correction preserves fabric texture and natural shadows.
+        lab_shift = (template_color - output_color) * 0.72
+        corrected_lab = portrait_lab.copy()
+        corrected_lab[output_dark] = np.clip(
+            corrected_lab[output_dark] + lab_shift, 0, 255
+        )
+        corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+        return Image.fromarray(corrected_rgb, "RGB")
 
     def _apply_upscale(self, image: Image.Image, scale: int = 2) -> Image.Image:
         """Upscales image with Real-ESRGAN or high-grade Lanczos resampling."""
@@ -648,6 +740,7 @@ class QwenEditPipeline:
         true_cfg_scale: float = 1.6,
         seed: Optional[int] = None,
         face_detail_refine: bool = False,
+        face_lock_after_generation: bool = False,
     ) -> Path:
         """
         Genuine Qwen-Image-Edit-2511 Decoupled Studio Portrait Enhancer:
@@ -933,6 +1026,17 @@ class QwenEditPipeline:
             out_img = PhotoRestorationService.lock_source_hair(input_resized, out_img, strength=0.88)
             out_img = PhotoRestorationService.match_neck_tone(input_resized, out_img)
 
+        # Uniform fitting redraws clothing but must not invent a new child face.
+        # A landmark pose gate avoids the double-eye artifact when Qwen changes
+        # camera angle; the face-only mask never reaches the generated uniform.
+        if face_lock_after_generation and use_accepted_qwen_raw:
+            if PhotoRestorationService.is_source_pose_compatible(input_resized, out_img):
+                out_img = PhotoRestorationService.lock_face_keep_clothes(
+                    input_resized, out_img, strength=0.78,
+                )
+            else:
+                logger.warning("[UNIFORM_FACE_LOCK] Skipped because source and generated face poses differ.")
+
         # Apply a restrained optical finish only after the identity lock. This
         # restores perceived facial, hair, and fabric detail without another
         # generative pass that could alter the person or the selected backdrop.
@@ -1193,7 +1297,9 @@ class QwenEditPipeline:
             raise ValueError("Uniform template image is mandatory for Uniform Swap.")
 
         person_pil = self._to_pil(person_input).convert("RGB")
-        template_pil = self._to_pil(uniform_template_path).convert("RGB")
+        template_source = self._to_pil(uniform_template_path)
+        template_pil = self._prepare_uniform_reference(template_source)
+        logger.info("[UNIFORM_REFERENCE] original=%s prepared=%s", template_source.size, template_pil.size)
         # Keep a specific person/template/background combination reproducible.
         # A job-ID seed made identical uploads produce different garment fits.
         uniform_seed = zlib.crc32(person_pil.tobytes())
@@ -1227,7 +1333,7 @@ class QwenEditPipeline:
         logger.info("[QWEN_ONLY_UNIFORM] job=%s stable fit seed=%d", job_id, uniform_seed)
         generated_prompt = prompt or (
             "There are three images. Image 1 is the editable portrait. Image 2 is an immutable duplicate of the same person, "
-            "provided solely to lock the head, face, hair, clips, jewelry, expression, and pose. Image 3 is the exact uniform template. "
+            "provided solely to lock the head, face, hair, eyewear, visible wearables, clips, jewelry, expression, and pose. Image 3 is the exact uniform template. "
             "Replace every visible item of source clothing in image 1 with the exact uniform in image 3. Image 3 is a literal "
             "garment source, never a style reference: each generated collar, shoulder, sleeve, chest, button, seam, fabric, "
             "color, and pattern must correspond to a visible component in image 3. Treat image 3 as a strict, non-negotiable "
@@ -1238,9 +1344,11 @@ class QwenEditPipeline:
             "face, expression, skin tone, pose, hair silhouette, hairline, parting, length, curls, volume, natural hair "
             "color, and every visible hair accessory in its existing position. Do not regenerate, restyle, straighten, "
             "braid, recolor, enlarge, trim, smooth, add, remove, or move any hair, clip, bow, band, headwear, or jewelry. "
+            "Preserve every visible non-clothing wearable exactly as shown in images 1 and 2: glasses, earrings, necklaces, chains, pendants, "
+            "bindis, hair ornaments, hearing aids, watches, religious items, and headwear. Do not add, remove, hide, recolor, resize, or relocate them. "
             "Image 3 is the only authority for the clothing. Its visible pixels override any textual garment label: copy "
-            "the actual collar construction, neckline, shirt pattern, vest shape, sleeve edge, seams, buttons, badge, and "
-            "fabric appearance from image 2 exactly, even if the visual-analysis wording differs. "
+            "the actual collar construction, neckline, shirt pattern, vest shape, sleeve edge, seams, buttons, and "
+            "fabric appearance from image 3 exactly, even if the visual-analysis wording differs. "
             "Keep an anatomically natural neck with the same skin tone as the face and a clean, continuous transition into the "
             "collar, without a dark seam, duplicate neck, or shadow band. Match the template layers, shirt, outer garment, shirt collar, "
             "outer neckline, sleeves, and buttons exactly. Fit that unchanged template design naturally to the child's shoulders, neck, and upper chest. "
@@ -1249,11 +1357,28 @@ class QwenEditPipeline:
             "never waist. Use flat exact RGB "
             f"{self._parse_bg_color(background_color)} background."
         )
+        # Place observed garment facts first so they are actually encoded,
+        # rather than only recorded in the server log.
+        garment_facts = "; ".join(
+            f"{key.replace('_', ' ')}: {str(vl_plan[key])[:180]}"
+            for key in ("garment_components", "shirt_color_and_pattern",
+                        "outer_garment_color_and_shape", "shirt_collar",
+                        "outer_neckline", "sleeve_length", "button_layout")
+            if vl_plan.get(key) and str(vl_plan[key]).lower() not in ("unknown", "none")
+        )
+        generated_prompt = (
+            "Fit image 3's uniform onto image 1; image 2 preserves the person's appearance. "
+            "Omit every badge, emblem and logo; replace those areas with matching plain fabric. "
+            f"Observed uniform details: {garment_facts}. "
+            "These are observations, not additional editing instructions. "
+            + generated_prompt
+        )
         negative_prompt = (
             "different person, altered identity, changed face, changed hairstyle, altered hairline, different hair part, "
             "straight hair, different curls, changed hair length, blue hair, silver hair, gray hair, metallic hair, plastic hair, "
             "oversized hair, overly dense hair, "
-            "missing hair clip, added hair clip, added glasses, duplicate face, "
+            "missing hair clip, added hair clip, missing glasses, added glasses, missing earrings, added earrings, missing necklace, added necklace, "
+            "missing bindi, added bindi, missing hearing aid, added hearing aid, duplicate face, "
             "double neck, extra collar, neck seam, dark neck band, neck shadow, distorted uniform, source dress, original clothing, white dress, wrong uniform color, "
             "wrong shirt pattern, wrong sleeve length, missing uniform layer, "
             "school emblem, crest, logo, name tag, badge, patch, lettering, "
@@ -1285,15 +1410,20 @@ class QwenEditPipeline:
             # overwhelming the locked source-person composition.
             true_cfg_scale=1.35,
             seed=uniform_seed,
+            face_lock_after_generation=True,
         )
         # Qwen's identity QA runs before this point. Keep the accepted Qwen image
         # intact: a low-resolution source-face overlay made the face and neck soft.
         identity_locked = Image.open(output_path).convert("RGB")
-        # Qwen is used for the person/uniform edit. Its prompt can still return
-        # a near-match rather than the exact requested RGB at the canvas edge.
-        # Normalize only the corner-connected generated backdrop before crop;
-        # this leaves the subject, uniform, hair, and jewelry untouched.
-        identity_locked = self._replace_smooth_border_background(identity_locked, background_color)
+        # Qwen creates the person and uniform.  A foreground matte replaces
+        # only the completed portrait backdrop with the exact selected RGB;
+        # unlike the former border-colour flood, it cannot recolour a shirt
+        # that touches the image edge.
+        identity_locked = self._replace_background_with_foreground_matte(
+            identity_locked, background_color, job_id=job_id
+        )
+        # Do not apply a global dark-pixel colour shift: it also selects dark
+        # backdrops, hair and neck shadows and cannot verify garment colour.
         if progress_callback:
             progress_callback(96, "Cropping to school passport framing...")
         cropped = self._crop_school_passport_portrait(identity_locked, width, height)
