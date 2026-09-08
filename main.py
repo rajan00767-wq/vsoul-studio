@@ -172,15 +172,20 @@ async def _execute_queued_job(job_id: str, job: dict):
             # original filename: that mutable URL can show a prior browser-cached
             # result while a newer job has already completed.
             rel_out = f"outputs/{Path(named_path).name}"
+            rel_candidate = None
+            if candidate_path and Path(candidate_path).is_file():
+                rel_candidate = f"outputs/{Path(candidate_path).name}"
             _js.update_job(
                 job_id,
                 status="done",
                 stage="done",
                 progress=100,
-                message="✓ Enhancement Complete",
+                message=msg or "✓ Enhancement Complete",
                 output_path=rel_out,
                 result_url=f"/{rel_out}",
-                candidate_path=(f"outputs/{Path(candidate_path).name}" if candidate_path else None),
+                # The browser labels this as a review-only Qwen generation;
+                # it never replaces the approved fallback automatically.
+                candidate_path=rel_candidate,
                 original_filename=orig_filename,
                 completed_at=str(time.time()),
             )

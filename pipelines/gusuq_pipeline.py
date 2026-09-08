@@ -260,8 +260,9 @@ class GUSUQPipeline:
             "Image 1 is the exact baseline uniform composite. Image 2 is the original person. "
             "Image 3 is the required uniform reference. Improve only realistic cloth drape, shoulder fit, "
             "collar-to-neck contact, and sleeve alignment in Image 1. Keep Image 2 face, hair, skin, pose, "
-            "and eyewear exactly unchanged. Preserve Image 3 uniform color, pattern, badge, logo, buttons, "
-            "and garment design exactly. Do not add glasses, ties, jewelry, extra collars, or layered clothing."
+            "and eyewear exactly unchanged. Preserve Image 3 uniform color, pattern, buttons, "
+            "and garment design exactly. Keep the garment plain without any badge, crest, emblem, or logo. "
+            "Do not add glasses, ties, jewelry, extra collars, or layered clothing."
         )
         if progress_cb:
             progress_cb(0.35, "Encoding Qwen 2509 person and uniform references...")

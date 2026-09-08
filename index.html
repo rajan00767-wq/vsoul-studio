@@ -1310,7 +1310,7 @@
       downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
     }
 
-    function renderEnhanceResult(url) {
+    function renderEnhanceResult(url, downloadUrl = url, reviewLabel = '') {
       const afterImg = document.getElementById('enhance-img-after');
       const dlBtn = document.getElementById('enhance-dl-btn');
       afterImg.onload = () => {
@@ -1318,10 +1318,10 @@
         const stage = document.getElementById('enhance-after-stage');
         stage.classList.remove('is-revealing');
         requestAnimationFrame(() => stage.classList.add('is-revealing'));
-        document.getElementById('enhance-after-badge').textContent = `${afterImg.naturalWidth}x${afterImg.naturalHeight} px - 300 DPI`;
+        document.getElementById('enhance-after-badge').textContent = reviewLabel || `${afterImg.naturalWidth}x${afterImg.naturalHeight} px - 300 DPI`;
       };
       afterImg.src = url;
-      dlBtn.href = url;
+      dlBtn.href = downloadUrl;
     }
 
     async function startEnhance() {
@@ -1424,17 +1424,24 @@
             btn.disabled = false;
             fillEl.style.width = '100%';
             pctEl.textContent = '100%';
-            msgEl.textContent = '✓ Enhancement Complete!';
+            msgEl.textContent = job.message || '✓ Enhancement Complete!';
             cancelBtn.style.display = 'none';
 
             const rawPath = (job && (job.output_path || job.result_url)) || '';
             const outUrl = (typeof rawPath === 'string' && rawPath.startsWith('http')) ? rawPath : `/${String(rawPath).replace(/^\/+/, '')}?t=${Date.now()}`;
-            const candidatePath = job && job.candidate_path;
-            const candidateUrl = candidatePath
-              ? `/${String(candidatePath).replace(/^\/+/, '')}?t=${Date.now()}`
+            const rawCandidate = job.candidate_path || '';
+            const candidateUrl = rawCandidate
+              ? `/${String(rawCandidate).replace(/^\/+/, '')}?t=${Date.now()}`
               : '';
+            // A rejected Qwen candidate is review-only. Show it alongside the
+            // original upload so the user can compare it directly, while the
+            // download remains the validation-approved output.
             enhanceState.resultUrl = candidateUrl || outUrl;
-            renderEnhanceResult(enhanceState.resultUrl);
+            renderEnhanceResult(
+              enhanceState.resultUrl,
+              outUrl,
+              candidateUrl ? 'Qwen Generation - Review' : ''
+            );
 
             const downloadName = (job.metadata && job.metadata.download_name) || job.original_filename || enhanceState.origName || 'enhanced.png';
             const dlBtn = document.getElementById('enhance-dl-btn');

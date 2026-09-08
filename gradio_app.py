@@ -141,6 +141,22 @@ def map_client_background(value: str) -> Tuple[str, str]:
     return "Light Blue (School / Visa ID)", "#047EF6"
 
 
+def resolve_background_hex(background_name: str, custom_hex: str = "") -> str:
+    """Return the exact RGB selected by the UI for final matte compositing."""
+    if background_name == "Custom Hex Color" and custom_hex and custom_hex.strip():
+        return custom_hex.strip()
+    named = {
+        "Light Blue (School / Visa ID)": "#047EF6",
+        "Pure White (Passport)": "#FFFFFF",
+        "Off-White / Light Grey": "#F2F2F2",
+        "Studio Dark": "#20242B",
+        "Warm Studio": "#E8DDD0",
+        "Corporate Navy": "#0B2545",
+        "Crimson Red": "#B52B38",
+    }
+    return named.get(background_name, "#FFFFFF")
+
+
 def apply_selected_background_matte(image: Image.Image, target_rgb: Tuple[int, int, int]) -> Image.Image:
     """Use an isolated matte worker to replace only the generated backdrop."""
     cache_dir = Path("scratch/cache")
@@ -211,7 +227,9 @@ PASSPORT_FORMATS = [
 
 ENGINE_PORTRAIT_RECOMMENDED = "✨ Qwen — slow, best output — Recommended"
 ENGINE_PORTRAIT_FAST = "⚡ Fast optical restoration"
-
+# User-approved studio candidate baseline. Keeping the seed fixed prevents
+# random Qwen runs from returning the repeated harsh-sunlight variant.
+STUDIO_REFERENCE_SEED = 261688816
 STUDIO_BLUE_RGB = (205, 230, 248)
 STUDIO_BLUE_BGR = (248, 230, 205)
 
@@ -262,13 +280,15 @@ def _run_qwen_2511_uniform_fit(
             "Preserve the person's exact face, hair, skin, expression, pose, and any real eyewear. "
             "Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, "
             "or ornament: retain its presence, shape, color, material, placement, and natural reflections. "
-            "Preserve the exact uniform color, fabric pattern, badge, logo, buttons, collar design, and garment shape. "
+            "Preserve the exact uniform color, fabric pattern, buttons, collar design, and garment shape. "
+            "Keep the uniform fabric clean and plain without any school badge, emblem, crest, logo, or lettering. "
             "Create a natural collar-to-neck contact with no double clothing layer, no exposed background fringe, "
             f"no added accessories, and no changed identity. Fit constraints from visual analysis: {constraint_text}."
         ),
         negative_prompt=(
+            "badge, school badge, crest, emblem, logo, patch, name tag, pins, chest text, lettering, words, "
             "changed identity, altered face, different hair, glasses, sunglasses, new jewelry, missing jewelry, altered jewelry, extra collar, "
-            "double shirt, recolored uniform, missing badge, missing logo, cropped uniform, distorted shoulders, "
+            "double shirt, recolored uniform, cropped uniform, distorted shoulders, "
             "background leakage, halo, cutout edge, artifacts"
         ),
         background_color="keep",
@@ -490,7 +510,7 @@ STUDIO_NEGATIVE_PROMPT = (
     "direct camera flash, blown highlights, washed out, underexposed, yellow tint, cyan cast, grainy, noisy, "
     "blurry, out of focus, plastic skin, altered identity, distorted face, deformed face, illustration, doll face, "
     "oversized eyes, enlarged eyes, anime eyes, artificial iris, beauty-filter face, "
-    "text, letters, words, watermark, signature, caption, printed logo, invented badge, scarf, neck wrap, shawl, "
+    "badge, school badge, crest, emblem, logo, patch, name tag, text, letters, words, watermark, signature, caption, printed logo, scarf, neck wrap, shawl, "
     "glasses, eyeglasses, spectacles, sunglasses, added jewelry, added clothing, added objects"
 )
 
@@ -501,101 +521,96 @@ def build_dynamic_identity_prompt(
     custom_instruction: str = "",
     vl_brief: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Builds a high-end commercial studio portrait prompt for Qwen-Image-Edit."""
+    """Builds a high-end commercial studio portrait prompt for Qwen-Image-Edit (under 180 tokens)."""
+    vl_brief = vl_brief or {}
     glasses_pos, _ = _glasses_prompt_bits(image_pil)
-    crown_near_edge = bool((vl_brief or {}).get("crown_near_top_edge", False))
-    direct_sunlight = bool((vl_brief or {}).get("direct_sunlight_present", False))
-    head_hair_hotspot = bool((vl_brief or {}).get("head_hair_hotspot_present", False))
-    clothing_description = str((vl_brief or {}).get("clothing_description") or "source garment").strip()
-    skin_tone = str((vl_brief or {}).get("skin_tone") or "source natural skin tone").strip()
-    hair_color = str((vl_brief or {}).get("hair_color") or "source natural hair color").strip()
-    face_orientation = str((vl_brief or {}).get("face_orientation") or "source camera orientation").strip()
-    expression = str((vl_brief or {}).get("expression") or "source expression").strip()
-    jewelry_description = str((vl_brief or {}).get("jewelry_description") or "visible source jewelry").strip()
-    # VL is advisory only. Keep its garment phrase short and neutral so it
-    # cannot carry a fabricated scene or additional person into Qwen Edit.
-    clothing_description = re.sub(r"[^a-zA-Z0-9 ,.-]", "", clothing_description)[:100] or "source garment"
-    skin_tone = re.sub(r"[^a-zA-Z0-9 ,.-]", "", skin_tone)[:80] or "source natural skin tone"
-    hair_color = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_color)[:80] or "source natural hair color"
-    face_orientation = re.sub(r"[^a-zA-Z0-9 ,.-]", "", face_orientation)[:80] or "source camera orientation"
-    expression = re.sub(r"[^a-zA-Z0-9 ,.-]", "", expression)[:80] or "source expression"
-    jewelry_description = re.sub(r"[^a-zA-Z0-9 ,.-]", "", jewelry_description)[:100] or "visible source jewelry"
-    crop_note = (
-        "Create exactly one centered, head-and-shoulders portrait of the uploaded person only. "
-        "Keep the complete hair crown visible with clear blank headroom above it; never crop the top of the hair. "
-        "Remove all other people, hands, objects, and scenery from the frame. "
-    )
-    clothing_lock = (
-        f"VL garment check: visible clothing is {clothing_description}. "
-        "Keep that exact source clothing unchanged: color, fabric, pattern, neckline, fit, and details. "
-    )
-    analysis = analyze_input_image_dynamically(image_pil)
-    background_lock = (
-        f"Completely remove the original background and replace every non-person pixel with one seamless, evenly lit, solid {bg_desc} studio backdrop. "
-        "The final image contains exactly two visual regions: the unchanged uploaded person and the solid backdrop. "
-        "Do not retain, blend, ghost, or add any original scenery, tree, leaf, branch, wall, furniture, shadow, color spill, texture, pattern, object, or decoration anywhere around or through the hair. "
-        "The backdrop must be perfectly clean and uniform from every canvas edge to the natural hair and clothing boundary. "
-    )
-    headwear_present = bool((vl_brief or {}).get("headwear_present", False))
-    headwear_description = str((vl_brief or {}).get("headwear_description") or "the source headwear").strip()
-    actual_headwear_terms = ("cap", "hat", "helmet", "scarf", "hijab", "turban", "head covering")
-    headwear_present = headwear_present and any(term in headwear_description.lower() for term in actual_headwear_terms)
-    headwear_lock = (
-        f"A headwear item is present ({headwear_description}). Preserve it exactly: its shape, color, logo, trim, placement, and edges. "
-        "Do not remove, replace, invent, crop, or blend it into the hair. Restore only the visible hair strands outside the headwear. "
-        if headwear_present
-        else "No headwear is visible. Do not add a cap, hat, helmet, scarf, or any head covering. "
-    )
-    hair_instruction = (
-        f"Visual analysis identifies the source hair as {hair_color}. Keep that exact natural hair color, hairstyle, parting, hairline, curls, clips, and visible hair volume. "
-        "Preserve every visible hair clip and its placement. Do not bleach, silver, gloss, extend, restyle, or invent hair. "
-        "Dark hair must remain naturally dark; never add white, grey, blue-metallic, or overexposed highlights. "
-    )
-    jewelry_lock = (
-        f"Visual analysis identifies {jewelry_description}. Preserve every visible source jewelry item exactly, including earrings, necklace, chain, pendant, bangle, ring, or ornament. "
-        "Do not remove, hide, recolor, reshape, move, blur, merge, duplicate, or replace jewelry. "
-        "Retain its real material, fine detail, placement, and natural reflections; do not invent additional jewelry. "
-    )
-    pose_lock = (
-        f"Visual analysis identifies {face_orientation} with {expression}. Treat the uploaded camera geometry as a hard constraint: keep the exact head angle, head tilt, eye direction, "
-        "shoulder line, torso orientation, body position, subject scale, and camera viewpoint. "
-        "Do not turn the head, change the pose, rotate the body, alter the expression, recenter the person, or create a new camera angle. "
-        "If the source is a focused front-facing camera portrait, it must remain the same focused front-facing portrait. "
-    )
-    lighting_instruction = (
-        f"Visual analysis identifies the source complexion as {skin_tone}. Use soft, even, neutral studio lighting. Correct visible harsh sunlight and deep shadows without changing that skin tone, the analyzed hair color, dress color, or subject details. "
-    )
-    portrait_quality = (
-        "Preserve the real face, age, expression, and identity exactly. Do not redraw facial anatomy, eyes, eyebrows, nose, or mouth. "
-        "Keep real eye size and facial proportions; never create doll-like or enlarged eyes. "
-        "Restore natural high-resolution photographic detail and realistic texture on the existing face, neck, body, hair, and dress without changing their shape, color, or design. "
-        "Correct compression noise, blur, and uneven exposure only; retain real skin texture, natural hair strands, and original dress weave. "
-        + lighting_instruction
-        + hair_instruction +
-        jewelry_lock +
-        pose_lock +
-        "Keep the original dress design, lace straps, fabric weave, color, and pose unchanged. Do not erase, blur, or turn the dress into blank white fabric. "
-        "Do not add clothing layers, text, logos, accessories, or objects. "
-        "Use soft, neutral, diffuse studio lighting with natural skin tone, gentle shadows, no harsh neck shadow, rim light, haze, bloom, white cast, blown highlights, or cinematic grading. "
-    )
-    if custom_instruction and custom_instruction.strip():
-        return (
-            custom_instruction.strip() + " "
-            + background_lock
-            + portrait_quality
-            + f"Preserve the person's exact facial identity, expression, skin tone, hair, and {analysis['framing_desc']}. "
-            + clothing_lock + headwear_lock + glasses_pos + crop_note
-        )
 
-    prompt = (
-        "Create a high-quality professional studio portrait photograph. "
-        + background_lock
-        + portrait_quality
-        + f"Preserve the person's exact facial identity, age, expression, skin tone, eyes, hair, and {analysis['framing_desc']}. "
-        + f"Keep {analysis['cloth_desc']} photorealistic. {clothing_lock}{headwear_lock} Do not add glasses, new jewelry, clothing, objects, or background elements. "
-        f"{glasses_pos}{crop_note}"
+    clothing = str(vl_brief.get("clothing_description") or "original clothing").strip()
+    if isinstance(vl_brief.get("clothing_description"), list):
+        clothing = ", ".join(vl_brief.get("clothing_description"))
+    clothing = re.sub(r"[^a-zA-Z0-9 ,.-]", "", clothing)[:80] or "original clothing"
+
+    skin_tone = str(vl_brief.get("skin_tone") or "natural skin tone").strip()
+    skin_tone = re.sub(r"[^a-zA-Z0-9 ,.-]", "", skin_tone)[:40] or "natural skin tone"
+
+    hair_color = str(vl_brief.get("hair_color") or "natural dark hair").strip()
+    hair_color = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_color)[:40] or "natural dark hair"
+
+    hair_style = str(vl_brief.get("hair_style") or "").strip()
+    hair_style = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_style)[:40]
+    hair_geometry = ", ".join(
+        re.sub(r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get(key) or ""))[:40]
+        for key in ("hair_parting", "hair_length", "hair_texture")
+        if str(vl_brief.get(key) or "").strip()
+        and "source hair" not in str(vl_brief.get(key) or "").lower()
     )
-    return prompt
+
+    expression = str(vl_brief.get("expression") or "natural expression").strip()
+    expression = re.sub(r"[^a-zA-Z0-9 ,.-]", "", expression)[:40] or "natural expression"
+
+    # Hair accessories (headbands, bows, ribbons, clips)
+    hair_acc = vl_brief.get("hair_accessories")
+    if isinstance(hair_acc, list):
+        hair_acc = ", ".join(str(x) for x in hair_acc if x)
+    hair_acc = str(hair_acc or "").strip()
+    hair_acc_lock = ""
+    if hair_acc and hair_acc.lower() not in ("none", "no", "null", "false"):
+        hair_acc_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", hair_acc)[:60]
+        accessory_details = re.sub(
+            r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get("hair_accessory_details") or "")
+        )[:80]
+        hair_acc_lock = f"Preserve visible hair accessory ({hair_acc_clean} {accessory_details}) exactly in place: color, shape, side, and placement. "
+
+    # Headwear (hats, caps, hijab, turban)
+    headwear_present = bool(vl_brief.get("headwear_present", False))
+    headwear_desc = str(vl_brief.get("headwear_description") or "").strip()
+    headwear_lock = ""
+    if headwear_present and headwear_desc and headwear_desc.lower() not in ("none", "no", "null"):
+        hw_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", headwear_desc)[:60]
+        headwear_lock = f"Preserve visible headwear ({hw_clean}) exactly. "
+
+    # Wearables & Jewelry
+    jewelry = vl_brief.get("jewelry_description") or vl_brief.get("visible_wearables")
+    if isinstance(jewelry, list):
+        jewelry = ", ".join(str(x) for x in jewelry if x)
+    jewelry = str(jewelry or "").strip()
+    jewelry_lock = ""
+    if jewelry and jewelry.lower() not in ("none", "no", "null"):
+        j_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", jewelry)[:60]
+        jewelry_lock = f"Preserve visible jewelry and wearables ({j_clean}). "
+
+    hair_desc = " ".join(part for part in (hair_style, hair_geometry, hair_color) if part).strip()
+    clothing_details = ", ".join(
+        re.sub(r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get(key) or ""))[:50]
+        for key in ("clothing_color_pattern", "clothing_collar", "clothing_fasteners")
+        if str(vl_brief.get(key) or "").strip()
+        and "source garment" not in str(vl_brief.get(key) or "").lower()
+    )
+
+    analysis = analyze_input_image_dynamically(image_pil)
+    framing_desc = analysis.get("framing_desc", "centered head-and-shoulders framing")
+
+    # Phrase this as a constrained edit, not a request for a new studio
+    # portrait. Long descriptive prompts made the model redraw low-resolution
+    # child photos as a different person before the identity gate could reject
+    # the output.
+    parts = [
+        "Edit this uploaded photograph only; do not generate a different person or change the camera view.",
+        "Keep the exact real face, original skin tone, facial proportions, eyes, and expression unchanged.",
+        "Keep the exact source hair unchanged: its real color, parting, length, texture, hairline, volume, and every visible accessory.",
+        "Keep every visible source jewelry item and the original clothing exactly unchanged.",
+        f"Keep the same {framing_desc}, pose, head angle, and gaze.",
+        glasses_pos,
+        "Correct only the photographed lighting: soften direct sunlight, reduce forehead and hair hot spots, lift harsh facial and neck shadows, and keep soft even natural studio light.",
+        "Do not bleach, recolor, reshape, smooth, or regenerate hair, skin, face, clothing, jewelry, or accessories while correcting light.",
+        "Improve only compression noise and focus with gentle natural photographic detail.",
+        f"Replace only the background with one seamless, flat solid {bg_desc} studio backdrop."
+    ]
+
+    base_prompt = " ".join(p.strip() for p in parts if p and p.strip())
+    if custom_instruction and custom_instruction.strip():
+        return f"{custom_instruction.strip()} {base_prompt}"
+    return base_prompt
 
 
 def upscale_qwen_result(image_bgr: np.ndarray, factor: int) -> np.ndarray:
@@ -1417,7 +1432,7 @@ def process_single_enhance(
             # Studio AI Portrait Mode (Qwen Diffusion + InsightFace 106-Point Identity Lock)
             # Qwen follows a semantic backdrop name more reliably than a hex
             # string. The exact hex remains the framing/padding color below.
-            selected_hex = custom_hex.strip() if custom_hex and custom_hex.strip() else "#FFFFFF"
+            selected_hex = resolve_background_hex(bg_color_name, custom_hex)
             try:
                 raw_hex = selected_hex.lstrip("#")
                 frame_bg_bgr = (int(raw_hex[4:6], 16), int(raw_hex[2:4], 16), int(raw_hex[0:2], 16))
@@ -1466,7 +1481,7 @@ def process_single_enhance(
                 # Qwen Image Edit can otherwise reproduce those concepts.
                 negative_prompt=(
                     "extra person, second face, extra hands, object, decoration, pattern, scenery, "
-                    "altered identity, altered hair, altered clothing, cropped hair crown, text, watermark, "
+                    "altered identity, altered hair, bleached hair, recolored hair, altered clothing, cropped hair crown, text, watermark, "
                     "blur, plastic skin, distorted face, enlarged eyes, head turn, changed pose, body rotation, "
                     "different camera angle, changed gaze, changed expression, recentered subject, missing jewelry, "
                     "altered jewelry, duplicated jewelry, " + glasses_negative
@@ -1478,7 +1493,10 @@ def process_single_enhance(
                 # The selected backdrop is applied by the final matte. Keep
                 # edit guidance restrained so it restores the photographed
                 # person instead of repainting skin and hair colour.
-                true_cfg_scale=1.18,
+                # Keep classifier-free guidance nearly neutral for an edit.
+                # Strong text guidance is the main cause of low-resolution
+                # portraits being redrawn as a different child.
+                true_cfg_scale=1.02,
                 # The API can request a four-step Qwen test. The Gradio UI
                 # keeps the quality default at twenty steps.
                 steps=max(1, int(qwen_steps)),
@@ -1504,18 +1522,18 @@ def process_single_enhance(
                 preserve_source_clothing=False,
                 # Qwen restores the supplied camera view; the prompt locks the
                 # source pose and camera geometry. No source overlay follows.
-                seed=int(time.time_ns() % (2 ** 32)),
+                seed=STUDIO_REFERENCE_SEED,
                 progress_cb=bridge,
             )
             qwen_pil = Image.open(str(res_path)).convert("RGB")
             candidate_path = None
+            qwen_accepted = bool(getattr(qwen_service, "last_qwen_identity_accepted", False))
             # A face-embedding score can remain high even when diffusion gives
             # a child a different expression, facial texture, or hairstyle.
-            # Keep every generated portrait as an explicit review candidate;
-            # the normal result remains the real uploaded subject with the
-            # requested backdrop and passport framing.
+            # Rejected outputs are diagnostic-only and must not be exported or
+            # shown as a selectable result. They represent a different person.
             raw_candidate_path = getattr(qwen_service, "last_qwen_candidate_path", None)
-            if raw_candidate_path and Path(raw_candidate_path).is_file():
+            if qwen_accepted and raw_candidate_path and Path(raw_candidate_path).is_file():
                 candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
                 candidate_pil = apply_selected_background_matte(candidate_pil, tuple(reversed(frame_bg_bgr)))
                 if passport_format and passport_format != "Original Dimensions (Enhanced)":
@@ -1535,16 +1553,30 @@ def process_single_enhance(
                     OUTPUTS_DIR / f"qwen_candidate_{Path(res_path).stem}.png",
                     fallback="qwen_candidate.png",
                 )
-            # Do not auto-deliver a regenerated identity. Keep the real source
-            # subject, then apply only local, non-generative lighting repair.
-            progress(0.91, desc="Balancing harsh sunlight on the portrait...")
-            qwen_pil = photo_restorer.neutralize_direct_sunlight(image)
-            # The isolated matte worker replaces only the original backdrop
-            # with the selected school-ID color, then exits to release GPU memory.
-            progress(0.93, desc="Applying the selected studio background...")
-            qwen_pil = apply_selected_background_matte(
-                qwen_pil, tuple(reversed(frame_bg_bgr))
-            )
+            # Deliver Qwen's edit when the pipeline identity gate accepted it.
+            # The old path always discarded the Qwen result here and returned
+            # a relit copy of the original upload, so the Enhance tab could
+            # never show the restoration that had just completed.
+            if qwen_accepted:
+                progress(0.93, desc="Finalizing the Qwen studio portrait...")
+                qwen_pil = Image.open(str(res_path)).convert("RGB")
+                candidate_path = None
+            else:
+                logger.warning("[QWEN_ENHANCE] Rejected Qwen candidate; using source-preserving fallback.")
+                # Keep the complete Qwen image available for the explicit UI
+                # comparison. It is not auto-selected, but the user can judge
+                # the full generation beside the original source photo.
+                if raw_candidate_path and Path(raw_candidate_path).is_file():
+                    candidate_path = Path(raw_candidate_path)
+                # The model changed protected hair/identity evidence. Keep the
+                # uploaded subject pixels intact; deterministic relighting here
+                # also distorted skin and hair in the fallback export.
+                progress(0.91, desc="Keeping the original subject intact...")
+                qwen_pil = image.convert("RGB")
+                progress(0.93, desc="Applying the selected studio background...")
+                qwen_pil = apply_selected_background_matte(
+                    qwen_pil, tuple(reversed(frame_bg_bgr))
+                )
 
             # Keep the real subject unchanged apart from local highlight
             # compression, the selected backdrop, and passport framing.
@@ -1565,9 +1597,15 @@ def process_single_enhance(
             elapsed = time.time() - t0
             progress(1.0, desc="Completed!")
             named_path = _save_matching_input(qwen_pil, image_source, fallback=Path(res_path).name)
+            completion_message = (
+                f"✅ Qwen studio portrait completed in {elapsed:.2f}s. Saved as {named_path.name}"
+                if qwen_accepted
+                else f"⚠️ Source-preserving studio result completed in {elapsed:.2f}s. "
+                "The Qwen candidate changed identity and was rejected."
+            )
             return (
                 str(named_path),
-                f"✅ Studio portrait completed in {elapsed:.2f}s. Saved as {named_path.name}",
+                completion_message,
                 str(candidate_path) if candidate_path else None,
             )
 

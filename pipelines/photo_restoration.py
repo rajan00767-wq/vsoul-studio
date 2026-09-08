@@ -598,6 +598,48 @@ class PhotoRestorationService:
             return image_pil
 
     @staticmethod
+    def tame_generated_portrait_hotspots(image_pil: Image.Image) -> Image.Image:
+        """Tone down bright forehead/hair glare without changing portrait geometry.
+
+        Qwen can retain a sunlit highlight even when its edit prompt requests
+        studio lighting. This operates only on high luminance pixels in the
+        upper portrait and excludes the flat generated backdrop sampled from
+        image corners.
+        """
+        try:
+            bgr = cv2.cvtColor(np.array(image_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+            height, width = bgr.shape[:2]
+            edge = max(4, min(18, height // 20, width // 20))
+            corners = np.concatenate((
+                bgr[:edge, :edge].reshape(-1, 3),
+                bgr[:edge, -edge:].reshape(-1, 3),
+                bgr[-edge:, :edge].reshape(-1, 3),
+                bgr[-edge:, -edge:].reshape(-1, 3),
+            ))
+            backdrop = np.median(corners, axis=0).astype(np.float32)
+            backdrop_pixels = np.linalg.norm(bgr.astype(np.float32) - backdrop, axis=2) < 42.0
+
+            region = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                region, (width // 2, int(height * 0.36)),
+                (int(width * 0.43), int(height * 0.34)), 0, 0, 360, 255, -1,
+            )
+            region[backdrop_pixels] = 0
+            alpha = cv2.GaussianBlur(region, (25, 25), 5).astype(np.float32) / 255.0
+            alpha[backdrop_pixels] = 0.0
+
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            hotspot = np.clip((lab[:, :, 0] - 120.0) / 85.0, 0.0, 1.0) * alpha
+            lab[:, :, 0] -= hotspot * 42.0
+            lab[:, :, 1] += (128.0 - lab[:, :, 1]) * hotspot * 0.08
+            lab[:, :, 2] += (128.0 - lab[:, :, 2]) * hotspot * 0.06
+            logger.info("[LIGHTING] Tamed generated forehead and hair hotspots")
+            return Image.fromarray(cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB))
+        except Exception as exc:
+            logger.warning("[LIGHTING] Generated hotspot correction skipped: %s", exc)
+            return image_pil
+
+    @staticmethod
     def lock_source_hair(
         orig_pil: Image.Image, portrait_pil: Image.Image, strength: float = 0.78
     ) -> Image.Image:
