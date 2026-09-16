@@ -113,6 +113,15 @@ def flatten_vl_dict(data: Any) -> Dict[str, Any]:
     return flat
 
 
+def _coerce_bool(value: Any) -> bool:
+    """Interpret Qwen-VL boolean fields without treating the string "false" as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"true", "yes", "1", "present"}
+
+
 def parse_bbox_pixels(bbox: Any, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
     """Parse bounding box into (x1, y1, x2, y2) pixel integers, handling normalized (0-1, 0-1000) and absolute pixels."""
     if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -188,7 +197,9 @@ def extract_template_visual_evidence(template: Image.Image) -> Dict[str, str]:
         evidence["measured_outer_garment_color"] = _rgb_hex(np.median(rgb[outer], axis=0))
     if evidence:
         evidence["template_palette_evidence"] = "; ".join(
-            f"{key.removeprefix('measured_').replace('_', ' ')} {value}"
+            # This blue-selective mask measures the colored checks, not the
+            # white base fabric. Calling it a base color tinted the whole shirt.
+            f"{'shirt colored pattern threads (not base fabric)' if key == 'measured_shirt_base_color' else key.removeprefix('measured_').replace('_', ' ')} {value}"
             for key, value in evidence.items()
             if key.startswith("measured_")
         )
@@ -258,7 +269,8 @@ from 0.88 to 1.10. Do not identify, describe, or alter the person."""
 
     _PORTRAIT_PROMPT = """Inspect this portrait only to prepare a constrained studio enhancement plan.
 Return JSON only with keys: source_subject_count, crown_near_top_edge, hair_edge_risk,
-direct_sunlight_present, head_hair_hotspot_present, glasses_present, headwear_present, headwear_description,
+direct_sunlight_present, head_hair_hotspot_present, sunlight_type, sunlight_direction, sunlight_evidence, sunlight_regions,
+glasses_present, headwear_present, headwear_description,
 hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_accessories, hair_accessory_details,
 clothing_description, clothing_color_pattern, clothing_collar, clothing_fasteners, garment_visibility, skin_tone,
 face_orientation, expression, and jewelry_description.
@@ -266,8 +278,10 @@ face_orientation, expression, and jewelry_description.
 Guidelines:
 source_subject_count is the number of people visibly present in the source image.
 crown_near_top_edge is true only when the top of the hair is close to the image edge.
-direct_sunlight_present is true for visible sun hot spots or hard subject shadows. It must be true when head_hair_hotspot_present is true.
-head_hair_hotspot_present is true when bright glare is visible on forehead or hair.
+direct_sunlight_present is true only for visible directional sunlight: a bright hot spot paired with a hard shadow, or an obvious outdoor sun wash. Do not mark ordinary soft indoor light as sunlight.
+head_hair_hotspot_present is true only when bright glare is visible on the forehead, hairline, crown, or hair.
+sunlight_type is one of "hard direct sun", "broad sun wash", "soft indoor", or "none". sunlight_direction is the visible direction, such as "upper left", or "none".
+sunlight_evidence is a concise reason (or "none"). sunlight_regions lists affected regions only (or "none"), for example "forehead, crown, left cheek".
 hair_accessories must list visible headbands, bows, ribbons, clips, or "none".
 hair_accessory_details must identify the visible accessory by side, color, and shape without inventing extras.
 headwear_present is true only for hats, caps, turbans, hijabs (distinct from hair accessories).
@@ -275,6 +289,7 @@ jewelry_description must list visible earrings, necklaces, chains, pendants, bin
 clothing_description must be a short generic description of the visible source garment.
 clothing_color_pattern, clothing_collar, and clothing_fasteners must describe only visible features.
 skin_tone must describe natural complexion (e.g. "fair", "wheatish", "dusky").
+hair_color must describe the base pigment visible in shaded strands. Describe silver, blue or gold glare in sunlight_evidence instead of treating it as the base hair color. If the base color is unclear, say "uncertain".
 Use concise generic descriptions. Do not identify the person."""
 
     @staticmethod
@@ -336,6 +351,10 @@ Use concise generic descriptions. Do not identify the person."""
             "hair_edge_risk": "low",
             "direct_sunlight_present": False,
             "head_hair_hotspot_present": False,
+            "sunlight_type": "none",
+            "sunlight_direction": "none",
+            "sunlight_evidence": "none",
+            "sunlight_regions": "none",
             "glasses_present": False,
             "headwear_present": False,
             "headwear_description": "none",
@@ -410,9 +429,17 @@ if torch.cuda.is_available():
             parsed = flatten_vl_dict(clean_and_repair_json(response))
             if isinstance(parsed, dict):
                 result.update(parsed)
+                for key in (
+                    "crown_near_top_edge",
+                    "direct_sunlight_present",
+                    "head_hair_hotspot_present",
+                    "glasses_present",
+                    "headwear_present",
+                ):
+                    result[key] = _coerce_bool(result.get(key))
                 # A forehead or hair hotspot is direct-light evidence even if
                 # the short VL response forgot to set the broader flag.
-                if bool(result.get("head_hair_hotspot_present", False)):
+                if result["head_hair_hotspot_present"]:
                     result["direct_sunlight_present"] = True
                 result["source"] = "qwen2.5-vl"
                 logger.info(

@@ -689,8 +689,11 @@ class PhotoRestorationService:
             # be highly saturated; real dark hair remains near-neutral even
             # where it has soft highlights.
             source_dark_hair = (
-                (hsv_source[:, :, 2] < 145)
-                & (hsv_source[:, :, 1] < 155)
+                # Phone portraits can contain blue/grey specular hair detail
+                # above the old dark-only threshold. Keep those true source
+                # strands so Qwen cannot replace them with silver strokes.
+                (hsv_source[:, :, 2] < 178)
+                & (hsv_source[:, :, 1] < 205)
                 & ~((hsv_source[:, :, 0] >= 32) & (hsv_source[:, :, 0] <= 95) & (hsv_source[:, :, 1] >= 40))
             ).astype(np.uint8) * 255
             # Require Qwen to already identify a nearby dark-hair region.
@@ -709,6 +712,7 @@ class PhotoRestorationService:
             mask = cv2.bitwise_and(mask, target_hair_area)
             mask = cv2.GaussianBlur(mask, (13, 13), 2.5).astype(np.float32)[:, :, None] / 255.0
             alpha = mask * float(np.clip(strength, 0.0, 1.0))
+            logger.info("[HAIR_LOCK] Applied source hair blend to %.1f%% of portrait", float(alpha.mean() * 100.0))
             fused = (warped_source.astype(np.float32) * alpha + portrait_bgr.astype(np.float32) * (1.0 - alpha)).clip(0, 255).astype(np.uint8)
             return Image.fromarray(cv2.cvtColor(fused, cv2.COLOR_BGR2RGB))
         except Exception as exc:
@@ -754,8 +758,8 @@ class PhotoRestorationService:
             source_hsv = cv2.cvtColor(warped_source, cv2.COLOR_BGR2HSV)
             target_hsv = cv2.cvtColor(portrait_bgr, cv2.COLOR_BGR2HSV)
             source_dark_hair = (
-                (source_hsv[:, :, 2] < 145)
-                & (source_hsv[:, :, 1] < 155)
+                (source_hsv[:, :, 2] < 178)
+                & (source_hsv[:, :, 1] < 205)
                 & ~((source_hsv[:, :, 0] >= 32) & (source_hsv[:, :, 0] <= 95) & (source_hsv[:, :, 1] >= 40))
             ).astype(np.uint8) * 255
             target_hair_neighborhood = cv2.dilate(
@@ -784,7 +788,12 @@ class PhotoRestorationService:
                 & (target_hsv[:, :, 1] >= 22)
                 & (target_hsv[:, :, 2] < 215)
             ).astype(np.uint8) * 255
+            # The face-aligned hair ellipse can overlap the new solid backdrop
+            # between loose curls. Limit colour repair to pixels that are also
+            # in Qwen's dark-hair neighbourhood; otherwise a blue selected
+            # background is incorrectly darkened or tinted at the curl edges.
             artifact_mask = cv2.bitwise_and(hair_region, synthetic_green_or_cyan)
+            artifact_mask = cv2.bitwise_and(artifact_mask, target_hair_neighborhood)
             artifact_alpha = cv2.GaussianBlur(artifact_mask, (11, 11), 2.0).astype(np.float32)[:, :, None] / 255.0
             artifact_alpha *= 0.82
             target_lab[:, :, 1:3] += (128.0 - target_lab[:, :, 1:3]) * artifact_alpha

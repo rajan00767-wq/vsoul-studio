@@ -227,8 +227,9 @@ PASSPORT_FORMATS = [
 
 ENGINE_PORTRAIT_RECOMMENDED = "✨ Qwen — slow, best output — Recommended"
 ENGINE_PORTRAIT_FAST = "⚡ Fast optical restoration"
-# User-approved studio candidate baseline. Keeping the seed fixed prevents
-# random Qwen runs from returning the repeated harsh-sunlight variant.
+# Base seed for a fresh Qwen sample on every enhancement job. The previous
+# fixed seed replayed the same raw diffusion image regardless of new lighting
+# analysis or prompt changes.
 STUDIO_REFERENCE_SEED = 261688816
 STUDIO_BLUE_RGB = (205, 230, 248)
 STUDIO_BLUE_BGR = (248, 230, 205)
@@ -521,7 +522,7 @@ def build_dynamic_identity_prompt(
     custom_instruction: str = "",
     vl_brief: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Builds a high-end commercial studio portrait prompt for Qwen-Image-Edit (under 180 tokens)."""
+    """Describe permitted restoration separately from protected identity and design."""
     vl_brief = vl_brief or {}
     glasses_pos, _ = _glasses_prompt_bits(image_pil)
 
@@ -589,22 +590,52 @@ def build_dynamic_identity_prompt(
 
     analysis = analyze_input_image_dynamically(image_pil)
     framing_desc = analysis.get("framing_desc", "centered head-and-shoulders framing")
+    sunlight_detected = str(vl_brief.get("direct_sunlight_present", "")).strip().lower() in {
+        "true", "yes", "1", "present"
+    }
+    sunlight_regions = re.sub(
+        r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get("sunlight_regions") or "")
+    )[:80]
+    sunlight_type = re.sub(
+        r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get("sunlight_type") or "")
+    )[:40]
+    sunlight_direction = re.sub(
+        r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get("sunlight_direction") or "")
+    )[:40]
+    if sunlight_detected:
+        region_hint = f" on the detected {sunlight_regions}" if sunlight_regions and sunlight_regions.lower() not in {"none", "unknown"} else ""
+        source_hint = " ".join(
+            value for value in (sunlight_type, f"from {sunlight_direction}" if sunlight_direction and sunlight_direction.lower() not in {"none", "unknown"} else "")
+            if value and value.lower() not in {"none", "unknown"}
+        )
+        lighting_instruction = (
+            f"Correct the detected {source_hint or 'directional sunlight'}{region_hint}: remove its hot spots and hard shadows. "
+            "Replace harsh directional sunlight with soft, neutral, diffused frontal lighting and gentle fill. "
+            "Remove bright glare on the forehead and hair while preserving realistic highlights and soft shadows."
+        )
+    else:
+        lighting_instruction = (
+            "Replace the source lighting with soft, neutral, diffused frontal studio lighting and gentle fill. "
+            "Reduce any harsh forehead glare or bright colored reflections on hair; retain subtle natural highlights and soft shadows."
+        )
 
-    # Phrase this as a constrained edit, not a request for a new studio
-    # portrait. Long descriptive prompts made the model redraw low-resolution
-    # child photos as a different person before the identity gate could reject
-    # the output.
+    # Allow lighting and detail restoration while preserving identity and design.
     parts = [
-        "Edit this uploaded photograph only; do not generate a different person or change the camera view.",
-        "Keep the exact real face, original skin tone, facial proportions, eyes, and expression unchanged.",
-        "Keep the exact source hair unchanged: its real color, parting, length, texture, hairline, volume, and every visible accessory.",
-        "Keep every visible source jewelry item and the original clothing exactly unchanged.",
+        "Restore this photograph as a natural indoor studio passport portrait of the same person.",
+        lighting_instruction,
+        "Preserve natural skin pigmentation and the hair's base color; do not reproduce blue, silver, or golden sunlight reflections as hair color. Avoid warm amber or cool blue color grading.",
+        "Reconstruct degraded detail in the face, hair and fabric; reduce compression artifacts while retaining realistic skin texture and individual hair strands.",
+        f"Replace the entire background, including visible gaps between curls, with a seamless solid {bg_desc} backdrop. Keep backdrop color off the subject.",
+        "Preserve identity, facial proportions, eye size, expression and natural skin pigmentation. Lighting may change; anatomy and garment design must stay the same.",
+        f"Preserve source hairstyle and base color: {hair_desc}. Bright sun reflections are lighting, not a new hair color.",
+        f"Preserve clothing: {clothing}" + (f"; {clothing_details}" if clothing_details else "") + ".",
+        hair_acc_lock,
+        headwear_lock,
+        jewelry_lock,
         f"Keep the same {framing_desc}, pose, head angle, and gaze.",
+        "Keep the entire head and all hair accessories visible with space above them, and include the shoulders and upper chest for passport cropping. Preserve an existing camera-facing pose.",
         glasses_pos,
-        "Correct only the photographed lighting: soften direct sunlight, reduce forehead and hair hot spots, lift harsh facial and neck shadows, and keep soft even natural studio light.",
-        "Do not bleach, recolor, reshape, smooth, or regenerate hair, skin, face, clothing, jewelry, or accessories while correcting light.",
-        "Improve only compression noise and focus with gentle natural photographic detail.",
-        f"Replace only the background with one seamless, flat solid {bg_desc} studio backdrop."
+        "Avoid beauty retouching, waxy skin, painted hair and exaggerated eyes."
     ]
 
     base_prompt = " ".join(p.strip() for p in parts if p and p.strip())
@@ -1438,10 +1469,18 @@ def process_single_enhance(
                 frame_bg_bgr = (int(raw_hex[4:6], 16), int(raw_hex[2:4], 16), int(raw_hex[0:2], 16))
             except (TypeError, ValueError):
                 frame_bg_bgr = (255, 255, 255)
-            # Keep Qwen's lighting neutral. Naming an exact saturated backdrop
-            # here caused it to paint that color into dark hair as rim light.
-            # The selected color is applied separately after generation.
-            bg_desc = bg_color_name
+            # Use Qwen's semantic studio-colour guidance. Exact post-generation
+            # recolouring cut into pale hair and light clothing, so the Qwen
+            # result remains the single source of subject and backdrop pixels.
+            # UI labels such as 'Light Blue' contradict the saturated preset.
+            # Describe the selected value, not an older display label.
+            bg_names = {
+                "#047EF6": "vivid blue",
+                "#FFFFFF": "pure white",
+                "#F2F2F2": "light neutral gray",
+                "#20242B": "dark charcoal",
+            }
+            bg_desc = f"{bg_names.get(selected_hex.upper(), 'custom color')} {selected_hex}"
             progress(0.10, desc="Analyzing portrait framing and clothing details...")
             from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
             vl_brief = uniform_vl_analyzer.analyze_portrait(image)
@@ -1453,6 +1492,9 @@ def process_single_enhance(
                 bool(vl_brief.get("crown_near_top_edge", False)),
                 vl_brief.get("hair_edge_risk"),
             )
+            direct_sunlight_confirmed = str(
+                vl_brief.get("direct_sunlight_present", "")
+            ).strip().lower() in {"true", "yes", "1", "present"}
             # Keep the original camera frame for Qwen. Always adding large
             # synthetic top padding made the model re-compose focused photos.
             # Add only enough headroom when VL says the crown is already at
@@ -1468,6 +1510,7 @@ def process_single_enhance(
                 padded.paste(qwen_source, (pad_side, pad_top))
                 qwen_source = padded
             prompt = build_dynamic_identity_prompt(image, bg_desc, qwen_prompt, vl_brief)
+            logger.info("[QWEN_ENHANCE] Restoration prompt: %s", prompt)
 
             _, glasses_negative = _glasses_prompt_bits(image)
             from pipelines.qwen_edit_pipeline import qwen_service
@@ -1487,16 +1530,9 @@ def process_single_enhance(
                     "altered jewelry, duplicated jewelry, " + glasses_negative
                 ),
                 background_color=bg_desc,
-                # 1.15 was too weak for Qwen Image Edit to reliably replace
-                # busy phone-photo backgrounds.  This remains conservative
-                # enough to retain the person's identity after face anchoring.
-                # The selected backdrop is applied by the final matte. Keep
-                # edit guidance restrained so it restores the photographed
-                # person instead of repainting skin and hair colour.
-                # Keep classifier-free guidance nearly neutral for an edit.
-                # Strong text guidance is the main cause of low-resolution
-                # portraits being redrawn as a different child.
-                true_cfg_scale=1.02,
+                # Base 2511 uses true CFG; the distilled four-step adapter
+                # needs its separate low-guidance configuration.
+                true_cfg_scale=1.02 if int(qwen_steps) <= 4 else 4.0,
                 # The API can request a four-step Qwen test. The Gradio UI
                 # keeps the quality default at twenty steps.
                 steps=max(1, int(qwen_steps)),
@@ -1512,17 +1548,15 @@ def process_single_enhance(
                 # restoring it, so the full-portrait edit remains the only
                 # generative pass in the production route.
                 face_detail_refine=False,
-                # Qwen creates the portrait; a final BiRefNet-only soft matte
-                # removes any generated source-scene fragments at hair edges.
-                # SCHP colour transfer remains disabled in the matte service.
-                use_birefnet_background=True,
+                # Keep the enhancement route Qwen-only, including its backdrop.
+                use_birefnet_background=False,
                 # The Qwen-only route must not invoke SCHP colour transfer:
                 # its coarse garment mask can pull original background colours
                 # into the regenerated dress and leave visible gaps.
                 preserve_source_clothing=False,
-                # Qwen restores the supplied camera view; the prompt locks the
-                # source pose and camera geometry. No source overlay follows.
-                seed=STUDIO_REFERENCE_SEED,
+                # A new job must create a new sample. A fixed seed was
+                # returning byte-identical raw images for every retry.
+                seed=(STUDIO_REFERENCE_SEED + int(time.time_ns())) & 0x7FFFFFFF,
                 progress_cb=bridge,
             )
             qwen_pil = Image.open(str(res_path)).convert("RGB")
@@ -1535,7 +1569,9 @@ def process_single_enhance(
             raw_candidate_path = getattr(qwen_service, "last_qwen_candidate_path", None)
             if qwen_accepted and raw_candidate_path and Path(raw_candidate_path).is_file():
                 candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
-                candidate_pil = apply_selected_background_matte(candidate_pil, tuple(reversed(frame_bg_bgr)))
+                # Retain Qwen's own backdrop for the comparison image. A
+                # second colour-only pass cannot safely distinguish pale blue
+                # studio backdrop from the generated garment or hair shine.
                 if passport_format and passport_format != "Original Dimensions (Enhanced)":
                     candidate_bgr = cv2.cvtColor(np.array(candidate_pil), cv2.COLOR_RGB2BGR)
                     candidate_pil = Image.fromarray(cv2.cvtColor(
@@ -1560,6 +1596,19 @@ def process_single_enhance(
             if qwen_accepted:
                 progress(0.93, desc="Finalizing the Qwen studio portrait...")
                 qwen_pil = Image.open(str(res_path)).convert("RGB")
+                # Source sunlight does not prove that the generated portrait
+                # still has glare. Applying the source flag here darkened normal
+                # facial midtones and flattened hair after Qwen's lighting edit.
+                logger.info("[QWEN_ENHANCE] Preserving accepted Qwen lighting; crop/export only")
+                # The Qwen edit already contains the requested studio light.
+                # A second synthetic relight flattened skin and made output
+                # look artificial, so preserve Qwen's photographic light.
+                # Do not transfer source colour after Qwen: outdoor foliage,
+                # brick, and sunlit hair can introduce a warm or green cast.
+                # Preserve Qwen's completed studio backdrop and subject edge
+                # exactly as generated. Re-matting or post-hoc recolouring
+                # causes haloing and can paint backdrop colours onto hair or
+                # light clothing.
                 candidate_path = None
             else:
                 logger.warning("[QWEN_ENHANCE] Rejected Qwen candidate; using source-preserving fallback.")

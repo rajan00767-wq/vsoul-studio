@@ -523,18 +523,12 @@ class QwenEditPipeline:
             # collar, placket, pattern, and vest occupy meaningful VL tokens.
             margin_y = max(8, int((max_y - min_y) * 0.025))
             crop_top = max(0, min_y - margin_y)
-            crop_bottom = rgba.height
-
-            # Maintain aspect ratio when cropping horizontally
-            target_ratio = target_width / target_height
-            current_h = crop_bottom - crop_top
-            needed_w = int(current_h * target_ratio)
-            center_x = (min_x + max_x) // 2
-            crop_left = max(0, min(rgba.width - needed_w, center_x - needed_w // 2))
-            crop_right = min(rgba.width, crop_left + needed_w)
-
-            if needed_w <= rgba.width and (crop_right - crop_left) > 0:
-                rgba = rgba.crop((crop_left, crop_top, crop_right, crop_bottom))
+            crop_bottom = min(rgba.height, max_y + margin_y)
+            # Crop transparent margins only. Forcing the garment into the
+            # person's aspect ratio discarded sleeves and vest side panels.
+            crop_left = max(0, min_x - margin_y)
+            crop_right = min(rgba.width, max_x + margin_y)
+            rgba = rgba.crop((crop_left, crop_top, crop_right, crop_bottom))
 
             backdrop = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
             prepared = Image.alpha_composite(backdrop, rgba).convert("RGB")
@@ -548,7 +542,7 @@ class QwenEditPipeline:
             if curr_ratio > target_ratio:
                 new_h = int(prepared.width / target_ratio)
                 padded = Image.new("RGB", (prepared.width, new_h), (255, 255, 255))
-                offset_y = new_h - prepared.height
+                offset_y = (new_h - prepared.height) // 2
                 padded.paste(prepared, (0, offset_y))
                 prepared = padded
             else:
@@ -662,7 +656,11 @@ class QwenEditPipeline:
             logger.warning("[UNIFORM_COLOR] Face boundary unavailable: %s", exc)
         lower_clothes = np.zeros((height, width), dtype=bool)
         lower_clothes[clothes_top:, :] = True
-        output_dark = lower_clothes & (portrait_lab[:, :, 0] < 110)
+        # Limit correction to the central torso. Long dark hair can extend
+        # below the jaw, so a full-width lower-frame mask would recolour it.
+        xx = np.arange(width)[None, :]
+        torso = np.abs(xx - (width / 2.0)) <= width * 0.40
+        output_dark = lower_clothes & torso & (portrait_lab[:, :, 0] < 110)
         if np.count_nonzero(output_dark) < 120:
             return image
 
@@ -835,6 +833,7 @@ class QwenEditPipeline:
         seed: Optional[int] = None,
         face_detail_refine: bool = False,
         face_lock_after_generation: bool = False,
+        reject_identity_failure: bool = False,
     ) -> Path:
         """
         Genuine Qwen-Image-Edit-2511 Decoupled Studio Portrait Enhancer:
@@ -1011,7 +1010,11 @@ class QwenEditPipeline:
             return callback_kwargs
 
         run_seed = int(seed) if seed is not None else (zlib.crc32(job_id.encode("utf-8")) & 0x7FFFFFFF)
-        logger.info("[QWEN_EDIT_ENHANCER] Running %d-step generative diffusion pass (seed=%d)...", num_steps, run_seed)
+        logger.info(
+            "[QWEN_EDIT_ENHANCER] Running %d-step diffusion (seed=%d, true_cfg=%.2f, lightning=%s)...",
+            num_steps, run_seed, max(1.01, float(true_cfg_scale)) if effective_negative else 1.0,
+            use_lightning_lora and LORA_FILE.exists(),
+        )
         res = pipe(
             image=conditioning_images if len(conditioning_images) > 1 else input_resized,
             prompt_embeds=prompt_embeds,
@@ -1056,6 +1059,14 @@ class QwenEditPipeline:
             input_resized, raw_diffused
         )
         self.last_qwen_identity_accepted = qwen_portrait_accepted
+        if reject_identity_failure and not qwen_portrait_accepted:
+            # A source-photo fallback cannot satisfy a clothing replacement.
+            # Preserve the raw candidate for diagnostics, but fail the job
+            # before exporting the unchanged upload as a successful uniform.
+            raise RuntimeError(
+                "Uniform generation changed the person's identity and was rejected. "
+                "No completed uniform image was produced; the original photo has not been substituted."
+            )
         # The enhancement UI is a Qwen Image Edit workflow.  Its final must be
         # the model's decoded image, followed only by passport framing in the
         # caller.  A QA fallback here used to replace a raw Qwen result with a
@@ -1411,12 +1422,8 @@ class QwenEditPipeline:
         if vl_plan.get("source") != "qwen2.5-vl":
             logger.warning("[QWEN_ONLY_UNIFORM] VL source is %s; using geometry fallback", vl_plan.get("source"))
 
-        # Badge coordinates now refer to the prepared VL reference, so this
-        # removal operates on the exact image supplied to Qwen.
-        if vl_plan.get("badge_present") and vl_plan.get("badge_bbox"):
-            template_pil = uniform_vl_analyzer.inpaint_badge(
-                template_pil, vl_plan["badge_bbox"]
-            ).convert("RGB")
+        # Keep the visual reference intact. Qwen omits emblems in the output;
+        # inaccurate VL badge boxes must not erase template seams or fabric.
         logger.info("[UNIFORM_REFERENCE] original=%s prepared=%s", template_source.size, template_pil.size)
 
         uniform_seed = zlib.crc32(person_pil.tobytes())
@@ -1454,25 +1461,62 @@ class QwenEditPipeline:
         )
         palette_evidence = str(vl_plan.get("template_palette_evidence") or "").strip()
 
+        # Supply actual facial detail as additional conditioning, not a second
+        # full portrait or a source-pixel overlay after generation.
+        identity_reference = None
+        try:
+            from pipelines.photo_restoration import _get_insight_app
+            faces = _get_insight_app().get(
+                cv2.cvtColor(np.array(person_pil), cv2.COLOR_RGB2BGR)
+            )
+            if len(faces) == 1:
+                x1, y1, x2, y2 = (float(v) for v in faces[0].bbox)
+                margin = max(x2 - x1, y2 - y1) * 0.25
+                bounds = (
+                    max(0, int(x1 - margin)), max(0, int(y1 - margin)),
+                    min(person_pil.width, int(x2 + margin)),
+                    min(person_pil.height, int(y2 + margin)),
+                )
+                if bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                    crop = person_pil.crop(bounds)
+                    # Match the portrait canvas aspect ratio without stretching
+                    # the face when the common reference loader resizes it.
+                    from PIL import ImageOps
+                    identity_reference = ImageOps.pad(
+                        crop, (width, height), method=Image.Resampling.LANCZOS,
+                        color=(127, 127, 127),
+                    )
+        except Exception as exc:
+            logger.warning("[UNIFORM_IDENTITY] Face reference unavailable: %s", exc)
+        identity_instruction = (
+            "Image 3 is a close-up of the same source face for identity only. Match its facial geometry and expression; use image 1 for head size, hairstyle, pose and composition. Do not copy the crop framing or its lighting. "
+            if identity_reference is not None else ""
+        )
+        logger.info("[UNIFORM_IDENTITY] Additional source face reference=%s", identity_reference is not None)
+
         generated_prompt = prompt or (
-            f"Make the entire backdrop a seamless, completely flat Light Blue school-ID background, exact RGB {bg_rgb}; no wall, texture, foliage, shadow, scene, or colour spill remains anywhere outside the person. "
-            f"Replace the clothing in image 1 with the exact school uniform in image 3. "
-            f"Image 2 locks the person's identity, facial features, skin tone, expression, hairstyle, and pose. "
-            f"Preserve every source hair strand, hairstyle, hair colour, hair accessory, jewelry item, and wearable exactly as visible in image 1. Do not name, add, remove, recolour, move, or reinterpret any of them. "
-            f"Uniform specifications observed from image 3: {garment_desc}. "
-            f"Structured garment analysis: {pattern_desc or 'use the literal reference pixels'}. "
-            f"Measured template color anchors: {palette_evidence or 'use image 3 pixels exactly'}. "
-            f"Copy the visible fabric color, check pattern, collar, neckline, buttons, shoulder seams, vest edge construction, and vest coverage exactly from image 3. "
-            f"Do not redesign, widen, narrow, smooth, or simplify the template vest. Fit its shoulder edges naturally to the child's actual shoulders and retain the template's upper-chest coverage. "
+            f"Edit the uploaded photograph of the same person, replacing clothing and background and balancing lighting. Keep the existing head and face geometry. Use a completely flat solid background RGB {bg_rgb}; include the visible gaps between curls. Keep background color off the subject. "
+            f"Image 1 is the person. Image 2 is the garment reference, not a style suggestion. Dress the person in the actual garment shown in image 2. "
+            f"{identity_instruction}"
+            f"Preserve the person's identity, facial features, skin tone, expression and hairstyle from image 1. "
+            f"Preserve an existing camera-facing pose and gaze exactly. Keep original eye size and spacing, nose, lips, jawline, cheek shape and facial asymmetry. Do not redesign the face to make it more symmetrical or younger. For a source looking away, make only a minimal gaze adjustment without reshaping the face. "
+            f"Keep the full head, hair and accessories visible with clear headroom, and frame through the upper chest so the collar and uniform are visible. The result must remain recognizably the same person, not an idealized or beautified replacement. "
+            f"Replace harsh outdoor light and forehead or hair glare with soft neutral frontal studio light and gentle fill. Preserve natural skin pigmentation and hair base color, not bright blue, silver or golden sun reflections. Retain realistic texture and gentle shadows without warm color grading. "
+            f"Preserve hairstyle, hairline, parting, curls, length, volume, every visible hair accessory, jewelry item and wearable from image 1. Restore detail without enlarging eyes or changing facial proportions. "
+            f"Measured template color anchors: {palette_evidence or 'use image 2 colors'}. Preserve the reference fabric hue, saturation and lightness under neutral light; do not brighten or saturate the garment to match the backdrop. "
+            f"Observed collar construction: {vl_plan.get('shirt_collar') or 'copy image 2'}. Reproduce the visible collar geometry from image 2; never substitute a different collar type. "
+            f"Copy all visible garment layers, fabric weave, check or stripe contrast and spacing, collar construction, neckline, buttons, lapels if present, stitch lines, shoulder seams and edge panels from image 2. Preserve pattern size relative to buttons and collar width. Do not replace textured fabric with smooth fabric or simplify stitched panels into a plain vest. "
+            f"Scale the template garment to the child's shoulders and torso while preserving its construction and relative proportions. Keep its visible upper-chest coverage. "
             f"Remove only badges, crests, logos, patches, and lettering; fill those areas with matching surrounding fabric. "
             f"Fit the uniform collar naturally around the base of the child's neck, maintaining the natural neck visible between chin and collar; do not pull the collar up to the jaw. "
             f"Keep the vest and shirt fabric authentic to the template, with zero emblems or text. "
-            f"High-resolution crisp studio school portrait."
+            f"Natural photographic school portrait of the uploaded person in the supplied uniform."
         )
 
         negative_prompt = (
             "badge, school badge, crest, emblem, logo, patch, name tag, pins, chest text, lettering, words, embroidered crest, cyan badge, blue circle badge, text, letters, symbols, "
             "different person, altered identity, changed face, changed hairstyle, altered hairline, different hair part, "
+            "profile view, looking away, tilted head, exaggerated eyes, crossed eyes, beauty filter, "
             "straight hair, different curls, changed hair length, blue hair, silver hair, gray hair, metallic hair, plastic hair, "
             "oversized hair, overly dense hair, rabbit ears, "
             "missing hair clip, added hair clip, missing glasses, added glasses, missing earrings, added earrings, missing necklace, added necklace, "
@@ -1484,7 +1528,7 @@ class QwenEditPipeline:
         )
         output_path = self.qwen_edit_enhancer(
             image_input=person_pil,
-            reference_images=[person_pil, template_pil],
+            reference_images=[template_pil] + ([identity_reference] if identity_reference is not None else []),
             prompt=generated_prompt,
             negative_prompt=negative_prompt,
             job_id=job_id,
@@ -1497,14 +1541,18 @@ class QwenEditPipeline:
             timeout_seconds=None,
             progress_callback=progress_callback,
             preserve_source_clothing=False,
-            max_generation_dimension=576,
-            keep_generation_resolution=False,
+            max_generation_dimension=704,
+            minimum_generation_dimension=704,
+            keep_generation_resolution=True,
             use_birefnet_background=False,
-            true_cfg_scale=1.35,
+            true_cfg_scale=4.0,
             seed=uniform_seed,
-            face_lock_after_generation=True,
+            face_lock_after_generation=False,
+            reject_identity_failure=True,
         )
         identity_locked = Image.open(output_path).convert("RGB")
+        # Keep Qwen's relit subject intact. The old dark-pixel palette mask
+        # included neck skin, while source face overlays restored outdoor light.
         # The uniform route is Qwen-only. A post-generation BiRefNet matte can
         # cut into hair accessories and sleeves, changing the Qwen fit that
         # the user is reviewing.
