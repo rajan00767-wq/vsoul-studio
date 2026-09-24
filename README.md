@@ -13,6 +13,6 @@ python download_models.py
 python main.py
 ```
 
-`download_models.py` downloads only the models used by this workspace: Qwen Image Edit 2511, Qwen2.5-VL analysis, and the optional local 2x/4x export model.
+`download_models.py` downloads only the models used by this workspace: Qwen Image Edit 2511, Qwen2.5-VL analysis, BiRefNet-HR matting, SCHP human parsing, and the optional local 2x/4x export model.
 
 Open http://127.0.0.1:8000

@@ -17,9 +17,12 @@ torchvision>=0.18.0
 opencv-python>=4.10.0,<5.0
 Pillow>=11.0.0
 numpy>=2.0.0
+scikit-image>=0.24.0
 insightface>=0.7.3
-onnxruntime-gpu>=1.19.0; sys_platform == "win32" or sys_platform == "linux"
-onnxruntime>=1.19.0; sys_platform == "darwin"
+# FaceAnalysis is intentionally CPU-only in the application to avoid taking
+# VRAM from Qwen and BiRefNet.
+onnxruntime>=1.19.0
+packaging>=24.1
 
 # Qwen Image Edit 2511 and Qwen2.5-VL analysis
 diffusers>=0.30.0
@@ -28,6 +31,8 @@ accelerate>=0.34.0
 safetensors>=0.4.5
 huggingface_hub>=0.25.0
 einops>=0.8.0
+timm>=1.0.9
+kornia>=0.7.3
 PyYAML>=6.0
 bitsandbytes>=0.44.0
 gguf>=0.10.0

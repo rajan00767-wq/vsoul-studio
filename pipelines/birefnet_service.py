@@ -27,6 +27,7 @@ from utils.logger import get_logger as _get_logger
 from pipelines.schp_service import available as schp_available, fuse_with_birefnet, parse
 
 logger = _get_logger(__name__)
+ROOT = Path(__file__).resolve().parents[1]
 
 _IMAGE_SIZE = (1024, 1024)
 
@@ -39,6 +40,7 @@ _TRANSFORM = transforms.Compose([
 # Prefer matting models over lite segmentation for hair, accessories, and
 # semi-transparent portrait edges. Keep lite as the last-resort fallback.
 _MODEL_CHAIN = [
+    str(ROOT / "models" / "birefnet-hr-matting"),
     "ZhengPeng7/BiRefNet_HR-matting",
     "ZhengPeng7/BiRefNet_dynamic-matting",
     "ZhengPeng7/BiRefNet-matting",

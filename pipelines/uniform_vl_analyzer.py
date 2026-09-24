@@ -113,6 +113,38 @@ def flatten_vl_dict(data: Any) -> Dict[str, Any]:
     return flat
 
 
+def normalize_uniform_analysis(data: Any) -> Dict[str, Any]:
+    """Keep garment-layer context when VL returns objects instead of strings."""
+    if not isinstance(data, dict):
+        return {}
+
+    def describe(value: Any) -> str:
+        if isinstance(value, dict):
+            return "; ".join(f"{key.replace('_', ' ')}: {describe(item)}"
+                             for key, item in value.items() if item is not None)
+        if isinstance(value, list):
+            return ", ".join(describe(item) for item in value if item is not None)
+        return str(value)
+
+    result = flatten_vl_dict(data)
+    descriptions = {
+        "garment_components", "shirt_color_and_pattern", "outer_garment_color_and_shape",
+        "shirt_collar", "outer_neckline", "button_layout", "button_color",
+        "fabric_detail", "construction_detail",
+    }
+    # Preserve canonical fields even inside a response wrapper. Never promote a
+    # generic 'color' leaf into another garment's color field.
+    def visit(node: Dict[str, Any]) -> None:
+        for key, value in node.items():
+            if key in descriptions:
+                result[key] = describe(value) if value is not None else "unknown"
+            elif isinstance(value, dict):
+                visit(value)
+
+    visit(data)
+    return result
+
+
 def _coerce_bool(value: Any) -> bool:
     """Interpret Qwen-VL boolean fields without treating the string "false" as true."""
     if isinstance(value, bool):
@@ -511,9 +543,12 @@ if torch.cuda.is_available():
             p_prompt = (
                 "Inspect this portrait only. Return JSON with keys: hair_style, hair_parting, hair_length, hair_texture, "
                 "hair_color, hair_accessories, hair_accessory_details, visible_wearables, clothing_description, "
-                "clothing_color_pattern, clothing_collar, clothing_fasteners, skin_tone, face_orientation, expression.\n"
+                "clothing_color_pattern, clothing_collar, clothing_fasteners, skin_tone, face_orientation, expression, face_detail, lighting_corrections.\n"
                 "hair_accessories must list visible headbands, bows, ribbons, clips, or 'none'.\n"
                 "hair_accessory_details must state side, color, and shape for each visible accessory.\n"
+                "Inspect both sides of the crown separately for small clips. Use uncertain for obscured details, not none.\n"
+                "face_detail: describe visible eye shape, eyebrows, nose, lips and expression without identifying the person or proposing beautification.\n"
+                "hair_color and skin_tone describe base pigment, not sunlight glare. lighting_corrections lists only visible hot spots or hard shadows to soften.\n"
                 "Describe hair and clothing only from visible pixels; do not infer or invent missing details.\n"
                 "visible_wearables must list visible earrings, bindi, glasses, necklaces, or 'none'.\n"
                 "Return JSON only:"
@@ -523,12 +558,20 @@ if torch.cuda.is_available():
                 "shirt_color_and_pattern, shirt_primary_color, shirt_secondary_color, shirt_pattern_type, "
                 "shirt_pattern_scale, outer_garment_color_and_shape, outer_primary_color, outer_pattern_type, "
                 "shirt_collar, outer_neckline, sleeve_length, button_layout, button_color, badge_present, "
-                "badge_location, badge_bbox.\n"
+                "badge_location, badge_bbox, fabric_detail, construction_detail.\n"
                 "Rules:\n"
                 "- Inspect literal template pixels only. Do not describe a generic school uniform or infer unseen fabric.\n"
-                "- Name each visible layer's exact colors. Classify the shirt pattern as check, stripe, plaid, print, or solid and its scale as micro, fine, medium, or large.\n"
-                "- State whether the outer garment is solid, textured, checked, striped, or patterned.\n"
+                "- Inspect each layer separately: collar, shirt front, sleeves, and outer garment. Do not let the backdrop or badge influence the fabric color description.\n"
+                "- Separate the cloth ground color from the thin pattern-line color. Describe the large spaces BETWEEN lines as the ground; do not call the whole shirt blue merely because it has blue lines. If unresolved say uncertain.\n"
+                "- Classify the shirt pattern as check, stripe, plaid, print, or solid and its scale as micro, fine, medium, or large. Note line thickness, crossing directions and contrast; do not invent measurements.\n"
+                "- A single-color outer garment can still have visible woven texture. Report color pattern and surface texture separately; do not equate solid color with smooth fabric.\n"
                 "- Distinguish a standing band collar from a folded pointed collar.\n"
+                "- Describe collar ends and whether folded triangular points are actually present. Do not invent points, piping or trim.\n"
+                "- Separate the light base cloth from colored grid threads; specify their contrast and spacing relative to a button.\n"
+                "- fabric_detail describes visible weave and surface finish for each layer. Inspect dark fabric for fine grain before calling it smooth. Use uncertain if unresolved.\n"
+                "- construction_detail must describe the actual left and right front edges, angled or curved panel shapes, seam lines, topstitching and overlapping layers. A V-neck description alone is insufficient. Distinguish stitched panel edges from printed stripes and shadows. Do not invent lapels when only seams are visible.\n"
+                "- button_layout and button_color describe each visible layer separately: position, visible count, color and round/other shape. Do not infer hidden buttons below the crop.\n"
+                "- Before returning JSON, cross-check collar, cloth ground versus grid color, outer texture and panel edges against the image. Replace unsupported claims with uncertain. Use concise string values for descriptions, not generic uniform recommendations.\n"
                 "- Distinguish a V-neck outer vest from a high collar.\n"
                 "- badge_present: true if an emblem, crest, logo patch, or school badge is visible.\n"
                 "- badge_bbox: [ymin, xmin, ymax, xmax] or [xmin, ymin, xmax, ymax] coordinates on this image, or null if no badge.\n"
@@ -564,14 +607,14 @@ msg_p = [{{"role": "user", "content": [{{"type": "image", "image": person_img}},
 txt_p = processor.apply_chat_template(msg_p, tokenize=False, add_generation_prompt=True)
 inp_p = processor(text=[txt_p], images=[person_img], padding=True, return_tensors="pt").to(model.device)
 with torch.inference_mode():
-    gen_p = model.generate(**inp_p, max_new_tokens=256, do_sample=False)
+    gen_p = model.generate(**inp_p, max_new_tokens=768, do_sample=False)
 out_p = processor.batch_decode(gen_p[:, inp_p.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
 
 msg_u = [{{"role": "user", "content": [{{"type": "image", "image": template_img}}, {{"type": "text", "text": u_prompt}}]}}]
 txt_u = processor.apply_chat_template(msg_u, tokenize=False, add_generation_prompt=True)
 inp_u = processor(text=[txt_u], images=[template_img], padding=True, return_tensors="pt").to(model.device)
 with torch.inference_mode():
-    gen_u = model.generate(**inp_u, max_new_tokens=256, do_sample=False)
+    gen_u = model.generate(**inp_u, max_new_tokens=768, do_sample=False)
 out_u = processor.batch_decode(gen_u[:, inp_u.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
 
 combined = {{"person_raw": out_p, "uniform_raw": out_u}}
@@ -599,7 +642,14 @@ if torch.cuda.is_available():
             if match:
                 combined_dict = json.loads(match.group(1))
                 p_dict = flatten_vl_dict(clean_and_repair_json(combined_dict.get("person_raw", "")))
-                u_dict = flatten_vl_dict(clean_and_repair_json(combined_dict.get("uniform_raw", "")))
+                uniform_observations = clean_and_repair_json(combined_dict.get("uniform_raw", ""))
+                u_dict = normalize_uniform_analysis(uniform_observations)
+                result["uniform_observations_raw"] = uniform_observations
+                # Missing model fields must not masquerade as observed facts.
+                for key in ("garment_components", "shirt_color_and_pattern", "outer_garment_color_and_shape",
+                            "shirt_collar", "outer_neckline", "button_layout", "hair_style", "hair_color",
+                            "hair_accessories", "visible_wearables"):
+                    result[key] = "unknown"
                 result.update(p_dict)
                 result.update(u_dict)
                 result["source"] = "qwen2.5-vl"

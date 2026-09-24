@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download only the Qwen models required by this Vsoul Studio workspace."""
+"""Download only the model assets used by this Vsoul Studio workspace."""
 
 from __future__ import annotations
 
@@ -17,12 +17,14 @@ NEEDED = [
     "qwen_image_edit/vae",
     "qwen_image_edit/scheduler",
     "qwen_image_edit/qwen-image-edit-2511-Q4_K_M.gguf",
-    "qwen_image_edit/svdq-fp4_r32-qwen-image-edit-lightningv1.0-4steps.safetensors",
     "loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
-    "qwen_image_edit/transformer/config.json",
     "qwen2.5-vl-3b-instruct",
+    "birefnet-hr-matting/config.json",
+    "birefnet-hr-matting/model.safetensors",
+    "schp-lip-20/config.json",
+    "schp-lip-20/preprocessor_config.json",
+    "schp-lip-20/model.safetensors",
     "realesrgan/RealESRGAN_x4plus.pth",
-    "insightface",
 ]
 
 
@@ -55,7 +57,8 @@ def fetch_missing() -> None:
         )
 
     qwen_comp = DEST / "qwen_image_edit"
-    if not (qwen_comp / "vae").is_dir() or not (qwen_comp / "transformer" / "config.json").is_file():
+    qwen_components = ("vae", "tokenizer", "processor", "scheduler", "text_encoder")
+    if any(not (qwen_comp / component).is_dir() for component in qwen_components):
         print("[FETCH] Qwen companion (vae/tokenizer/text_encoder/scheduler/processor)")
         snapshot_download(
             "Qwen/Qwen-Image-Edit-2511",
@@ -66,10 +69,31 @@ def fetch_missing() -> None:
                 "processor/*",
                 "scheduler/*",
                 "text_encoder/*",
-                "transformer/config.json",
                 "*.json",
             ],
-            ignore_patterns=["transformer/*.safetensors", "transformer/*.bin"],
+            ignore_patterns=["transformer/*"],
+        )
+
+    birefnet_dir = DEST / "birefnet-hr-matting"
+    if not (birefnet_dir / "model.safetensors").is_file():
+        print("[FETCH] BiRefNet HR portrait matting")
+        snapshot_download(
+            "ZhengPeng7/BiRefNet_HR-matting",
+            local_dir=str(birefnet_dir),
+            ignore_patterns=["*.md", "assets/*"],
+        )
+
+    schp_dir = DEST / "schp-lip-20"
+    if not (schp_dir / "model.safetensors").is_file():
+        print("[FETCH] SCHP LIP-20 human parsing")
+        snapshot_download(
+            "pirocheto/schp-lip-20",
+            local_dir=str(schp_dir),
+            allow_patterns=[
+                "config.json",
+                "preprocessor_config.json",
+                "model.safetensors",
+            ],
         )
 
     esr = DEST / "realesrgan" / "RealESRGAN_x4plus.pth"
