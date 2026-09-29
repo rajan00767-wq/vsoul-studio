@@ -158,7 +158,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                     # Ignore values from older cached browser pages.
                     "",
                     _cb,
-                    int(metadata.get("steps", 20)),
+                    int(metadata.get("steps", 8)),
                 ),
             )
             named_path, msg, candidate_path = (*result, None)[:3]

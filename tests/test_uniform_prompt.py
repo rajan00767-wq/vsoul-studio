@@ -1,6 +1,7 @@
 """Lightweight prompt regression tests without loading GPU models."""
 import ast
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 import unittest
 
 
@@ -10,8 +11,55 @@ ROOT = Path(__file__).resolve().parents[1]
 class UniformPromptTests(unittest.TestCase):
     def setUp(self):
         tree = ast.parse((ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"))
+        self.tree = tree
         self.route = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                           and n.name == "qwen_vl_image_edit_uniform_swap")
+
+    def uniform_step_selector(self):
+        helper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_select_uniform_steps")
+        namespace = {"Any": Any, "Dict": Dict, "List": List, "Tuple": Tuple}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "steps", "exec"), namespace)
+        return namespace["_select_uniform_steps"]
+
+    def test_adaptive_uniform_steps_scale_with_observed_risk(self):
+        select = self.uniform_step_selector()
+        simple, _ = select({
+            "pose": "front portrait", "hair_accessories": "none",
+            "outer_color_confidence": "high", "fabric_detail": "plain woven cotton",
+        })
+        moderate, _ = select({
+            "pose": "front portrait", "hair_accessories": "two clips",
+            "outer_color_confidence": "high", "fabric_detail": "plain woven cotton",
+        })
+        difficult, reasons = select({
+            "pose": "front portrait", "hair_accessories": "two flowers",
+            "direct_sunlight_present": True, "sunlight_type": "hard direct sun",
+            "outer_color_confidence": "low",
+            "fabric_detail": "unclear",
+        })
+        self.assertEqual((simple, moderate, difficult), (8, 12, 20))
+        self.assertIn("hard or direct source lighting", reasons)
+
+    def test_soft_indoor_hotspot_and_shared_template_uncertainty_use_twelve_steps(self):
+        select = self.uniform_step_selector()
+        selected, reasons = select({
+            "pose": "front portrait", "hair_accessories": "none",
+            "direct_sunlight_present": True, "head_hair_hotspot_present": True,
+            "sunlight_type": "soft indoor", "outer_color_confidence": "low",
+            "fabric_detail": "unclear",
+        })
+        self.assertEqual(selected, 12)
+        self.assertEqual(reasons, [
+            "possible lighting hotspot", "uncertain uniform color or fabric detail",
+        ])
+
+    def test_adaptive_uniform_steps_respect_requested_maximum(self):
+        select = self.uniform_step_selector()
+        selected, _ = select({
+            "direct_sunlight_present": True, "hair_accessories": "flowers",
+        }, maximum_steps=12)
+        self.assertEqual(selected, 12)
 
     def details(self, plan, keys):
         helper = next(n for n in self.route.body if isinstance(n, ast.FunctionDef)
@@ -38,9 +86,21 @@ class UniformPromptTests(unittest.TestCase):
         expression = ast.Expression(assignment.value)
         namespace = dict(bg_rgb=(4, 126, 246), fabric_color_instruction="TEST BLACK",
                          hair_color_instruction="TEST HAIR",
-                         refinement_prompt=lambda bg, fabric, hair: "TEST REFINEMENT " + str(bg) + " " + fabric + " " + hair)
+                         lighting_instruction="TEST LIGHTING",
+                         skin_tone_instruction="TEST SKIN",
+                         identity_instruction="TEST IDENTITY",
+                         collar_constraint="TEST COLLAR",
+                         refinement_prompt=lambda bg, fabric, hair, lighting, skin, identity: "TEST REFINEMENT " + str(bg) + " " + fabric + " " + hair + " " + lighting + " " + skin + " " + identity)
         result = eval(compile(expression, "prompt", "eval"), namespace)
-        self.assertEqual(result, "TEST REFINEMENT (4, 126, 246) TEST BLACK TEST HAIR")
+        self.assertEqual(result, "TEST REFINEMENT (4, 126, 246) TEST BLACK TEST HAIR TEST LIGHTING TEST SKIN TEST IDENTITY TEST COLLAR")
+
+    def test_vl_skin_tone_is_forwarded_as_a_source_cross_check(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn('vl_plan.get("skin_tone")', source)
+        self.assertIn("image 1 pixels remain authoritative", source)
+        for phrase in ("never lighten", "whiten, tan, warm, cool or recolor skin"):
+            self.assertIn(phrase, source)
+        self.assertIn('"skin_tone_instruction": skin_tone_instruction', source)
 
     def test_negative_prompt_does_not_ban_source_traits(self):
         assignment = next(n for n in self.route.body if isinstance(n, ast.Assign)
@@ -48,21 +108,64 @@ class UniformPromptTests(unittest.TestCase):
         result = ast.literal_eval(assignment.value)
         for trait in ("straight hair", "gray hair", "white dress", "neck shadow"):
             self.assertNotIn(trait, result)
+        for source_trait in ("added bows", "added flowers"):
+            self.assertNotIn(source_trait, result)
 
     def test_uniform_construction_observations_are_forwarded(self):
         assignment = next(n for n in self.route.body if isinstance(n, ast.Assign)
                           and any(isinstance(t, ast.Name) and t.id == "garment_details" for t in n.targets))
         keys = ast.literal_eval(assignment.value.args[0])
-        for key in ("shirt_color_and_pattern", "outer_garment_color_and_shape",
-                    "fabric_detail", "construction_detail", "button_color"):
+        for key in ("shirt_color_and_pattern", "outer_garment_color_and_shape"):
             self.assertIn(key, keys)
+        for key in ("outer_color_under_neutral_light",):
+            self.assertIn(key, keys)
+
+    def test_vl_portrait_details_are_audited_not_prompted(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertNotIn('f"VL portrait facts: {portrait_details}', source)
+        self.assertIn('"portrait_details": portrait_details', source)
+        for key in ("face_detail", "hair_parting", "hair_texture", "hair_color",
+                    "hair_accessories", "hair_accessory_details", "visible_wearables"):
+            self.assertIn(f'"{key}"', source)
+        self.assertIn("outer_neutral_rgb", source)
+
+    def test_identity_review_blocks_mismatched_person(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("[UNIFORM_IDENTITY_REVIEW] Candidate rejected", source)
+        self.assertIn("Uniform output was not delivered because the generated face", source)
+        self.assertNotIn("Candidate retained for user review", source)
+
+    def test_uniform_delivery_uses_no_secondary_identity_generator(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertNotIn("_swap_uniform_identity", source)
+        self.assertNotIn("inswapper_128", source)
+
+    def test_identity_repair_is_structural_and_preserves_source_chroma(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("alpha = (mask * .36)", source)
+        self.assertIn("mean_strength = 1.0 if channel == 0 else 0.35", source)
+
+    def test_uniform_prompt_rejects_cast_only_skin_and_invented_earrings(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn('unsafe_cast_terms = ("orange", "yellow"', source)
+        for phrase in ("changed ethnicity appearance", "changed ancestry appearance", "invented earrings", "dangling earrings"):
+            self.assertIn(phrase, source)
+
+    def test_generation_uses_structured_accessories_not_unreliable_free_text(self):
+        source = ast.get_source_segment(
+            (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"), self.route,
+        )
+        self.assertIn('raw_accessories = vl_plan.get("hair_accessories")', source)
+        generation_section = source[source.index("raw_accessories ="):source.index("generated_prompt =")]
+        self.assertNotIn("hair_accessory_details", generation_section)
 
     def test_single_generation_keeps_quality_settings(self):
         calls = [node for node in ast.walk(self.route) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute) and node.func.attr == "qwen_edit_enhancer"]
         self.assertEqual(len(calls), 1)
         kwargs = {arg.arg: arg.value for arg in calls[0].keywords}
-        self.assertEqual(ast.literal_eval(kwargs["steps"]), 20)
+        self.assertEqual(kwargs["steps"].id, "generation_steps")
+        self.assertEqual(ast.literal_eval(kwargs["max_sequence_length"]), 384)
         self.assertEqual(ast.literal_eval(kwargs["true_cfg_scale"]), 3.0)
         self.assertFalse(ast.literal_eval(kwargs["reject_identity_failure"]))
         self.assertTrue(ast.literal_eval(kwargs["return_raw_candidate"]))
@@ -71,16 +174,66 @@ class UniformPromptTests(unittest.TestCase):
         self.assertTrue(ast.literal_eval(kwargs["preserve_reference_aspect"]))
         references = kwargs["reference_images"]
         self.assertIsInstance(references, ast.List)
-        self.assertEqual([item.id for item in references.elts], ["template_pil"])
-        self.assertEqual(kwargs["image_input"].id, "rough_composite")
+        self.assertEqual([item.id for item in references.elts], ["person_pil", "template_pil"])
+        self.assertEqual(kwargs["image_input"].id, "person_pil")
 
-    def test_fabric_finishing_runs_after_background_replacement(self):
+    def test_repeated_inputs_use_a_new_auditable_job_seed(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertNotIn('zlib.crc32(job_id.encode("utf-8"), uniform_seed)', source)
+        self.assertIn('"seed_policy": "stable_content_seed"', source)
+
+    def test_single_pass_edits_original_person_and_uses_template_reference(self):
+        assignments = {
+            target.id: node.value
+            for node in self.route.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        normalized = assignments["conditioning_person"]
+        self.assertIsInstance(normalized, ast.Call)
+        self.assertEqual(normalized.func.attr, "normalize_uniform_conditioning_light")
+        self.assertEqual(normalized.args[0].id, "person_pil")
+
         calls = [node for node in ast.walk(self.route) if isinstance(node, ast.Call)]
+        qwen = next(node for node in calls if isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "qwen_edit_enhancer")
+        qwen_kwargs = {item.arg: item.value for item in qwen.keywords}
+        self.assertEqual(qwen_kwargs["image_input"].id, "person_pil")
+        identity = next(node for node in calls if isinstance(node.func, ast.Name)
+                        and node.func.id == "check_uniform_identity")
+        self.assertEqual(identity.args[0].id, "person_pil")
+
+    def test_wrong_qwen_background_is_corrected_after_generation(self):
+        calls = [node for node in ast.walk(self.route) if isinstance(node, ast.Call)]
+        qwen = next(node for node in calls if isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "qwen_edit_enhancer")
+        post_generation_replacements = [node for node in calls if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {
+                "_replace_background_with_foreground_matte",
+                "_replace_smooth_border_background",
+            }
+            and node.lineno > qwen.lineno
+        )]
+        self.assertEqual(len(post_generation_replacements), 1)
+        replacement = post_generation_replacements[0]
+        kwargs = {item.arg: item.value for item in replacement.keywords}
+        self.assertEqual(replacement.args[0].id, "cropped")
+        self.assertEqual(kwargs["background_color"].id, "background_color")
+        self.assertTrue(ast.literal_eval(kwargs["preserve_foreground_rgb"]))
+        self.assertTrue(ast.literal_eval(kwargs["strict"]))
         background = next(node for node in calls if isinstance(node.func, ast.Attribute)
-                          and node.func.attr == "_replace_background_with_foreground_matte")
+                          and node.func.attr == "_has_selected_solid_background")
         finishing = next(node for node in calls if isinstance(node.func, ast.Name)
                          and node.func.id == "finish_uniform_tones")
         self.assertGreater(finishing.lineno, background.lineno)
+
+    def test_uniform_finishing_uses_source_exposure_and_measured_hair(self):
+        calls = [node for node in ast.walk(self.route) if isinstance(node, ast.Call)]
+        finishing = next(node for node in calls if isinstance(node.func, ast.Name)
+                         and node.func.id == "finish_uniform_tones")
+        kwargs = {item.arg: item.value for item in finishing.keywords}
+        self.assertEqual(kwargs["correct_dark_hair"].id, "measured_dark_hair")
+        self.assertEqual(kwargs["face_target_luma"].id, "face_target_luma")
 
     def test_custom_prompt_cannot_replace_uniform_instructions(self):
         assignment = next(n for n in self.route.body if isinstance(n, ast.Assign)

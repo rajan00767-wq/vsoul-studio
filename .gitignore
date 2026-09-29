@@ -12,6 +12,7 @@ outputs/
 scratch/cache/
 external/
 third_party/
+Ultralytics/
 *.log
 *.sqlite*
 *.db

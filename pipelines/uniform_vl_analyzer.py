@@ -92,6 +92,12 @@ def flatten_vl_dict(data: Any) -> Dict[str, Any]:
         "hair_texture",
         "hair_accessory_details",
         "skin_tone",
+        "face_shape",
+        "eye_description",
+        "eyebrow_description",
+        "nose_description",
+        "mouth_description",
+        "earring_description",
         "expression",
         "face_orientation",
         "jewelry_description",
@@ -106,6 +112,8 @@ def flatten_vl_dict(data: Any) -> Dict[str, Any]:
         "outer_pattern_type",
         "button_color",
         "outer_garment_color_and_shape",
+        "outer_color_under_neutral_light",
+        "outer_color_confidence",
     ):
         if str_key in flat and isinstance(flat[str_key], list):
             flat[str_key] = ", ".join(str(item) for item in flat[str_key] if item) or "none"
@@ -130,7 +138,7 @@ def normalize_uniform_analysis(data: Any) -> Dict[str, Any]:
     descriptions = {
         "garment_components", "shirt_color_and_pattern", "outer_garment_color_and_shape",
         "shirt_collar", "outer_neckline", "button_layout", "button_color",
-        "fabric_detail", "construction_detail",
+        "fabric_detail", "construction_detail", "outer_color_under_neutral_light", "outer_color_confidence",
     }
     # Preserve canonical fields even inside a response wrapper. Never promote a
     # generic 'color' leaf into another garment's color field.
@@ -262,7 +270,10 @@ Uniform Blueprint (Image 2):
 - shirt_collar: exact shirt collar style (e.g. "mandarin band collar at neck base", "folded pointed collar", "button-down pointed collar", "round collar")
 - outer_neckline: exact neckline of the outer garment (e.g. "deep V-neck vest", "crew neck", "blazer lapel", "none")
 - shirt_color_and_pattern: shirt color and pattern (e.g. "blue and white micro-checkered", "plain white")
-- outer_garment_color_and_shape: outer garment color and style (e.g. "navy blue V-neck vest", "dark blazer", "none")
+- outer_garment_color_and_shape: observed outer garment color and style
+- outer_color_under_neutral_light: perceived base fabric color after discounting shadows, highlights, and color cast
+- outer_neutral_rgb: three integers [R, G, B] estimating that base fabric under neutral studio light
+- outer_color_confidence: high, medium, or low
 - sleeve_length: sleeve length (e.g. "short sleeves", "long sleeves", "sleeveless", or "unknown" if cropped)
 - button_layout: description of visible buttons on shirt and outer garment (e.g. "front placket with 2 visible white buttons")
 - badge_present: boolean (true if any school crest, emblem, patch, logo, or text badge is visible on the uniform; false otherwise)
@@ -272,11 +283,12 @@ Uniform Blueprint (Image 2):
 Key garment guidelines:
 - Distinguish a standing band collar (mandarin collar) from a turtleneck: a standing band collar sits at the base of the neck with an open neck hole.
 - Distinguish a V-neck outer garment (e.g. V-neck vest) from a high collar: if the outer layer plunges or opens in front to expose the shirt, outer_neckline is "V-neck" or "open vest".
-Return JSON ONLY with keys: garment_components, shirt_collar, outer_neckline, shirt_color_and_pattern, outer_garment_color_and_shape, sleeve_length, button_layout, badge_present, badge_location, badge_bbox, hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_accessories, hair_accessory_details, visible_wearables.
+Return JSON ONLY with keys: garment_components, shirt_collar, outer_neckline, shirt_color_and_pattern, outer_garment_color_and_shape, outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence, sleeve_length, button_layout, badge_present, badge_location, badge_bbox, hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_accessories, hair_accessory_details, visible_wearables.
 Do not describe or identify the person."""
 
     _GARMENT_RETRY_PROMPT = """Analyze this uniform template only. Return one JSON object and nothing else.
 Required keys: garment_components, shirt_color_and_pattern, outer_garment_color_and_shape,
+outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence,
 shirt_collar, outer_neckline, sleeve_length, button_layout, badge_present, badge_location, badge_bbox.
 Describe only visible garment facts. Do not describe a person.
 Distinguish a standing band collar from a folded pointed collar. Distinguish a V-neck vest from a high collar.
@@ -305,7 +317,8 @@ direct_sunlight_present, head_hair_hotspot_present, sunlight_type, sunlight_dire
 glasses_present, headwear_present, headwear_description,
 hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_accessories, hair_accessory_details,
 clothing_description, clothing_color_pattern, clothing_collar, clothing_fasteners, garment_visibility, skin_tone,
-face_orientation, expression, and jewelry_description.
+face_orientation, expression, face_shape, eye_description, eyebrow_description, nose_description,
+mouth_description, earring_description, and jewelry_description.
 
 Guidelines:
 source_subject_count is the number of people visibly present in the source image.
@@ -315,12 +328,19 @@ head_hair_hotspot_present is true only when bright glare is visible on the foreh
 sunlight_type is one of "hard direct sun", "broad sun wash", "soft indoor", or "none". sunlight_direction is the visible direction, such as "upper left", or "none".
 sunlight_evidence is a concise reason (or "none"). sunlight_regions lists affected regions only (or "none"), for example "forehead, crown, left cheek".
 hair_accessories must list visible headbands, bows, ribbons, clips, or "none".
-hair_accessory_details must identify the visible accessory by side, color, and shape without inventing extras.
+hair_accessory_details must enumerate every visible accessory separately by left/right side, color, shape and count.
+Flowers are flowers, not headbands; clips are clips, not jewelry. Inspect both sides independently and return "none"
+instead of guessing when uncertain.
 headwear_present is true only for hats, caps, turbans, hijabs (distinct from hair accessories).
 jewelry_description must list visible earrings, necklaces, chains, pendants, bindis, or "none".
+face_shape, eye_description, eyebrow_description, nose_description and mouth_description must concisely describe
+only stable visible geometry. Do not infer ethnicity, nationality or identity. earring_description must describe the
+source earrings' type, size, metal/color and position, or "none".
 clothing_description must be a short generic description of the visible source garment.
 clothing_color_pattern, clothing_collar, and clothing_fasteners must describe only visible features.
-skin_tone must describe natural complexion (e.g. "fair", "wheatish", "dusky").
+skin_tone must concisely describe the natural base complexion and undertone visible in evenly lit facial areas
+(for example "medium-brown with warm-neutral undertone"). Ignore sunlight, highlights, shadow, makeup, background
+spill and camera white-balance cast; never infer base skin color from a bright hot spot.
 hair_color must describe the base pigment visible in shaded strands. Describe silver, blue or gold glare in sunlight_evidence instead of treating it as the base hair color. If the base color is unclear, say "uncertain".
 Use concise generic descriptions. Do not identify the person."""
 
@@ -403,6 +423,12 @@ Use concise generic descriptions. Do not identify the person."""
             "clothing_fasteners": "source garment details",
             "garment_visibility": "upper garment visible",
             "skin_tone": "source natural skin tone",
+            "face_shape": "source face shape",
+            "eye_description": "source eye geometry",
+            "eyebrow_description": "source eyebrow geometry",
+            "nose_description": "source nose geometry",
+            "mouth_description": "source mouth geometry",
+            "earring_description": "source earrings",
             "face_orientation": "source camera orientation",
             "expression": "source expression",
             "jewelry_description": "visible source jewelry",
@@ -507,7 +533,10 @@ if torch.cuda.is_available():
             "badge_bbox": None,
             "garment_components": ["shirt", "vest"],
             "shirt_color_and_pattern": "checkered shirt",
-            "outer_garment_color_and_shape": "navy blue vest",
+            "outer_garment_color_and_shape": "unknown outer garment color and shape",
+            "outer_color_under_neutral_light": "unknown",
+            "outer_neutral_rgb": None,
+            "outer_color_confidence": "low",
             "sleeve_length": "unknown",
             "button_layout": "front placket buttons",
             "shirt_collar": "mandarin band collar at neck base",
@@ -516,6 +545,12 @@ if torch.cuda.is_available():
             "hair_color": "natural dark hair",
             "hair_accessories": "none",
             "visible_wearables": "none",
+            "direct_sunlight_present": False,
+            "head_hair_hotspot_present": False,
+            "sunlight_type": "none",
+            "sunlight_direction": "none",
+            "sunlight_evidence": "none",
+            "sunlight_regions": "none",
             "garment_risks": ["Preserve every visible template layer."],
             "risks": ["Use deterministic face lock and seam-only repair."],
             "source": "geometry fallback",
@@ -543,12 +578,17 @@ if torch.cuda.is_available():
             p_prompt = (
                 "Inspect this portrait only. Return JSON with keys: hair_style, hair_parting, hair_length, hair_texture, "
                 "hair_color, hair_accessories, hair_accessory_details, visible_wearables, clothing_description, "
-                "clothing_color_pattern, clothing_collar, clothing_fasteners, skin_tone, face_orientation, expression, face_detail, lighting_corrections.\n"
+                "clothing_color_pattern, clothing_collar, clothing_fasteners, skin_tone, face_orientation, expression, face_detail, "
+                "direct_sunlight_present, head_hair_hotspot_present, sunlight_type, sunlight_direction, sunlight_evidence, sunlight_regions.\n"
                 "hair_accessories must list visible headbands, bows, ribbons, clips, or 'none'.\n"
                 "hair_accessory_details must state side, color, and shape for each visible accessory.\n"
                 "Inspect both sides of the crown separately for small clips. Use uncertain for obscured details, not none.\n"
                 "face_detail: describe visible eye shape, eyebrows, nose, lips and expression without identifying the person or proposing beautification.\n"
-                "hair_color and skin_tone describe base pigment, not sunlight glare. lighting_corrections lists only visible hot spots or hard shadows to soften.\n"
+                "direct_sunlight_present is true for visible directional sunlight, hard shadows, or broad outdoor sun wash.\n"
+                "head_hair_hotspot_present is true for bright glare on the forehead, hairline, crown, roots, or hair.\n"
+                "sunlight_type is hard direct sun, broad sun wash, soft indoor, or none. sunlight_direction states its visible direction.\n"
+                "sunlight_evidence briefly describes the evidence. sunlight_regions lists only affected regions such as forehead, crown, roots, left hair, or right hair.\n"
+                "hair_color and skin_tone describe base pigment, not sunlight glare. Report orange/yellow skin cast and silver, cyan, white or gold crown glare as lighting evidence; do not call these soft or normal lighting.\n"
                 "Describe hair and clothing only from visible pixels; do not infer or invent missing details.\n"
                 "visible_wearables must list visible earrings, bindi, glasses, necklaces, or 'none'.\n"
                 "Return JSON only:"
@@ -557,11 +597,14 @@ if torch.cuda.is_available():
                 "Inspect this uniform template image only. Return JSON with keys: garment_components, "
                 "shirt_color_and_pattern, shirt_primary_color, shirt_secondary_color, shirt_pattern_type, "
                 "shirt_pattern_scale, outer_garment_color_and_shape, outer_primary_color, outer_pattern_type, "
+                "outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence, "
                 "shirt_collar, outer_neckline, sleeve_length, button_layout, button_color, badge_present, "
                 "badge_location, badge_bbox, fabric_detail, construction_detail.\n"
                 "Rules:\n"
                 "- Inspect literal template pixels only. Do not describe a generic school uniform or infer unseen fabric.\n"
                 "- Inspect each layer separately: collar, shirt front, sleeves, and outer garment. Do not let the backdrop or badge influence the fabric color description.\n"
+                "- Judge the outer fabric's real base color after discounting shadows, highlights, camera white balance and reflected backdrop light. Put that judgment in outer_color_under_neutral_light.\n"
+                "- outer_neutral_rgb must be [R, G, B] integers for that same base color under neutral studio lighting, not a raw shadow pixel and not the backdrop color. Set confidence low if ambiguous.\n"
                 "- Separate the cloth ground color from the thin pattern-line color. Describe the large spaces BETWEEN lines as the ground; do not call the whole shirt blue merely because it has blue lines. If unresolved say uncertain.\n"
                 "- Classify the shirt pattern as check, stripe, plaid, print, or solid and its scale as micro, fine, medium, or large. Note line thickness, crossing directions and contrast; do not invent measurements.\n"
                 "- A single-color outer garment can still have visible woven texture. Report color pattern and surface texture separately; do not equate solid color with smooth fabric.\n"
@@ -577,6 +620,13 @@ if torch.cuda.is_available():
                 "- badge_bbox: [ymin, xmin, ymax, xmax] or [xmin, ymin, xmax, ymax] coordinates on this image, or null if no badge.\n"
                 "Return JSON only:"
             )
+            h_prompt = (
+                "Inspect this enlarged head crop only. Return JSON with keys: hair_style, hair_parting, hair_length, "
+                "hair_texture, hair_color, hair_accessories, hair_accessory_details. Count every "
+                "distinct flower, bow, ribbon, clip, band or tie. Inspect the left and right sides separately and "
+                "state each accessory's side, color, shape and count. Describe base hair pigment from shaded strands; "
+                "do not call sunlight glare blonde, gray or silver. Do not infer gender. Return JSON only:"
+            )
 
             worker_code = f'''import gc
 import json
@@ -590,6 +640,7 @@ person_path = Path({str(person_path.resolve())!r})
 template_path = Path({str(template_path.resolve())!r})
 p_prompt = {p_prompt!r}
 u_prompt = {u_prompt!r}
+h_prompt = {h_prompt!r}
 
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
@@ -602,6 +653,7 @@ model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
 
 person_img = Image.open(person_path).convert("RGB")
 template_img = Image.open(template_path).convert("RGB")
+head_crop = person_img.crop((0, 0, person_img.width, max(1, int(person_img.height * 0.82))))
 
 msg_p = [{{"role": "user", "content": [{{"type": "image", "image": person_img}}, {{"type": "text", "text": p_prompt}}]}}]
 txt_p = processor.apply_chat_template(msg_p, tokenize=False, add_generation_prompt=True)
@@ -610,6 +662,13 @@ with torch.inference_mode():
     gen_p = model.generate(**inp_p, max_new_tokens=768, do_sample=False)
 out_p = processor.batch_decode(gen_p[:, inp_p.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
 
+msg_h = [{{"role": "user", "content": [{{"type": "image", "image": head_crop}}, {{"type": "text", "text": h_prompt}}]}}]
+txt_h = processor.apply_chat_template(msg_h, tokenize=False, add_generation_prompt=True)
+inp_h = processor(text=[txt_h], images=[head_crop], padding=True, return_tensors="pt").to(model.device)
+with torch.inference_mode():
+    gen_h = model.generate(**inp_h, max_new_tokens=384, do_sample=False)
+out_h = processor.batch_decode(gen_h[:, inp_h.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
+
 msg_u = [{{"role": "user", "content": [{{"type": "image", "image": template_img}}, {{"type": "text", "text": u_prompt}}]}}]
 txt_u = processor.apply_chat_template(msg_u, tokenize=False, add_generation_prompt=True)
 inp_u = processor(text=[txt_u], images=[template_img], padding=True, return_tensors="pt").to(model.device)
@@ -617,12 +676,12 @@ with torch.inference_mode():
     gen_u = model.generate(**inp_u, max_new_tokens=768, do_sample=False)
 out_u = processor.batch_decode(gen_u[:, inp_u.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
 
-combined = {{"person_raw": out_p, "uniform_raw": out_u}}
+combined = {{"person_raw": out_p, "hair_raw": out_h, "uniform_raw": out_u}}
 print("---COMBINED_START---")
 print(json.dumps(combined))
 print("---COMBINED_END---")
 
-del gen_p, gen_u, inp_p, inp_u, person_img, template_img, model, processor
+del gen_p, gen_h, gen_u, inp_p, inp_h, inp_u, person_img, head_crop, template_img, model, processor
 gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
@@ -642,15 +701,30 @@ if torch.cuda.is_available():
             if match:
                 combined_dict = json.loads(match.group(1))
                 p_dict = flatten_vl_dict(clean_and_repair_json(combined_dict.get("person_raw", "")))
+                hair_observations = clean_and_repair_json(combined_dict.get("hair_raw", ""))
+                h_dict = flatten_vl_dict(hair_observations)
                 uniform_observations = clean_and_repair_json(combined_dict.get("uniform_raw", ""))
                 u_dict = normalize_uniform_analysis(uniform_observations)
                 result["uniform_observations_raw"] = uniform_observations
                 # Missing model fields must not masquerade as observed facts.
                 for key in ("garment_components", "shirt_color_and_pattern", "outer_garment_color_and_shape",
+                            "outer_color_under_neutral_light", "outer_neutral_rgb", "outer_color_confidence",
                             "shirt_collar", "outer_neckline", "button_layout", "hair_style", "hair_color",
                             "hair_accessories", "visible_wearables"):
                     result[key] = "unknown"
                 result.update(p_dict)
+                for key in ("direct_sunlight_present", "head_hair_hotspot_present"):
+                    result[key] = _coerce_bool(result.get(key))
+                if result["head_hair_hotspot_present"]:
+                    result["direct_sunlight_present"] = True
+                for key in (
+                    "hair_parting", "hair_length", "hair_texture", "hair_color",
+                    "hair_accessories", "hair_accessory_details",
+                ):
+                    value = h_dict.get(key)
+                    if value not in (None, "", "unknown", "uncertain"):
+                        result[key] = value
+                result["hair_observations_raw"] = hair_observations
                 result.update(u_dict)
                 result["source"] = "qwen2.5-vl"
             else:

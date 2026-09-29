@@ -1397,7 +1397,7 @@ def process_single_enhance(
     upscale_factor: int,
     qwen_prompt: str,
     progress=None,
-    qwen_steps: int = 20,
+    qwen_steps: int = 8,
 ):
     """Processes one uploaded photo with Indian passport dimensions."""
     progress = _as_progress(progress)
@@ -1533,8 +1533,8 @@ def process_single_enhance(
                 # Base 2511 uses true CFG; the distilled four-step adapter
                 # needs its separate low-guidance configuration.
                 true_cfg_scale=1.02 if int(qwen_steps) <= 4 else 4.0,
-                # The API can request a four-step Qwen test. The Gradio UI
-                # keeps the quality default at twenty steps.
+                # Eight steps is the production enhancement balance; Uniform
+                # Swap keeps its separate twenty-step fidelity setting.
                 steps=max(1, int(qwen_steps)),
                 # Do not use a separate AI upscaler in this route.
                 upscale_factor=1,

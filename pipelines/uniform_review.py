@@ -22,7 +22,15 @@ def check_uniform_identity(source, candidate, minimum_similarity=0.50):
         faces = [detector.get(cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR))
                  for img in (source, candidate)]
         if any(len(items) != 1 for items in faces):
-            return {"accepted": False, "reason": "Expected one face in source and generated image"}
+            return {
+                "accepted": False,
+                "source_face_count": len(faces[0]),
+                "generated_face_count": len(faces[1]),
+                "reason": (
+                    "Expected one face in source and generated image "
+                    f"(detected source={len(faces[0])}, generated={len(faces[1])})"
+                ),
+            }
         score = float(np.dot(faces[0][0].normed_embedding, faces[1][0].normed_embedding))
         accepted = bool(np.isfinite(score) and score >= minimum_similarity)
         return {"accepted": accepted, "similarity": score if np.isfinite(score) else None,

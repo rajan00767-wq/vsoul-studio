@@ -598,6 +598,73 @@ class PhotoRestorationService:
             return image_pil
 
     @staticmethod
+    def normalize_uniform_conditioning_light(image_pil: Image.Image) -> Image.Image:
+        """Create an evenly lit identity guide for the single-pass uniform edit.
+
+        This image is never delivered to the user. It gives Qwen a neutral
+        lighting target while the untouched upload remains the source used for
+        analysis and identity verification.
+        """
+        base = PhotoRestorationService.neutralize_direct_sunlight(image_pil)
+        try:
+            rgb = np.array(base.convert("RGB"))
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            faces = _get_insight_app().get(bgr)
+            if not faces:
+                return base
+
+            height, width = rgb.shape[:2]
+            x1, y1, x2, y2 = [int(value) for value in faces[0].bbox]
+            face_w, face_h = max(24, x2 - x1), max(24, y2 - y1)
+            center_x = (x1 + x2) // 2
+
+            face_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                face_mask,
+                (center_x, y1 + int(face_h * 0.49)),
+                (int(face_w * 0.58), int(face_h * 0.60)),
+                0, 0, 360, 255, -1,
+            )
+            feather = max(15, (min(face_w, face_h) // 5) | 1)
+            face_alpha = cv2.GaussianBlur(face_mask, (feather, feather), 0).astype(np.float32) / 255.0
+
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            luminance = lab[:, :, 0]
+            sigma = max(9.0, min(face_w, face_h) * 0.18)
+            illumination = cv2.GaussianBlur(luminance, (0, 0), sigmaX=sigma, sigmaY=sigma)
+            inner = face_mask > 220
+            if not np.any(inner):
+                return base
+
+            # Remove only low-frequency directional light. High-frequency
+            # facial texture remains in luminance and is therefore preserved.
+            observed_level = float(np.median(illumination[inner]))
+            studio_level = float(np.clip(observed_level, 125.0, 151.0))
+            correction = np.clip(studio_level - illumination, -34.0, 22.0)
+            luminance += correction * face_alpha * 0.88
+            lab[:, :, 0] = np.clip(luminance, 0, 255)
+
+            # Broad direct sun also shifts the complete face toward orange,
+            # not just its brightest pixels. Limit that cast gently across
+            # the guide instead of forcing a fixed skin colour.
+            a_median = float(np.median(lab[:, :, 1][inner]))
+            b_median = float(np.median(lab[:, :, 2][inner]))
+            a_shift = min(8.0, max(0.0, a_median - 151.0))
+            b_shift = min(12.0, max(0.0, b_median - 145.0))
+            lab[:, :, 1] -= face_alpha * a_shift
+            lab[:, :, 2] -= face_alpha * b_shift
+
+            corrected = cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+            logger.info(
+                "[LIGHTING_GUIDE] Flattened source illumination level=%.1f a_shift=%.1f b_shift=%.1f",
+                observed_level, a_shift, b_shift,
+            )
+            return Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+        except Exception as exc:
+            logger.warning("[LIGHTING_GUIDE] Uniform conditioning normalization skipped: %s", exc)
+            return base
+
+    @staticmethod
     def tame_generated_portrait_hotspots(image_pil: Image.Image) -> Image.Image:
         """Tone down bright forehead/hair glare without changing portrait geometry.
 
