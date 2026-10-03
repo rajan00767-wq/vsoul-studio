@@ -58,13 +58,115 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _PIPELINE_LOCK = threading.Lock()
 
-# Qwen portrait candidates are shown when they clear the user-selected
-# acceptance floor. Hair-colour and torso checks remain separate safeguards.
-MIN_PORTRAIT_IDENTITY_SIMILARITY = 0.50
+# A recognition embedding can remain high after Qwen redraws a child's eyes,
+# mouth, or face proportions. Keep a strict biometric floor and independently
+# verify the dense facial geometry before delivering a generated portrait.
+MIN_PORTRAIT_IDENTITY_SIMILARITY = 0.70
+MAX_PORTRAIT_LANDMARK_RMSE = 0.045
+MAX_PORTRAIT_FACE_ASPECT_DELTA = 0.10
+
+
+def _normalized_face_geometry(
+    landmarks: np.ndarray, five_points: np.ndarray
+) -> np.ndarray:
+    """Normalize dense landmarks for scale, translation, and camera roll."""
+    points = np.asarray(landmarks, dtype=np.float32)[:, :2]
+    anchors = np.asarray(five_points, dtype=np.float32)[:, :2]
+    eye_vector = anchors[1] - anchors[0]
+    eye_distance = max(float(np.linalg.norm(eye_vector)), 1e-6)
+    eye_midpoint = (anchors[0] + anchors[1]) * 0.5
+    angle = float(np.arctan2(eye_vector[1], eye_vector[0]))
+    cosine, sine = np.cos(-angle), np.sin(-angle)
+    rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float32)
+    return ((points - eye_midpoint) @ rotation.T) / eye_distance
+
+
+def _face_geometry_metrics(source_face: Any, generated_face: Any) -> Tuple[float, float]:
+    """Return dense-landmark RMSE and face-box aspect-ratio change."""
+    source_shape = _normalized_face_geometry(
+        np.asarray(source_face.landmark_2d_106), np.asarray(source_face.kps)
+    )
+    generated_shape = _normalized_face_geometry(
+        np.asarray(generated_face.landmark_2d_106), np.asarray(generated_face.kps)
+    )
+    landmark_rmse = float(np.sqrt(np.mean((source_shape - generated_shape) ** 2)))
+
+    source_box = np.asarray(source_face.bbox, dtype=np.float32)
+    generated_box = np.asarray(generated_face.bbox, dtype=np.float32)
+    source_aspect = float(
+        (source_box[2] - source_box[0]) / max(source_box[3] - source_box[1], 1e-6)
+    )
+    generated_aspect = float(
+        (generated_box[2] - generated_box[0])
+        / max(generated_box[3] - generated_box[1], 1e-6)
+    )
+    return landmark_rmse, abs(generated_aspect - source_aspect)
+
+
+def _select_enhancement_steps(
+    vl_plan: Dict[str, Any], maximum_steps: int = 20
+) -> Tuple[int, List[str]]:
+    """Choose portrait-enhancement depth from visible restoration risk."""
+    def truthy(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"true", "yes", "1", "present"}
+
+    risk = 0
+    reasons: List[str] = []
+    sunlight = truthy(vl_plan.get("direct_sunlight_present"))
+    hotspot = truthy(vl_plan.get("head_hair_hotspot_present"))
+    sunlight_type = str(vl_plan.get("sunlight_type") or "").lower()
+    hard_light = any(term in sunlight_type for term in ("hard", "direct", "outdoor", "sun"))
+    if sunlight and hard_light:
+        risk += 2
+        reasons.append("hard or direct source lighting")
+    elif sunlight or hotspot:
+        risk += 1
+        reasons.append("possible lighting hotspot")
+
+    pose = str(vl_plan.get("face_orientation") or vl_plan.get("pose") or "").lower()
+    if pose and not any(term in pose for term in ("front", "forward", "camera")):
+        risk += 2
+        reasons.append("non-frontal source pose")
+
+    hair_edge_risk = str(vl_plan.get("hair_edge_risk") or "").lower()
+    if any(term in hair_edge_risk for term in ("high", "complex", "difficult", "clipped")):
+        risk += 1
+        reasons.append("complex hair boundary")
+    elif truthy(vl_plan.get("crown_near_top_edge")):
+        risk += 1
+        reasons.append("limited crown headroom")
+
+    accessories = vl_plan.get("hair_accessories")
+    if str(accessories or "").strip().lower() not in {
+        "", "none", "[]", "{}", "unknown", "uncertain"
+    }:
+        risk += 1
+        reasons.append("hair accessories")
+
+    min_dimension = int(vl_plan.get("source_min_dimension") or 0)
+    face_detail = float(vl_plan.get("source_face_detail_score") or 0.0)
+    if (0 < min_dimension < 320) or (0 < face_detail < 35.0):
+        risk += 2
+        reasons.append("very low source resolution or facial detail")
+    elif (0 < min_dimension < 480) or (0 < face_detail < 80.0):
+        risk += 1
+        reasons.append("limited source resolution or facial detail")
+
+    recommended = 20 if risk >= 4 else 12 if risk >= 2 else 8 if risk >= 1 else 4
+    requested_maximum = int(maximum_steps or 20)
+    maximum = (
+        20 if requested_maximum >= 20 else
+        12 if requested_maximum >= 12 else
+        8 if requested_maximum >= 8 else 4
+    )
+    selected = min(recommended, maximum)
+    if not reasons:
+        reasons.append("clean frontal portrait with balanced lighting")
+    return selected, reasons
 
 
 def _select_uniform_steps(vl_plan: Dict[str, Any], maximum_steps: int = 20) -> Tuple[int, List[str]]:
-    """Choose uniform diffusion depth from observed edit difficulty."""
+    """Choose uniform edit depth without turning source-preservation risks into redraw pressure."""
     def truthy(value: Any) -> bool:
         return str(value or "").strip().lower() in {"true", "yes", "1", "present"}
 
@@ -84,12 +186,16 @@ def _select_uniform_steps(vl_plan: Dict[str, Any], maximum_steps: int = 20) -> T
         reasons.append("possible lighting hotspot")
 
     accessories = vl_plan.get("hair_accessories")
-    if str(accessories or "").strip().lower() not in {"", "none", "[]", "{}", "unknown", "uncertain"}:
+    has_hair_accessories = str(accessories or "").strip().lower() not in {
+        "", "none", "[]", "{}", "unknown", "uncertain"
+    }
+    if has_hair_accessories:
         risk += 2
         reasons.append("hair accessories")
 
     pose = str(vl_plan.get("pose") or vl_plan.get("face_orientation") or "").lower()
-    if pose and not any(term in pose for term in ("front", "forward")):
+    non_frontal_pose = pose and not any(term in pose for term in ("front", "forward"))
+    if non_frontal_pose:
         risk += 2
         reasons.append("non-frontal source pose")
 
@@ -104,8 +210,22 @@ def _select_uniform_steps(vl_plan: Dict[str, Any], maximum_steps: int = 20) -> T
         risk += 1
         reasons.append("uncertain uniform color or fabric detail")
 
-    recommended = 20 if risk >= 4 else 12 if risk >= 2 else 8
-    maximum = max(8, min(int(maximum_steps or 20), 20))
+    recommended = 20 if risk >= 4 else 12 if risk >= 2 else 8 if risk >= 1 else 4
+
+    # Hair clips, strong source lighting, and a non-frontal pose mean the
+    # original pixels are especially valuable. More denoising does not repair
+    # those conditions; it makes Qwen rebuild the child's face and hair. Keep
+    # such portraits at twelve steps or below, even when the caller allows 20.
+    source_preservation_risk = has_hair_accessories or hard_light or bool(non_frontal_pose)
+    if source_preservation_risk and recommended > 12:
+        recommended = 12
+        reasons.append("source-preserving cap for hair, lighting, or pose")
+    requested_maximum = int(maximum_steps or 20)
+    maximum = (
+        20 if requested_maximum >= 20 else
+        12 if requested_maximum >= 12 else
+        8 if requested_maximum >= 8 else 4
+    )
     selected = min(recommended, maximum)
     if not reasons:
         reasons.append("clean frontal source and simple uniform")
@@ -114,16 +234,23 @@ def _select_uniform_steps(vl_plan: Dict[str, Any], maximum_steps: int = 20) -> T
 
 def _encode_prompt_isolated(
     image: Union[Image.Image, List[Image.Image]],
-    prompt: str,
+    prompt: Union[str, List[str]],
     max_sequence_length: int = 256,
     timeout_seconds: Optional[float] = 120,
     conditioning_max_dimension: int = 256,
     conditioning_pixel_budget: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Union[
+    Tuple[torch.Tensor, Optional[torch.Tensor]],
+    List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
+]:
     """
-    Runs prompt encoding in an isolated worker subprocess.
+    Runs one or more prompt encodings in one isolated worker subprocess.
     Reclaims 100% of GPU memory upon exit, eliminating bitsandbytes NF4 memory leaks.
     """
+    single_prompt = isinstance(prompt, str)
+    prompts = [prompt] if single_prompt else list(prompt)
+    if not prompts or any(not isinstance(item, str) for item in prompts):
+        raise ValueError("At least one text prompt is required for Qwen prompt encoding")
     images = image if isinstance(image, list) else [image]
     if not images:
         raise ValueError("At least one reference image is required for Qwen prompt encoding")
@@ -146,8 +273,6 @@ def _encode_prompt_isolated(
     models_posix = MODELS_DIR.resolve().as_posix()
     temp_img_paths_posix = [p.resolve().as_posix() for p in temp_img_paths]
     embeds_cache_posix = embeds_cache_file.resolve().as_posix()
-    escaped_prompt = prompt.replace('"', '\\"').replace("'", "\\'")
-
     helper_code = f"""
 import sys
 import torch
@@ -186,18 +311,24 @@ pipe = QwenImageEditPlusPipeline(
 )
 
 images = [Image.open(path).convert("RGB") for path in {temp_img_paths_posix!r}]
-prompt = \"\"\"{escaped_prompt}\"\"\"
+prompts = {prompts!r}
 
+encoded = []
 with torch.inference_mode():
-    prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
-        image=images,
-        prompt=prompt,
-        device=device,
-        num_images_per_prompt=1,
-        max_sequence_length={max_sequence_length},
-    )
+    for prompt in prompts:
+        prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+            image=images,
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length={max_sequence_length},
+        )
+        encoded.append({{
+            "embeds": prompt_embeds.cpu(),
+            "mask": prompt_embeds_mask.cpu() if prompt_embeds_mask is not None else None,
+        }})
 
-torch.save({{"embeds": prompt_embeds.cpu(), "mask": prompt_embeds_mask.cpu() if prompt_embeds_mask is not None else None}}, "{embeds_cache_posix}")
+torch.save({{"items": encoded}}, "{embeds_cache_posix}")
 print("SUCCESS")
 """
     helper_script = CACHE_DIR / f"enc_worker_{int(time.time()*1000)}.py"
@@ -211,6 +342,8 @@ print("SUCCESS")
             run_args = {
                 "capture_output": True,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
             }
             if timeout_seconds is not None and timeout_seconds > 0:
                 run_args["timeout"] = max(1, timeout_seconds)
@@ -222,9 +355,8 @@ print("SUCCESS")
             logger.error("[QWEN_ENCODE_WORKER_ERROR] stdout: %s | stderr: %s", ret.stdout, ret.stderr)
             raise RuntimeError(f"Prompt encoding worker failed (code {ret.returncode}): {ret.stderr}")
         loaded_cache = torch.load(str(embeds_cache_file), map_location="cpu")
-        embeds = loaded_cache["embeds"]
-        mask = loaded_cache["mask"]
-        return embeds, mask
+        results = [(item["embeds"], item["mask"]) for item in loaded_cache["items"]]
+        return results[0] if single_prompt else results
     finally:
         for temp_img_path in temp_img_paths:
             if temp_img_path.exists():
@@ -450,10 +582,41 @@ class QwenEditPipeline:
 
         face_x, face_y, face_w, face_h = max(faces, key=lambda box: box[2] * box[3])
         target_ratio = width / height
+        # Qwen occasionally generates a valid face with the crown touching the
+        # canvas. Add backdrop above that image before cropping so the passport
+        # frame cannot remove more hair. This does not stretch or regenerate
+        # any subject pixels.
+        edge = max(4, min(16, source_h // 20, source_w // 20))
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        backdrop_lab = np.median(np.concatenate((
+            lab[:edge, :edge].reshape(-1, 3),
+            lab[:edge, -edge:].reshape(-1, 3),
+        )), axis=0)
+        foreground = np.linalg.norm(lab - backdrop_lab, axis=2) > 18.0
+        central_foreground = foreground[:, int(source_w * .04):int(source_w * .96)]
+        occupied_rows = np.count_nonzero(central_foreground, axis=1) >= max(3, int(source_w * .02))
+        occupied = np.flatnonzero(occupied_rows)
+        crown_y = int(occupied[0]) if occupied.size else max(0, int(face_y - face_h * .30))
+        estimated_crop_h = min(source_h, max(int(face_h * 2.28), int(source_h * 0.52)))
+        minimum_headroom = max(10, int(estimated_crop_h * .055))
+        pad_top = max(0, minimum_headroom - crown_y)
+        if pad_top:
+            backdrop = np.median(np.concatenate((
+                rgb[:edge, :edge].reshape(-1, 3),
+                rgb[:edge, -edge:].reshape(-1, 3),
+            )), axis=0).round().clip(0, 255).astype(np.uint8)
+            padded = np.empty((source_h + pad_top, source_w, 3), dtype=np.uint8)
+            padded[:] = backdrop
+            padded[pad_top:] = rgb
+            rgb = padded
+            image = Image.fromarray(rgb, "RGB")
+            source_h += pad_top
+            face_y += pad_top
+
         # Include the complete hair, chin, shoulders and upper chest. Keeping
         # nearly the whole generated torso made children look unusually short
         # and read like half-body portraits instead of school-ID photographs.
-        crop_h = min(source_h, max(int(face_h * 2.72), int(source_h * 0.64)))
+        crop_h = min(source_h, max(int(face_h * 2.28), int(source_h * 0.52)))
         crop_w = min(source_w, max(1, int(crop_h * target_ratio)))
         if crop_w / crop_h > target_ratio:
             crop_w = max(1, int(crop_h * target_ratio))
@@ -461,7 +624,7 @@ class QwenEditPipeline:
             crop_h = max(1, int(crop_w / target_ratio))
 
         center_x = face_x + face_w // 2
-        top = int(face_y - face_h * 0.62)
+        top = int(face_y - face_h * 0.44)
         top = max(0, min(source_h - crop_h, top))
         left = max(0, min(source_w - crop_w, center_x - crop_w // 2))
         cropped = image.crop((left, top, left + crop_w, top + crop_h))
@@ -537,6 +700,159 @@ class QwenEditPipeline:
         locked = generated_rgb.astype(np.float32) * (1.0 - alpha) + aligned_matched * alpha
         logger.info("[QWEN_ONLY_UNIFORM] Applied landmark-aligned source-face identity lock")
         return Image.fromarray(np.rint(locked).clip(0, 255).astype(np.uint8), "RGB")
+
+    @staticmethod
+    def _restore_uniform_hair_accessories(
+        source: Image.Image,
+        generated: Image.Image,
+        source_labels: np.ndarray,
+        generated_labels: np.ndarray,
+    ) -> tuple[Image.Image, dict]:
+        """Landmark-align uploaded head detail to an accepted uniform portrait."""
+        source_rgb = np.array(source.convert("RGB"))
+        generated_rgb = np.array(generated.convert("RGB"))
+        from pipelines.photo_restoration import _get_insight_app
+        from pipelines.uniform_finishing import restore_uniform_hair_accessories
+
+        detector = _get_insight_app()
+        source_faces = detector.get(cv2.cvtColor(source_rgb, cv2.COLOR_RGB2BGR))
+        generated_faces = detector.get(cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2BGR))
+        if len(source_faces) != 1 or len(generated_faces) != 1:
+            return generated, {"applied": False, "reason": "face_alignment_unavailable"}
+        matrix, _ = cv2.estimateAffinePartial2D(
+            np.asarray(source_faces[0].kps, dtype=np.float32),
+            np.asarray(generated_faces[0].kps, dtype=np.float32),
+            method=cv2.LMEDS,
+        )
+        if matrix is None:
+            return generated, {"applied": False, "reason": "landmark_alignment_failed"}
+
+        height, width = generated_rgb.shape[:2]
+        aligned_source = cv2.warpAffine(
+            source_rgb, matrix, (width, height), flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        aligned_labels = cv2.warpAffine(
+            source_labels.astype(np.uint8), matrix, (width, height),
+            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        return restore_uniform_hair_accessories(
+            generated,
+            Image.fromarray(aligned_source, "RGB"),
+            generated_labels,
+            aligned_labels,
+        )
+
+    @staticmethod
+    def _lock_uniform_source_head(
+        source: Image.Image,
+        generated: Image.Image,
+        source_labels: np.ndarray,
+        background_color: Union[str, Tuple[int, int, int]],
+    ) -> tuple[Image.Image, dict]:
+        """Preserve the uploaded face, hair silhouette, and small crown clips.
+
+        This is reserved for a low-similarity uniform result.  It replaces the
+        redrawn head only, not the generated collar or garment, using dark-hair
+        colour evidence to exclude foliage from outdoor source portraits.
+        """
+        from pipelines.photo_restoration import _get_insight_app
+        from pipelines.schp_service import parse as parse_body_parts
+
+        source_rgb = np.asarray(source.convert("RGB"))
+        generated_rgb = np.asarray(generated.convert("RGB"))
+        detector = _get_insight_app()
+        source_faces = detector.get(cv2.cvtColor(source_rgb, cv2.COLOR_RGB2BGR))
+        generated_faces = detector.get(cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2BGR))
+        if len(source_faces) != 1 or len(generated_faces) != 1:
+            return generated.convert("RGB"), {"applied": False, "reason": "face_alignment_unavailable"}
+
+        matrix, _ = cv2.estimateAffinePartial2D(
+            np.asarray(source_faces[0].kps, dtype=np.float32),
+            np.asarray(generated_faces[0].kps, dtype=np.float32), method=cv2.LMEDS,
+        )
+        if matrix is None:
+            return generated.convert("RGB"), {"applied": False, "reason": "landmark_alignment_failed"}
+
+        height, width = generated_rgb.shape[:2]
+        aligned_source = cv2.warpAffine(
+            source_rgb, matrix, (width, height), flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        aligned_labels = cv2.warpAffine(
+            source_labels.astype(np.uint8), matrix, (width, height),
+            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        generated_labels = parse_body_parts(generated_rgb)["labels"]
+
+        source_face = aligned_labels == 13
+        source_hair_label = aligned_labels == 2
+        if np.count_nonzero(source_face) < 128 or np.count_nonzero(source_hair_label) < 128:
+            return generated.convert("RGB"), {"applied": False, "reason": "head_mask_unavailable"}
+
+        source_lab = cv2.cvtColor(aligned_source, cv2.COLOR_RGB2LAB).astype(np.float32)
+        dark_samples = source_lab[source_hair_label & (source_lab[:, :, 0] < 115)]
+        if dark_samples.size == 0:
+            return generated.convert("RGB"), {"applied": False, "reason": "hair_colour_unavailable"}
+        hair_median = np.median(dark_samples, axis=0)
+        colour_distance = np.linalg.norm(source_lab - hair_median[None, None, :], axis=2)
+        # Outdoor leaves are frequently mislabeled as hair. Genuine dark hair
+        # remains close to the dark-strand median even where it has soft sheen.
+        dark_hair = source_hair_label & (
+            (colour_distance < 62.0) | (source_lab[:, :, 0] < 76.0)
+        )
+
+        x1, y1, x2, y2 = np.asarray(generated_faces[0].bbox, dtype=float)
+        face_w, face_h = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        yy, xx = np.indices((height, width))
+        crown_region = (
+            (yy >= max(0, int(y1 - face_h * .62)))
+            & (yy <= int(y1 + face_h * .20))
+            & (xx >= int(x1 - face_w * .68))
+            & (xx <= int(x2 + face_w * .68))
+        )
+        rgb_range = aligned_source.max(axis=2).astype(np.int16) - aligned_source.min(axis=2).astype(np.int16)
+        light_clip = (
+            crown_region
+            & (aligned_source.min(axis=2) > 155)
+            & (rgb_range < 78)
+            & (cv2.dilate(dark_hair.astype(np.uint8), np.ones((13, 13), np.uint8)) > 0)
+        )
+        head_mask = source_face | dark_hair | light_clip
+        head_mask = cv2.morphologyEx(
+            head_mask.astype(np.uint8), cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1,
+        ).astype(bool)
+
+        # Remove Qwen's replacement hairstyle where it lies outside the
+        # uploaded silhouette, then feather the real source head over it.
+        generated_hair = generated_labels == 2
+        head_zone = (
+            (yy < int(y2 + face_h * .28))
+            & (xx >= int(x1 - face_w * .98))
+            & (xx <= int(x2 + face_w * .98))
+        )
+        source_hair_extent = cv2.dilate(
+            dark_hair.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1,
+        ).astype(bool)
+        result = generated_rgb.copy()
+        result[generated_hair & head_zone & ~source_hair_extent] = QwenEditPipeline._parse_bg_color(None, background_color)
+
+        # Match only lightness in the retained source face/hair; chroma stays
+        # from the upload so complexion and dark-hair pigment remain authentic.
+        result_lab = cv2.cvtColor(result, cv2.COLOR_RGB2LAB).astype(np.float32)
+        core = source_face & (source_lab[:, :, 0] > 25)
+        if np.count_nonzero(core) >= 128:
+            shift = float(np.median(result_lab[:, :, 0][core]) - np.median(source_lab[:, :, 0][core]))
+            source_lab[:, :, 0] += np.clip(shift, -14.0, 14.0)
+        matched_source = cv2.cvtColor(source_lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+        alpha = cv2.GaussianBlur(head_mask.astype(np.uint8) * 255, (7, 7), 0).astype(np.float32) / 255.0
+        result = result.astype(np.float32) * (1.0 - alpha[:, :, None]) + matched_source * alpha[:, :, None]
+        return Image.fromarray(np.rint(result).clip(0, 255).astype(np.uint8), "RGB"), {
+            "applied": True,
+            "head_pixels": int(np.count_nonzero(head_mask)),
+            "clip_pixels": int(np.count_nonzero(light_clip)),
+        }
 
     def _parse_bg_color(self, bg_color: Union[str, Tuple[int, int, int]]) -> Tuple[int, int, int]:
         if isinstance(bg_color, tuple) and len(bg_color) == 3:
@@ -652,11 +968,11 @@ class QwenEditPipeline:
     def _replace_smooth_border_background(
         self, image: Image.Image, background_color: Union[str, Tuple[int, int, int]]
     ) -> Image.Image:
-        """Correct Qwen's off-color flat backdrop without using a segmentation model.
+        """Correct Qwen's off-color flat backdrop while protecting the parsed subject.
 
         Only pixels similar to the four corner samples and connected to a canvas
-        border are changed. Hair, clothing, and face pixels are not reachable
-        through this mask, so this is safe for the Qwen-only portrait route.
+        border are changed. The semantic subject mask prevents a light shirt or
+        skin highlight touching the canvas edge from joining that replacement.
         """
         rgb = np.array(image.convert("RGB"))
         h, w = rgb.shape[:2]
@@ -674,36 +990,91 @@ class QwenEditPipeline:
         # Qwen often shades a nominally flat gray backdrop beside dark curls.
         # A wider tolerance removes that neutral smoky fringe. Protect pale
         # flowers separately below so they are not mistaken for the backdrop.
-        candidates = (distance < 64.0).astype(np.uint8)
-        # Patterned light shirts contain neutral threads close to a gray
-        # backdrop. Protect the complete lower garment around pixels that are
-        # clearly unlike the backdrop, then flood only the remaining canvas.
-        foreground_seed = (distance >= 22.0).astype(np.uint8)
-        lower_protection = cv2.dilate(
-            foreground_seed,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
-            iterations=1,
-        ).astype(bool)
-        lower = np.zeros((h, w), dtype=bool)
-        lower[int(h * 0.58):, :] = True
-        candidates[lower & lower_protection] = 0
+        # Qwen's conditioning backdrop is deliberately flat middle gray. Keep
+        # this tolerance narrow so light-brown fringe hair and skin near the
+        # forehead cannot be mistaken for backdrop.
+        candidates = (distance < 48.0).astype(np.uint8)
+        lower_region = np.zeros((h, w), dtype=bool)
+        lower_region[int(h * .48):, :] = True
+        # Protect the actual person rather than a broad colour neighbourhood.
+        # The old neighbourhood rule retained large pieces of a pale wall on
+        # both sides of dark hair. A tiny dilation keeps antialiased hair and
+        # garment edges without turning nearby scenery into foreground.
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
 
-        # Pale clips and flowers can be close to a gray background in LAB.
-        # They occur beside the crown, are brighter or more chromatic than the
-        # sampled backdrop, and contain a reliable non-background core. Grow
-        # only those cores inside the upper side zones; do not grow the whole
-        # hair silhouette, which would retain a gray halo around curls.
-        luma_delta = lab[:, :, 0] - background_lab[0]
-        chroma_delta = np.linalg.norm(lab[:, :, 1:] - background_lab[1:], axis=2)
-        yy, xx = np.indices((h, w))
-        accessory_zone = (yy < h * 0.43) & ((xx < w * 0.42) | (xx > w * 0.58))
-        accessory_core = accessory_zone & ((luma_delta > 12.0) | (chroma_delta > 14.0))
-        accessory_protection = cv2.dilate(
-            accessory_core.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
-            iterations=1,
-        ).astype(bool)
-        candidates[accessory_protection] = 0
+            labels = parse_body_parts(rgb)["labels"]
+            subject = (labels != 0).astype(np.uint8)
+            hair = (labels == 2).astype(np.uint8)
+            # Fill parser cracks inside the lower garment silhouette. A convex
+            # hull follows the detected outer sleeve/shoulder boundary while
+            # closing internal zero-label gaps; unlike colour dilation it does
+            # not preserve unrelated lower backdrop gradients.
+            clothing = np.isin(labels, (5, 6, 7, 9, 10, 12)).astype(np.uint8)
+            clothing_points = cv2.findNonZero(clothing)
+            if clothing_points is not None and len(clothing_points) >= 3:
+                clothing_hull = np.zeros_like(clothing)
+                cv2.fillConvexPoly(
+                    clothing_hull, cv2.convexHull(clothing_points), 1,
+                )
+                candidates[lower_region & clothing_hull.astype(bool)] = 0
+            # Protect all parsed subject below the shoulders, plus only reliable
+            # face/head classes above them. SCHP occasionally labels a large
+            # patch of flat backdrop beside hair as an arm or garment; trusting
+            # every upper non-hair label retained exactly the gray halo this
+            # correction is meant to remove.
+            yy, _ = np.indices(subject.shape)
+            lower_subject = subject.astype(bool) & (yy >= int(h * .48))
+            reliable_upper_subject = np.isin(labels, (1, 4, 13))
+            hair_core = cv2.erode(
+                hair,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            pixel_luma = (
+                rgb[:, :, 0].astype(np.float32) * .2126
+                + rgb[:, :, 1].astype(np.float32) * .7152
+                + rgb[:, :, 2].astype(np.float32) * .0722
+            )
+            # Preserve the complete parsed hair core. Background-coloured gaps
+            # inside the hairstyle are handled separately only where SCHP
+            # actually reports background; luma alone must never erase a real
+            # highlight or a pale accessory inside the hair label.
+            protected_subject = lower_subject | reliable_upper_subject | hair_core
+            candidates[protected_subject] = 0
+
+            # SCHP may label a saturated bow or clip as background. Preserve
+            # only chromatic accessory pixels immediately beside the parsed
+            # upper-head silhouette. Neutral wall/sky cannot satisfy this.
+            upper_subject = subject.astype(bool)
+            upper_subject[int(h * 0.52):, :] = False
+            accessory_zone = cv2.dilate(
+                upper_subject.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+                iterations=1,
+            ).astype(bool)
+            chroma_delta = np.linalg.norm(lab[:, :, 1:] - background_lab[1:], axis=2)
+            accessory_seed = accessory_zone & (chroma_delta >= 8.0) & (pixel_luma >= 92.0)
+            component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+                accessory_seed.astype(np.uint8), connectivity=8,
+            )
+            compact_accessory = np.zeros_like(accessory_seed)
+            max_accessory_area = max(64, int(h * w * .06))
+            for component in range(1, component_count):
+                area = int(component_stats[component, cv2.CC_STAT_AREA])
+                component_w = int(component_stats[component, cv2.CC_STAT_WIDTH])
+                component_h = int(component_stats[component, cv2.CC_STAT_HEIGHT])
+                aspect = max(component_w, component_h) / max(1, min(component_w, component_h))
+                if 6 <= area <= max_accessory_area and aspect <= 3.5:
+                    compact_accessory |= component_labels == component
+            compact_accessory = cv2.dilate(
+                compact_accessory.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            candidates[compact_accessory] = 0
+        except Exception as exc:
+            logger.warning("[UNIFORM_BACKGROUND] Subject protection unavailable: %s", exc)
 
         count, labels = cv2.connectedComponents(candidates, connectivity=8)
         if count <= 1:
@@ -712,12 +1083,31 @@ class QwenEditPipeline:
         border_labels = border_labels[border_labels != 0]
         if not len(border_labels):
             return image
+        # Replace only backdrop connected to a canvas edge. Fine fringe hair is
+        # sometimes labelled as background by SCHP and may resemble neutral
+        # gray in LAB, but it is enclosed by the head and must remain untouched.
         matte = np.isin(labels, border_labels).astype(np.uint8) * 255
-        # Keep a hard boundary. Blurring the replacement mask mixes the chosen
-        # color into translucent petals and creates a colored smoke halo.
-        alpha = matte.astype(np.float32)[:, :, None] / 255.0
+        # A one-pixel optical transition removes the bright matte fringe that
+        # Qwen leaves around curls and bows. The protected semantic subject and
+        # accessory zone above prevent this narrow antialiasing band from
+        # repainting real hair or translucent petals.
+        feathered = cv2.GaussianBlur(matte, (3, 3), .6)
+        definite_background = cv2.erode(
+            matte, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1,
+        )
+        feathered[definite_background == 255] = 255
+        alpha = feathered.astype(np.float32)[:, :, None] / 255.0
         target = np.full_like(rgb, self._parse_bg_color(background_color), dtype=np.uint8)
-        corrected = (target.astype(np.float32) * alpha + rgb.astype(np.float32) * (1.0 - alpha))
+        old_background = np.median(np.concatenate((
+            rgb[:edge, :edge].reshape(-1, 3),
+            rgb[:edge, -edge:].reshape(-1, 3),
+        )), axis=0).astype(np.float32)
+        # Remove the old backdrop contribution before adding the requested one.
+        # Ordinary alpha blending mixes gray into blue and produces a pale halo.
+        corrected = rgb.astype(np.float32) + alpha * (
+            target.astype(np.float32) - old_background[None, None, :]
+        )
+        corrected[matte == 255] = target[matte == 255]
         return Image.fromarray(corrected.clip(0, 255).astype(np.uint8), "RGB")
 
     def _replace_background_with_foreground_matte(
@@ -767,17 +1157,41 @@ class QwenEditPipeline:
                 + rgb[:, :, 2].astype(np.float32) * .0722
             )
             grab_mask[(labels == 2) & (luma < 115.0)] = cv2.GC_FGD
-            # Pale flowers and clips may be parsed as background. Protect
-            # bright, low-chroma objects touching the upper hair silhouette,
-            # while excluding saturated outdoor foliage.
-            channel_range = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+            # Hair accessories are frequently parsed as background. Protect
+            # every non-backdrop accessory colour touching the upper hair
+            # silhouette, including saturated red bows as well as pale clips.
+            # The input here is Qwen's already-flat studio portrait, so corner
+            # colour is reliable evidence of backdrop rather than scenery.
             yy, xx = np.indices(subject.shape)
-            accessory_zone = (
-                (yy < height * .45)
-                & ((xx < width * .42) | (xx > width * .58))
-                & (near_subject > 0)
+            edge = max(4, min(20, height // 20, width // 20))
+            backdrop_rgb = np.median(np.concatenate((
+                rgb[:edge, :edge].reshape(-1, 3),
+                rgb[:edge, -edge:].reshape(-1, 3),
+            )), axis=0)
+            corner_samples = np.concatenate((
+                rgb[:edge, :edge].reshape(-1, 3),
+                rgb[:edge, -edge:].reshape(-1, 3),
+            )).astype(np.float32)
+            corner_distances = np.linalg.norm(corner_samples - backdrop_rgb, axis=1)
+            flat_generated_backdrop = float(np.percentile(corner_distances, 90)) <= 12.0
+            backdrop_distance = np.linalg.norm(
+                rgb.astype(np.float32) - backdrop_rgb.astype(np.float32), axis=2
             )
-            accessory = accessory_zone & (luma > 135.0) & (channel_range < 85)
+            accessory_neighborhood = cv2.dilate(
+                subject,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (121, 121)),
+                iterations=1,
+            )
+            accessory_zone = (
+                (yy < height * .48)
+                & ((xx < width * .46) | (xx > width * .54))
+                & (accessory_neighborhood > 0)
+            )
+            accessory = (
+                accessory_zone
+                & (backdrop_distance > 32.0)
+                & flat_generated_backdrop
+            )
             grab_mask[accessory] = cv2.GC_FGD
             torso = np.array((
                 (int(width * .38), int(height * .56)),
@@ -796,20 +1210,172 @@ class QwenEditPipeline:
                 background_model, foreground_model, 5, cv2.GC_INIT_WITH_MASK,
             )
             foreground = np.isin(grab_mask, (cv2.GC_FGD, cv2.GC_PR_FGD)).astype(np.uint8)
+            # GrabCut can still relabel a small accessory edge after the hard
+            # seeds are supplied. Restore only pixels demonstrably unlike the
+            # sampled flat backdrop; holes within bows remain background.
+            foreground[accessory] = 1
             foreground = cv2.morphologyEx(
                 foreground, cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
                 iterations=1,
             )
-            alpha = cv2.GaussianBlur(foreground.astype(np.float32), (3, 3), 0.45)
-            alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
+            foreground_alpha = cv2.GaussianBlur(foreground.astype(np.float32), (3, 3), 0.45)
+            foreground_alpha = np.clip(foreground_alpha, 0.0, 1.0)[:, :, None]
+            background_alpha = 1.0 - foreground_alpha
             target = np.full_like(rgb, self._parse_bg_color(background_color), dtype=np.uint8)
-            composed = rgb.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
+            # Decontaminate the antialiased edge rather than blending the old
+            # studio color into the selected backdrop.
+            old_background = backdrop_rgb.astype(np.float32)
+            composed = rgb.astype(np.float32) + background_alpha * (
+                target.astype(np.float32) - old_background[None, None, :]
+            )
+            composed[foreground == 0] = target[foreground == 0]
             return Image.fromarray(np.rint(composed).clip(0, 255).astype(np.uint8), "RGB")
         except Exception as exc:
             if strict:
                 raise RuntimeError("Background color replacement failed; raw Qwen output is retained.") from exc
             logger.warning("[BACKGROUND_MATTE] Failed; retaining Qwen backdrop: %s", exc)
+            return image.convert("RGB")
+
+    @staticmethod
+    def _apply_rough_silhouette_guard(
+        image: Image.Image, rough_reference: Image.Image
+    ) -> Image.Image:
+        """Keep Qwen inside the intended passport head/upper-chest silhouette.
+
+        Qwen can preserve identity while adding hands, props, tables, or a
+        retail scene. The fixed rough canvas is the authoritative framing, so
+        use its semantic person silhouette as a hard geometry guard before
+        background validation. This does not replace any pixels inside the
+        silhouette or alter the generated face/uniform.
+        """
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            rgb = np.asarray(image.convert("RGB"))
+            reference = np.asarray(
+                rough_reference.convert("RGB").resize((rgb.shape[1], rgb.shape[0]), Image.LANCZOS)
+            )
+            # The rough canvas is deliberately not a silhouette authority.
+            # Its template placement can differ from Qwen's restored head and
+            # shoulders, so intersecting it with the Qwen subject cuts holes
+            # through hair, neck, and sleeves. Use the generated semantic
+            # subject mask for all portrait geometry; the rough canvas is used
+            # only to recover the requested flat background colour.
+            generated_labels = parse_body_parts(rgb)["labels"]
+            foreground = (generated_labels != 0).astype(np.uint8)
+            foreground = cv2.morphologyEx(
+                foreground, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1,
+            )
+            # Passport framing ends at the upper chest. Remove side hands,
+            # bags, and lower-arm pixels that Qwen may attach to the subject;
+            # the central shoulders and uniform remain inside this corridor.
+            yy, xx = np.indices(foreground.shape)
+            side_corridor = (xx >= int(foreground.shape[1] * .25)) & (
+                xx <= int(foreground.shape[1] * .75)
+            )
+            foreground[(yy >= int(foreground.shape[0] * .58)) & (~side_corridor)] = 0
+            if np.count_nonzero(foreground) < foreground.size * 0.15:
+                return image.convert("RGB")
+            backdrop = np.median(np.concatenate((
+                reference[:8, :8].reshape(-1, 3),
+                reference[:8, -8:].reshape(-1, 3),
+            )), axis=0).astype(np.uint8)
+            result = rgb.copy()
+            # Keep the outside of the generated subject as the plain backdrop.
+            # Never inpaint a discrepancy against the rough layout: that was
+            # responsible for the blue holes and floating-collar artifacts.
+            result[foreground == 0] = backdrop
+            return Image.fromarray(result, "RGB")
+        except Exception as exc:
+            logger.warning("[UNIFORM_SILHOUETTE] Guard unavailable: %s", exc)
+            return image.convert("RGB")
+
+    @staticmethod
+    def _lock_rough_uniform_pixels(
+        image: Image.Image, garment_reference: Image.Image
+    ) -> Image.Image:
+        """Fit the clean garment guide to Qwen's portrait without touching the head.
+
+        Qwen is useful for portrait restoration, but its garment edits can drift
+        into the source clothing or invent a different fabric. Use the clean
+        garment-only guide, never the rough portrait composite, so no old face,
+        hair, hand, or background pixels can enter the final image.
+        """
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            generated = np.asarray(image.convert("RGB"))
+            reference = np.asarray(
+                garment_reference.convert("RGB").resize(
+                    (generated.shape[1], generated.shape[0]), Image.LANCZOS
+                )
+            )
+            reference_labels = parse_body_parts(reference)["labels"]
+            reference_garment = np.isin(
+                reference_labels, (5, 6, 7, 9, 10, 12)
+            ).astype(np.uint8)
+            if np.count_nonzero(reference_garment) < reference_garment.size * 0.04:
+                return image.convert("RGB")
+
+            generated_labels = parse_body_parts(generated)["labels"]
+            generated_garment = np.isin(
+                generated_labels, (5, 6, 7, 9, 10, 12)
+            ).astype(np.uint8)
+            source_points = cv2.findNonZero(reference_garment)
+            target_points = cv2.findNonZero(generated_garment)
+            if source_points is None:
+                return image.convert("RGB")
+            source_x, source_y, source_w, source_h = cv2.boundingRect(source_points)
+            if target_points is not None:
+                _, _, target_w, _ = cv2.boundingRect(target_points)
+            else:
+                target_w = int(generated.shape[1] * 0.78)
+
+            # Place the template collar just below the generated chin. This
+            # keeps the neck from being overwritten and scales the garment to
+            # the actual shoulder span in the Qwen portrait.
+            target_top = int(generated.shape[0] * 0.54)
+            try:
+                from pipelines.photo_restoration import _get_insight_app
+
+                detector = _get_insight_app()
+                generated_faces = detector.get(cv2.cvtColor(generated, cv2.COLOR_RGB2BGR))
+                if len(generated_faces) == 1:
+                    _, _, _, face_bottom = [int(value) for value in generated_faces[0].bbox]
+                    target_top = max(target_top, face_bottom + int(generated.shape[0] * 0.015))
+            except Exception as exc:
+                logger.warning("[UNIFORM_TEMPLATE_LOCK] Face anchor unavailable: %s", exc)
+
+            scale = max(0.60, min(1.45, target_w / max(source_w, 1)))
+            output_w = max(8, int(round(source_w * scale)))
+            output_h = max(8, int(round(source_h * scale)))
+            garment_crop = reference[source_y:source_y + source_h, source_x:source_x + source_w]
+            mask_crop = reference_garment[source_y:source_y + source_h, source_x:source_x + source_w]
+            garment_crop = cv2.resize(garment_crop, (output_w, output_h), interpolation=cv2.INTER_LANCZOS4)
+            mask_crop = cv2.resize(mask_crop, (output_w, output_h), interpolation=cv2.INTER_NEAREST)
+
+            x0 = max(0, (generated.shape[1] - output_w) // 2)
+            y0 = max(0, target_top)
+            x1, y1 = min(generated.shape[1], x0 + output_w), min(generated.shape[0], y0 + output_h)
+            if x1 <= x0 or y1 <= y0:
+                return image.convert("RGB")
+            crop_w, crop_h = x1 - x0, y1 - y0
+            fitted_reference = generated.copy()
+            fitted_mask = np.zeros(generated.shape[:2], dtype=np.uint8)
+            fitted_reference[y0:y1, x0:x1] = garment_crop[:crop_h, :crop_w]
+            fitted_mask[y0:y1, x0:x1] = mask_crop[:crop_h, :crop_w]
+            fitted_mask = cv2.morphologyEx(
+                fitted_mask, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1,
+            )
+            alpha = cv2.GaussianBlur(fitted_mask.astype(np.float32), (0, 0), 1.2)
+            alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
+            locked = generated.astype(np.float32) * (1.0 - alpha) + fitted_reference.astype(np.float32) * alpha
+            return Image.fromarray(np.rint(locked).clip(0, 255).astype(np.uint8), "RGB")
+        except Exception as exc:
+            logger.warning("[UNIFORM_TEMPLATE_LOCK] Template lock unavailable: %s", exc)
             return image.convert("RGB")
 
     def _has_selected_solid_background(
@@ -831,10 +1397,27 @@ class QwenEditPipeline:
         distances = np.linalg.norm(samples - target, axis=1)
         side_width = max(2, int(width * 0.03))
         side_height = max(1, int(height * 0.68))
-        side_samples = np.concatenate((
+        side_pixels = np.concatenate((
             rgb[:side_height, :side_width].reshape(-1, 3),
             rgb[:side_height, -side_width:].reshape(-1, 3),
         ))
+        # Long hair and bows can legitimately reach a passport crop's side
+        # edge. Exclude parsed subject pixels before measuring backdrop hue;
+        # otherwise an exact blue background is rejected simply because the
+        # child fills the frame.
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            subject = parse_body_parts(rgb.astype(np.uint8))["labels"] != 0
+            side_subject = np.concatenate((
+                subject[:side_height, :side_width].reshape(-1),
+                subject[:side_height, -side_width:].reshape(-1),
+            ))
+            side_samples = side_pixels[~side_subject]
+            if side_samples.shape[0] < max(16, side_pixels.shape[0] // 5):
+                side_samples = side_pixels
+        except Exception:
+            side_samples = side_pixels
         side_distances = np.linalg.norm(side_samples - target, axis=1)
         side_match = float(np.mean(side_distances <= 18.0))
         exact_match = bool(
@@ -844,35 +1427,162 @@ class QwenEditPipeline:
         )
         if exact_match:
             return True
+        return False
 
-        # Qwen often renders the requested saturated backdrop as a natural
-        # studio gradient. Accept the selected hue even when its brightness
-        # differs, otherwise a second segmentation pass needlessly damages
-        # fine hair and accessories. Neutral targets still require the exact
-        # RGB check above because hue is undefined for white and gray.
-        target_u8 = target.round().clip(0, 255).astype(np.uint8).reshape(1, 1, 3)
-        target_hsv = cv2.cvtColor(target_u8, cv2.COLOR_RGB2HSV)[0, 0]
-        if int(target_hsv[1]) < 80:
+    @staticmethod
+    def _has_generated_uniform(
+        image: Image.Image,
+        target_outer_rgb: Optional[Tuple[int, int, int]],
+        rough_reference: Optional[Image.Image] = None,
+    ) -> bool:
+        """Reject unchanged source clothing and incomplete garment edits."""
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            labels = parse_body_parts(rgb)["labels"]
+            clothing = np.isin(labels, (5, 6, 7, 9, 10, 12))
+            coverage = float(np.mean(clothing))
+            if coverage < 0.07:
+                logger.warning("[UNIFORM_REVIEW] Clothing coverage too small: %.3f", coverage)
+                return False
+            height, width = labels.shape
+            central_arms = np.isin(
+                labels[
+                    int(height * .30):int(height * .85),
+                    int(width * .18):int(width * .82),
+                ],
+                (14, 15),
+            )
+            central_arm_fraction = float(np.count_nonzero(central_arms) / labels.size)
+            if central_arm_fraction > 0.015:
+                logger.warning(
+                    "[UNIFORM_REVIEW] Hand/arm crosses passport torso: %.3f",
+                    central_arm_fraction,
+                )
+                return False
+            if target_outer_rgb is None:
+                return True
+            # Judge the measured outer-template colour only inside the parsed
+            # lower clothing. Measuring the full lower frame counts the white
+            # shirt, skin, and backdrop against a gray pinafore and rejects a
+            # valid multi-layer school uniform.
+            yy, _ = np.indices(labels.shape)
+            lower_clothing = clothing & (yy >= int(height * .45))
+            lower_distance = np.linalg.norm(
+                rgb.astype(np.float32) - np.asarray(target_outer_rgb, dtype=np.float32), axis=2
+            )
+            matching_fraction = float(
+                np.mean(lower_distance[lower_clothing] <= 55.0)
+            ) if np.any(lower_clothing) else 0.0
+            logger.info(
+                "[UNIFORM_REVIEW] clothing_coverage=%.3f target_color_fraction=%.3f",
+                coverage, matching_fraction,
+            )
+            if rough_reference is not None:
+                reference = np.asarray(
+                    rough_reference.convert("RGB").resize((width, height), Image.LANCZOS),
+                    dtype=np.uint8,
+                )
+                ref_labels = parse_body_parts(reference)["labels"]
+                ref_clothing = np.isin(ref_labels, (5, 6, 7, 9, 10, 12))
+                ref_clothing &= np.indices(ref_labels.shape)[0] >= int(height * .45)
+                candidate_clothing = clothing & (
+                    np.indices(labels.shape)[0] >= int(height * .45)
+                )
+                if np.count_nonzero(ref_clothing) >= 256 and np.count_nonzero(candidate_clothing) >= 256:
+                    # The final garment lock uses these exact template pixels.
+                    # Compare within that semantic garment region rather than
+                    # demanding that every shirt, sleeve, and tie pixel match
+                    # the outer-pinafore color. This keeps valid multi-layer
+                    # uniforms from failing solely because their white layer
+                    # is correctly not gray.
+                    template_delta = float(np.mean(np.linalg.norm(
+                        rgb[ref_clothing].astype(np.float32)
+                        - reference[ref_clothing].astype(np.float32),
+                        axis=1,
+                    )))
+                    logger.info(
+                        "[UNIFORM_REVIEW] template_garment_delta=%.2f outer_color_fraction=%.3f",
+                        template_delta, matching_fraction,
+                    )
+                    if template_delta > 48.0:
+                        logger.warning(
+                            "[UNIFORM_REVIEW] Locked garment differs from supplied template: %.2f",
+                            template_delta,
+                        )
+                        return False
+                    ref_hsv = cv2.cvtColor(reference, cv2.COLOR_RGB2HSV)
+                    candidate_hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+                    ref_saturation = float(np.mean(ref_hsv[:, :, 1][ref_clothing] > 40))
+                    candidate_saturation = float(
+                        np.mean(candidate_hsv[:, :, 1][candidate_clothing] > 40)
+                    )
+                    # Large newly saturated regions are a reliable signal that
+                    # the source clothing was retained (e.g. pink cardigan)
+                    # instead of the supplied neutral school uniform.
+                    if candidate_saturation - ref_saturation > 0.28:
+                        logger.warning(
+                            "[UNIFORM_REVIEW] Garment palette diverges from template: "
+                            "reference_saturation=%.3f candidate_saturation=%.3f",
+                            ref_saturation,
+                            candidate_saturation,
+                        )
+                        return False
+            elif matching_fraction < 0.18:
+                # This fallback only applies when no template reference is
+                # available for direct comparison.
+                logger.warning(
+                    "[UNIFORM_REVIEW] Template-color coverage too small without a template reference: %.3f",
+                    matching_fraction,
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning("[UNIFORM_REVIEW] Garment verification unavailable: %s", exc)
             return False
 
-        def same_color_family(pixels):
-            hsv = cv2.cvtColor(
-                pixels.round().clip(0, 255).astype(np.uint8).reshape(-1, 1, 3),
-                cv2.COLOR_RGB2HSV,
-            ).reshape(-1, 3)
-            hue_delta = np.abs(hsv[:, 0].astype(np.int16) - int(target_hsv[0]))
-            hue_delta = np.minimum(hue_delta, 180 - hue_delta)
-            minimum_saturation = max(45, int(target_hsv[1] * 0.45))
-            return (
-                (hue_delta <= 10)
-                & (hsv[:, 1] >= minimum_saturation)
-                & (hsv[:, 2] >= 35)
-            )
-
-        return bool(
-            np.mean(same_color_family(samples)) >= 0.90
-            and np.mean(same_color_family(side_samples)) >= 0.78
+    @staticmethod
+    def _is_regenerated_from_rough(image: Image.Image, rough: Image.Image) -> bool:
+        """Require Qwen to render a photograph, not echo the pasted layout."""
+        generated = np.asarray(image.convert("RGB"), dtype=np.float32)
+        guide = np.asarray(
+            rough.convert("RGB").resize((generated.shape[1], generated.shape[0]), Image.LANCZOS),
+            dtype=np.float32,
         )
+        # Identity and hair are intentionally preserved and can dominate the
+        # frame. Judge only the lower garment region when deciding whether the
+        # rough pasted clothing was genuinely re-rendered.
+        garment_top = int(generated.shape[0] * 0.48)
+        per_pixel_delta = np.mean(
+            np.abs(generated[garment_top:] - guide[garment_top:]), axis=2
+        )
+        mean_delta = float(np.mean(per_pixel_delta))
+        nearly_unchanged = float(np.mean(per_pixel_delta < 10.0))
+        logger.info(
+            "[UNIFORM_REVIEW] rough_delta=%.2f nearly_unchanged=%.3f",
+            mean_delta, nearly_unchanged,
+        )
+        return mean_delta >= 12.0 and nearly_unchanged <= 0.75
+
+    @staticmethod
+    def _has_flat_border_background(image: Image.Image) -> bool:
+        """Return true only when Qwen generated a uniform studio backdrop."""
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+        height, width = rgb.shape[:2]
+        edge = max(4, min(24, height // 12, width // 12))
+        if height < edge * 2 or width < edge * 2:
+            return False
+        corners = np.concatenate((
+            rgb[:edge, :edge].reshape(-1, 3),
+            rgb[:edge, -edge:].reshape(-1, 3),
+        ))
+        center = np.median(corners, axis=0)
+        distances = np.linalg.norm(corners - center, axis=1)
+        # A generated seamless backdrop can contain mild sensor/lighting
+        # variation. Keep the tolerance tight enough to reject scenery while
+        # allowing this normal flat-background noise.
+        return bool(np.percentile(distances, 90) <= 28.0)
 
     @staticmethod
     def _match_dark_uniform_color(image: Image.Image, template: Image.Image) -> Image.Image:
@@ -956,10 +1666,9 @@ class QwenEditPipeline:
     def _has_acceptable_portrait_identity(source: Image.Image, generated: Image.Image) -> bool:
         """Reject a diffusion result when it no longer depicts the uploaded person."""
         try:
-            from insightface.app import FaceAnalysis
+            from pipelines.photo_restoration import _get_insight_app
 
-            app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-            app.prepare(ctx_id=-1, det_size=(320, 320))
+            app = _get_insight_app()
             source_bgr = cv2.cvtColor(np.array(source.convert("RGB")), cv2.COLOR_RGB2BGR)
             generated_bgr = cv2.cvtColor(np.array(generated.convert("RGB")), cv2.COLOR_RGB2BGR)
             source_faces = app.get(source_bgr)
@@ -975,6 +1684,13 @@ class QwenEditPipeline:
                 source_faces[0].normed_embedding,
                 generated_faces[0].normed_embedding,
             ))
+            landmark_rmse, face_aspect_delta = _face_geometry_metrics(
+                source_faces[0], generated_faces[0]
+            )
+            geometry_ok = (
+                landmark_rmse <= MAX_PORTRAIT_LANDMARK_RMSE
+                and face_aspect_delta <= MAX_PORTRAIT_FACE_ASPECT_DELTA
+            )
 
             def hair_shadow_anchor(image_bgr: np.ndarray, face_obj: Any) -> Optional[float]:
                 """Measure the dark hair mass immediately above the detected face.
@@ -1037,12 +1753,16 @@ class QwenEditPipeline:
             # or re-drawn child face from being passed off as an enhancement.
             accepted = (
                 similarity >= MIN_PORTRAIT_IDENTITY_SIMILARITY
+                and geometry_ok
                 and torso_present
                 and not dark_hair_shifted_light
             )
             logger.info(
-                "[PORTRAIT_QA] Identity similarity=%.3f threshold=%.3f torso_coverage=%.2f hair_luma=%.1f->%.1f dark_hair_shifted_light=%s accepted=%s",
-                similarity, MIN_PORTRAIT_IDENTITY_SIMILARITY, torso_coverage,
+                "[PORTRAIT_QA] Identity similarity=%.3f threshold=%.3f landmark_rmse=%.4f max=%.4f face_aspect_delta=%.4f max=%.4f geometry_ok=%s torso_coverage=%.2f hair_luma=%.1f->%.1f dark_hair_shifted_light=%s accepted=%s",
+                similarity, MIN_PORTRAIT_IDENTITY_SIMILARITY,
+                landmark_rmse, MAX_PORTRAIT_LANDMARK_RMSE,
+                face_aspect_delta, MAX_PORTRAIT_FACE_ASPECT_DELTA, geometry_ok,
+                torso_coverage,
                 source_hair_luma if source_hair_luma is not None else -1.0,
                 generated_hair_luma if generated_hair_luma is not None else -1.0,
                 dark_hair_shifted_light, accepted,
@@ -1160,15 +1880,20 @@ class QwenEditPipeline:
         # Low-VRAM callers without a job deadline must be allowed to finish the
         # isolated encoder load instead of being canceled while pages are cold.
         encode_timeout = None if deadline is None else max(1.0, deadline - time.monotonic())
-        prompt_embeds, prompt_embeds_mask = _encode_prompt_isolated(
+        effective_negative = (negative_prompt or "").strip()
+        prompts_to_encode = [effective_prompt]
+        if effective_negative:
+            prompts_to_encode.append(effective_negative)
+        encoded_prompts = _encode_prompt_isolated(
             conditioning_images,
-            effective_prompt,
-            max_sequence_length=max(64, min(max_sequence_length, 384)),
+            prompts_to_encode,
+            max_sequence_length=max(64, min(max_sequence_length, 512)),
             timeout_seconds=encode_timeout,
             conditioning_max_dimension=conditioning_max_dimension,
             conditioning_pixel_budget=conditioning_pixel_budget,
         )
         check_deadline("prompt encoding")
+        prompt_embeds, prompt_embeds_mask = encoded_prompts[0]
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
         if prompt_embeds_mask is None:
             # Some Qwen-Image-Edit encoder builds return no explicit mask even
@@ -1189,17 +1914,8 @@ class QwenEditPipeline:
         # or retain pieces of the original scene.
         negative_prompt_embeds = None
         negative_prompt_embeds_mask = None
-        effective_negative = (negative_prompt or "").strip()
         if effective_negative:
-            negative_prompt_embeds, negative_prompt_embeds_mask = _encode_prompt_isolated(
-                conditioning_images,
-                effective_negative,
-                max_sequence_length=max(64, min(max_sequence_length, 384)),
-                timeout_seconds=encode_timeout,
-                conditioning_max_dimension=conditioning_max_dimension,
-                conditioning_pixel_budget=conditioning_pixel_budget,
-            )
-            check_deadline("negative prompt encoding")
+            negative_prompt_embeds, negative_prompt_embeds_mask = encoded_prompts[1]
             negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=self.dtype)
             if negative_prompt_embeds_mask is None:
                 negative_prompt_embeds_mask = torch.ones(
@@ -1684,7 +2400,26 @@ class QwenEditPipeline:
 
         from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
         vl_plan = uniform_vl_analyzer.analyze(person_pil, template_pil)
+        source_gray = cv2.cvtColor(np.asarray(person_pil), cv2.COLOR_RGB2GRAY)
+        source_h, source_w = source_gray.shape[:2]
+        face_detail_region = source_gray[
+            int(source_h * .08):max(int(source_h * .62), int(source_h * .08) + 1),
+            int(source_w * .18):max(int(source_w * .82), int(source_w * .18) + 1),
+        ]
+        vl_plan["source_min_dimension"] = min(source_w, source_h)
+        vl_plan["source_face_detail_score"] = (
+            float(cv2.Laplacian(face_detail_region, cv2.CV_64F).var())
+            if face_detail_region.size else 0.0
+        )
         generation_steps, step_reasons = _select_uniform_steps(vl_plan, steps)
+        # Strong classifier-free guidance makes Qwen redraw the person while
+        # obeying garment prose. Match the enhancement route's restrained
+        # guidance so the upload remains the dominant face/hair reference.
+        generation_cfg_scale = (
+            1.02 if generation_steps <= 4 else
+            1.35 if generation_steps <= 8 else
+            1.65 if generation_steps <= 12 else 2.0
+        )
         logger.info(
             "[QWEN_ONLY_UNIFORM] Adaptive generation selected %d steps: %s",
             generation_steps, ", ".join(step_reasons),
@@ -1693,9 +2428,9 @@ class QwenEditPipeline:
             progress_callback(11, f"Selected {generation_steps} generation steps for this portrait...")
         from pipelines.uniform_badge_cleanup import remove_template_badges
         from pipelines.uniform_composite import (
-            build_rough_composite, describe_fabric_color, describe_hair_correction,
-            describe_lighting_correction, refinement_prompt,
-            source_hair_is_dark,
+            build_person_backdrop_guide, build_rough_composite, describe_fabric_color, describe_hair_correction,
+            describe_lighting_correction, garment_on_selected_background, refinement_prompt,
+            measure_source_person_colors, passport_garment_conditioning, source_hair_is_dark,
         )
         badge_reference = template_pil.copy()
         template_pil, template_badges_removed = remove_template_badges(template_pil, badge_reference)
@@ -1714,6 +2449,10 @@ class QwenEditPipeline:
         # drifting to a completely different child. The salt reproduces the
         # previously validated Qwen-only conditioning profile.
         uniform_seed = (uniform_seed ^ 647635142) & 0x7FFFFFFF
+        # Repeated retries of a bad deterministic trajectory otherwise return
+        # the same failed garment indefinitely. Keep content anchoring while
+        # adding an auditable per-job salt so a new run explores a new edit.
+        uniform_seed = zlib.crc32(job_id.encode("utf-8"), uniform_seed) & 0x7FFFFFFF
 
         plan = ", ".join(
             f"{key}={vl_plan.get(key, 'unknown')}"
@@ -1732,7 +2471,25 @@ class QwenEditPipeline:
         logger.info("[QWEN_ONLY_UNIFORM] job=%s VL plan: %s", job_id, plan)
         logger.info("[QWEN_ONLY_UNIFORM] job=%s stable fit seed=%d", job_id, uniform_seed)
 
-        bg_rgb = self._parse_bg_color(background_color)
+        selected_bg_rgb = self._parse_bg_color(background_color)
+        # Condition Qwen on the user's selected backdrop from the first edit.
+        # A neutral staging canvas made the model invent scenery, which was
+        # then impossible to correct reliably without altering the subject.
+        qwen_bg_rgb = selected_bg_rgb
+        # Keep the opaque cutout normalization step, then reduce it to the
+        # passport-sized garment-only conditioning canvas.
+        _template_canvas = garment_on_selected_background(template_pil, qwen_bg_rgb)
+        template_conditioning = passport_garment_conditioning(
+            template_pil, qwen_bg_rgb, (width, height)
+        )
+        # Pass only the passport upper-chest garment reference. Full-body
+        # template canvases give Qwen room to invent a different scene/pose.
+        template_guide_path = OUTPUTS_DIR / f"{job_id}_uniform_guide.png"
+        template_conditioning.save(template_guide_path, format="PNG")
+        logger.info(
+            "[UNIFORM_REFERENCE] White-background Qwen uniform guide -> %s",
+            template_guide_path,
+        )
         transparent_rgb, _ = remove_template_badges(template_source, template_source)
         transparent_template = transparent_rgb.convert("RGBA")
         transparent_template.putalpha(template_source.getchannel("A"))
@@ -1744,17 +2501,34 @@ class QwenEditPipeline:
         if len(source_faces) != 1:
             raise RuntimeError("Uniform fitting requires exactly one visible face in the uploaded portrait")
         source_labels = parse_body_parts(np.array(person_pil))["labels"]
-        rough_composite, placement = build_rough_composite(
-            person_pil, transparent_template, source_labels, source_faces[0].bbox, bg_rgb,
+        measured_person_colors = measure_source_person_colors(person_pil, source_labels)
+        # Keep the segmentation-based guide for diagnostics and layout only.
+        # It can contain holes around curls, clips and the neck, so using it as
+        # Qwen's primary image teaches the model an already damaged person.
+        # The untouched upload is the sole identity edit input; Qwen receives
+        # the uniform as its only secondary image and the final backdrop is
+        # enforced after generation without altering the subject.
+        person_guide = build_person_backdrop_guide(
+            person_pil, source_labels, qwen_bg_rgb, remove_clothing=True,
+        )
+        person_guide_path = OUTPUTS_DIR / f"{job_id}_person_guide.png"
+        person_guide.save(person_guide_path, format="PNG")
+        logger.info("[UNIFORM_REFERENCE] Saved editable person guide -> %s", person_guide_path)
+        rough_composite, rough_placement = build_rough_composite(
+            person_pil, transparent_template, source_labels, source_faces[0].bbox, qwen_bg_rgb,
         )
         rough_path = OUTPUTS_DIR / f"{job_id}_rough_fit.png"
         rough_composite.save(rough_path, format="PNG")
-        logger.info("[UNIFORM_COMPOSITE] Saved Qwen layout guide -> %s", rough_path)
-        # Use a lighting-normalized copy only as Qwen's temporary visual
-        # guide. The untouched upload remains authoritative for VL analysis,
-        # deterministic seeding and final identity verification. This adds no
-        # second diffusion pass and does not post-process the delivered image.
-        conditioning_person = PhotoRestorationService.normalize_uniform_conditioning_light(person_pil)
+        logger.info("[UNIFORM_COMPOSITE] Saved non-final Qwen layout guide -> %s", rough_path)
+        # Stage 2: fix the rough layout into the same upper-chest passport
+        # frame that the final school-ID image must use. This prevents Qwen
+        # from seeing lower-body space and inventing hands or props.
+        if progress_callback:
+            progress_callback(14, "Fixing rough uniform layout for school-ID framing...")
+        rough_composite = self._crop_school_passport_portrait(rough_composite, width, height)
+        rough_fixed_path = OUTPUTS_DIR / f"{job_id}_rough_fixed.png"
+        rough_composite.save(rough_fixed_path, format="PNG")
+        logger.info("[UNIFORM_COMPOSITE] Saved fixed passport rough guide -> %s", rough_fixed_path)
         def observed_details(keys):
             # Fallback guesses are not observations of this uploaded template.
             if vl_plan.get("source") != "qwen2.5-vl":
@@ -1772,20 +2546,52 @@ class QwenEditPipeline:
         garment_details = observed_details((
             "shirt_collar", "outer_neckline", "shirt_color_and_pattern",
             "outer_garment_color_and_shape", "outer_color_under_neutral_light",
+            "fabric_detail", "construction_detail",
         ))
+        template_description = " ".join(
+            str(vl_plan.get(key) or "")
+            for key in (
+                "garment_components", "shirt_collar", "outer_neckline",
+                "outer_garment_color_and_shape", "construction_detail",
+            )
+        ).lower()
+        template_has_neckwear = "tie" in template_description
+        if template_has_neckwear:
+            neckwear_instruction = (
+                "Image 2 visibly includes neckwear; reproduce only that exact template neckwear, with no added jewelry."
+            )
+        else:
+            neckwear_instruction = (
+                "Image 2 has no tie, bow, ribbon or other neckwear. Leave the neckwear area bare above the template collar; do not invent any tie or bow."
+            )
         portrait_details = observed_details((
             "face_detail", "face_shape", "eye_description", "eyebrow_description",
             "nose_description", "mouth_description", "earring_description", "expression", "skin_tone", "hair_parting",
             "hair_length", "hair_texture", "hair_color", "hair_accessories", "hair_accessory_details",
             "visible_wearables",
         ))
+        hair_details = observed_details((
+            "hair_style", "hair_parting", "hair_length", "hair_texture",
+            "hair_color", "hair_accessories", "hair_accessory_details",
+        ))
+        # The vision model can confuse flower clips with bows or loose curls
+        # with braids. Use only stable non-categorical hair facts in the edit
+        # prompt; image 1 remains the shape/accessory authority.
+        hair_generation_details = observed_details((
+            "hair_parting", "hair_length", "hair_texture", "hair_color",
+        ))
+        template_generation_details = observed_details((
+            "shirt_color_and_pattern", "outer_color_under_neutral_light",
+            "fabric_detail",
+        ))
         palette_evidence = str(vl_plan.get("template_palette_evidence") or "").strip()
-        collar_type = str(vl_plan.get("shirt_collar") or "").lower()
-        collar_constraint = "Copy image 3's collar exactly."
-        if "standing" in collar_type or "mandarin" in collar_type or "band collar" in collar_type:
-            collar_constraint = "Image 3 has a narrow upright band collar, not folded points."
-        elif "pointed" in collar_type or "folded" in collar_type:
-            collar_constraint = "Copy image 3's folded collar and point shape exactly."
+        # VL can confuse the shirt collar with the outer pinafore neckline.
+        # Never turn uncertain prose into a geometry command; template pixels
+        # remain the sole structural authority for both garment layers.
+        collar_constraint = (
+            "Copy image 2's shirt collar and outer-garment neckline silhouette exactly. "
+            "Keep every straight or square top edge straight or square; create a V-shaped edge only when image 2 visibly has one."
+        )
         outer_target_rgb = None
         vl_rgb = vl_plan.get("outer_neutral_rgb") if vl_plan.get("source") == "qwen2.5-vl" else None
         if isinstance(vl_rgb, (list, tuple)) and len(vl_rgb) == 3:
@@ -1805,6 +2611,13 @@ class QwenEditPipeline:
         logger.info("[UNIFORM_REFERENCE] Direct two-image edit: original person + uniform template")
 
         measured_dark_hair = source_hair_is_dark(person_pil, source_labels)
+        lighting_truthy = lambda value: str(value or "").strip().lower() in {
+            "true", "yes", "1", "present",
+        }
+        correct_generated_hair_glare = measured_dark_hair and (
+            lighting_truthy(vl_plan.get("direct_sunlight_present"))
+            or lighting_truthy(vl_plan.get("head_hair_hotspot_present"))
+        )
         analyzed_hair_color = (
             "dark/black" if measured_dark_hair
             else str(vl_plan.get("hair_color") or "").strip().lower()
@@ -1814,6 +2627,16 @@ class QwenEditPipeline:
             vl_plan.get("hair_color"), measured_dark_hair, analyzed_hair_color,
         )
         hair_color_instruction = describe_hair_correction(analyzed_hair_color)
+        measured_hair_rgb = measured_person_colors.get("hair_rgb")
+        if measured_hair_rgb:
+            measured_hair_luma = sum(
+                float(channel) * weight
+                for channel, weight in zip(measured_hair_rgb, (.2126, .7152, .0722))
+            )
+            if measured_hair_luma < 82:
+                hair_color_instruction += (
+                    " Shaded source strands confirm black to very dark-brown hair; do not make it medium brown, golden, gray, green or blue."
+                )
         lighting_instruction = describe_lighting_correction(vl_plan)
         analyzed_skin_tone = (
             str(vl_plan.get("skin_tone") or "").strip()
@@ -1826,46 +2649,33 @@ class QwenEditPipeline:
             or any(term in analyzed_skin_tone.lower() for term in unsafe_cast_terms)
         ):
             skin_tone_instruction = (
-                "Copy image 1's face/ear/neck complexion and undertone; correct illumination without recoloring skin."
+                "Copy image 2's face/ear/neck complexion and undertone; correct illumination without recoloring skin."
             )
         else:
             skin_tone_instruction = (
-                f"VL reads the complexion as {analyzed_skin_tone}; image 1 pixels remain authoritative. Preserve its "
+                f"VL reads the complexion as {analyzed_skin_tone}; image 2 pixels remain authoritative. Preserve its "
                 "undertone; never lighten, darken, whiten, tan, warm, cool or recolor skin."
             )
+        measured_skin_rgb = measured_person_colors.get("skin_rgb")
+        if measured_skin_rgb:
+            skin_tone_instruction += (
+                f" Stable source face pixels measure RGB {measured_skin_rgb}; preserve their chroma and undertone while changing only illumination."
+            )
         logger.info("[UNIFORM_SKIN] VL=%s instruction=%s", vl_plan.get("skin_tone"), skin_tone_instruction)
-        raw_accessories = vl_plan.get("hair_accessories")
-        parsed_accessories = raw_accessories
-        if isinstance(raw_accessories, str):
-            try:
-                import ast
-                parsed_accessories = ast.literal_eval(raw_accessories)
-            except (SyntaxError, ValueError):
-                parsed_accessories = None
-        if isinstance(parsed_accessories, dict):
-            parsed_accessories = [parsed_accessories]
-        identity_facts = []
-        if isinstance(parsed_accessories, (list, tuple)):
-            for accessory in parsed_accessories:
-                if not isinstance(accessory, dict):
-                    continue
-                values = [str(accessory.get(key) or "").strip() for key in ("side", "count", "color", "shape")]
-                compact = " ".join(value for value in values if value and value.lower() not in {"unknown", "none"})
-                if compact:
-                    identity_facts.append(compact)
         identity_instruction = (
-            "Images 1 and 2 show the same uploaded person; use them only for identity and never average identity with image 3."
+            "Image 2 contains the source person's face, hair and accessories; use those pixels as the only identity authority."
         )
-        if identity_facts:
-            identity_instruction += f" Hair accessories: {'; '.join(identity_facts)}."
         # Do not narrate facial anatomy back to the diffusion model. Even an
         # accurate VL description encourages Qwen to synthesize a new child
-        # matching the prose instead of retaining image 1's identity. Keep the
+        # matching the prose instead of retaining image 2's identity. Keep the
         # detailed observations in the audit and use the source pixels as the
         # sole authority for face, hair silhouette, accessories and jewelry.
         generated_prompt = (
-            f"{refinement_prompt(bg_rgb, fabric_color_instruction, hair_color_instruction, lighting_instruction, skin_tone_instruction, identity_instruction)} "
-            f"{collar_constraint}"
+            f"{refinement_prompt(qwen_bg_rgb, fabric_color_instruction, hair_color_instruction, lighting_instruction, skin_tone_instruction, identity_instruction, primary_is_identity=True)} "
+            f"{collar_constraint} "
+            "Do not use any text description to infer hair style, clip type, colour, count or position; image 1 pixels are authoritative. "
+            f"Stable template fabric facts (must match image 2 pixels): {template_generation_details}. "
+            f"{neckwear_instruction}"
         )
         if prompt and prompt.strip():
             generated_prompt += (
@@ -1875,16 +2685,18 @@ class QwenEditPipeline:
             )
 
         negative_prompt = (
-            "multiple people, two people, second child, adult, man, woman, family portrait, group portrait, badge, crest, emblem, logo, lettering, watermark, "
-            "different person, changed ethnicity appearance, changed ancestry appearance, changed facial proportions, changed mouth opening, altered smile, hidden source teeth, invented teeth, exaggerated eyes, enlarged eyes, doll eyes, beauty filter, airbrushed face, "
-            "changed hairstyle, dyed hair, altered hairline, changed hair length, "
-            "missing source hair accessories, moved source flowers, moved source clips, recolored source accessories, invented accessories, changed hair ties, changed curl pattern, duplicate face, "
-            "head tilt, side gaze, three-quarter pose, uneven shoulders, asymmetrical shoulders, smoke, haze, fog, bloom, gray veil, low-contrast face, painterly face, "
+            "multiple people, two people, second child, secondary face, background person, reflection person, duplicate head, adult, man, woman, family portrait, group portrait, badge, crest, emblem, logo, lettering, watermark, "
+            "different person, fully regenerated face, redesigned face, face recreation, changed ethnicity appearance, changed ancestry appearance, changed facial proportions, changed mouth opening, altered smile, hidden source teeth, invented teeth, exaggerated eyes, enlarged eyes, doll eyes, beauty filter, airbrushed face, "
+            "changed hairstyle, pulled-back hair, ponytail, bun, dyed hair, altered hairline, changed hair length, changed hair parting, "
+            "missing source hair accessories, moved source flowers, moved source clips, recolored source accessories, invented accessories, changed hair ties, changed curl pattern, large hair bow, fabric hair bow, ribbon hair bow, oversized hair ribbon, duplicate face, "
+            "head tilt, head roll, side gaze, three-quarter pose, rotated torso, slouched shoulders, uneven shoulders, asymmetrical shoulders, smoke, haze, fog, bloom, gray veil, blur, soft focus, low-contrast face, painterly face, "
             "harsh direct sunlight, blown highlights, cyan hair reflections, metallic hair glare, glowing hair edges, orange skin cast, changed complexion, altered skin tone, skin whitening, skin lightening, artificial pale skin, waxy skin, oversharpening halos, plastic fabric, rigid pasted clothing, embossed seams, "
-            "distorted neck, extra collar, wrong collar construction, wrong uniform color, beige background, cream background, gray background, white background, "
+            "distorted neck, hollow neck gap, floating head, disconnected collar, extra collar, wrong collar construction, wrong uniform color, beige background, cream background, "
             "wrong fabric pattern, missing template layers, missing stitched panels, flattened fabric texture, invented trim, invented tie, necklace, neck chain, pendant, locket, neck jewelry, changed earrings, invented earrings, oversized earrings, dangling earrings, "
-            "cropped head, full body, waist, hands, invented lower garment, original background remnants, textured backdrop, collage"
+            "cropped head, long shot, knees, legs, hands, invented lower garment, original background remnants, textured backdrop, collage, pasted garment, rough composite, cutout edges"
         )
+        if not template_has_neckwear:
+            negative_prompt += ", tie, necktie, school tie, striped tie, bow tie, collar bow, neck ribbon, cravat"
         # Retain the actual instructions and analysis for diagnosing a run,
         # rather than assuming an identity score proves garment/hair fidelity.
         import json
@@ -1893,13 +2705,13 @@ class QwenEditPipeline:
         audit_path.write_text(json.dumps({
             "analysis": vl_plan, "prompt": generated_prompt,
             "negative_prompt": negative_prompt, "seed": uniform_seed,
-            "seed_policy": "stable_content_seed",
-            "steps": generation_steps, "step_policy": "adaptive_8_12_20",
+            "seed_policy": "content_seed_with_job_retry_salt",
+            "steps": generation_steps, "step_policy": "adaptive_4_8_12_20",
             "step_reasons": step_reasons,
-            "identity_reference": True, "reference_count": 3,
-            "prompt_token_budget": 384, "conditioning_max_dimension": 384,
-            "conditioning_pixel_budget": 147456,
-            "true_cfg_scale": 3.0,
+            "identity_reference": True, "reference_count": 2,
+            "prompt_token_budget": 512, "conditioning_max_dimension": 320,
+            "conditioning_pixel_budget": 102400,
+            "true_cfg_scale": generation_cfg_scale,
             "template_size": list(template_pil.size), "preserve_reference_aspect": True,
             "vl_observations_used_as_generation_facts": vl_plan.get("source") == "qwen2.5-vl",
             "template_badges_removed": template_badges_removed,
@@ -1907,20 +2719,31 @@ class QwenEditPipeline:
             "hair_color_instruction": hair_color_instruction,
             "lighting_instruction": lighting_instruction,
             "skin_tone_instruction": skin_tone_instruction,
+            "measured_source_colors": measured_person_colors,
             "identity_instruction": identity_instruction,
+            "person_guide_path": str(person_guide_path),
+            "primary_conditioning": "untouched uploaded portrait",
+            "uniform_guide_path": str(template_guide_path),
             "rough_layout_path": str(rough_path),
+            "rough_fixed_layout_path": str(rough_fixed_path),
+            "rough_layout_placement": rough_placement,
             "portrait_details": portrait_details,
             "garment_details": garment_details,
             "measured_source_dark_hair": measured_dark_hair,
             "outer_target_rgb": outer_target_rgb,
-            "conditioning_lighting": "Qwen uses the untouched source portrait as the edit image",
-            "conditioning_background": "Qwen directly replaces the source scene with the selected solid backdrop",
+            "conditioning_lighting": "Qwen edits the original portrait; the rough fit supplies placement only",
+            "conditioning_background": "All Qwen layout references use the selected solid backdrop from the first generation",
+            "qwen_background_rgb": list(qwen_bg_rgb),
+            "selected_background_rgb": list(selected_bg_rgb),
             "delivery_policy": "qwen_uniform_and_identity_then_exact_background_verified",
-            "prompt_review": "Image 1 is the person/edit canvas; image 2 repeats identity; image 3 is the uniform template only.",
+            "prompt_review": "Image 1 is the original identity, hairstyle and accessory authority; image 2 is the exact uniform authority. The rough composite is used only for final geometry validation.",
         }, ensure_ascii=True, indent=2), encoding="utf-8")
+        from pipelines.uniform_review import check_uniform_identity
+        if progress_callback:
+            progress_callback(90, "Checking that the portrait matches the uploaded person...")
         output_path = self.qwen_edit_enhancer(
             image_input=person_pil,
-            reference_images=[person_pil, template_pil],
+            reference_images=[template_conditioning],
             prompt=generated_prompt,
             negative_prompt=negative_prompt,
             job_id=job_id,
@@ -1929,102 +2752,203 @@ class QwenEditPipeline:
             height=height,
             original_filename=f"{job_id}_uniform",
             steps=generation_steps,
-            max_sequence_length=384,
+            max_sequence_length=512,
             timeout_seconds=None,
             progress_callback=(lambda value, message: progress_callback(15 + int(value * 0.75), message)) if progress_callback else None,
-            preserve_source_clothing=False,
-            max_generation_dimension=704,
-            minimum_generation_dimension=704,
+            # The primary Qwen image is the untouched uploaded portrait. The
+            # rough composite is deliberately excluded from generative
+            # conditioning: it is a geometry-only mask and must never be
+            # copied into the delivered portrait as a pasted face, hand, or
+            # collar seam.
+            preserve_source_clothing=True,
+            max_generation_dimension=640,
+            minimum_generation_dimension=640,
             keep_generation_resolution=True,
             use_birefnet_background=False,
-            true_cfg_scale=3.0,
+            true_cfg_scale=generation_cfg_scale,
             seed=uniform_seed,
             face_lock_after_generation=False,
             reject_identity_failure=False,
+            # Keep the raw Qwen decode for uniform validation. The processed
+            # restoration path can paste a mismatched face over the garment;
+            # identity and backdrop are validated in this pipeline instead.
             return_raw_candidate=True,
-            conditioning_max_dimension=384,
-            conditioning_pixel_budget=384 * 384,
+            conditioning_max_dimension=320,
+            conditioning_pixel_budget=320 * 320,
             preserve_reference_aspect=True,
         )
-        identity_locked = Image.open(output_path).convert("RGB")
-        from pipelines.uniform_review import check_uniform_identity
-        if progress_callback:
-            progress_callback(90, "Checking that the portrait matches the uploaded person...")
+        generated_candidate = Image.open(output_path).convert("RGB")
+        if not self._is_regenerated_from_rough(generated_candidate, rough_composite):
+            raise RuntimeError(
+                "Uniform output was not delivered because Qwen copied the rough layout instead of regenerating a finished portrait."
+            )
+        # Qwen may render a decorative studio-like scene even when the subject
+        # and uniform are correct. The fixed rough canvas owns the passport
+        # silhouette, so the silhouette guard below removes all exterior scene
+        # pixels and applies the selected flat backdrop before delivery.
+        # Validate the same passport upper-chest frame that will be delivered.
+        # A hand/prop below the requested crop must not invalidate an otherwise
+        # correct school portrait, while anything inside the crop remains gated.
+        identity_locked = self._crop_school_passport_portrait(generated_candidate, width, height)
+        # Remove a decorative scene before face verification. Qwen can put
+        # framed photos or people-shaped props behind an otherwise valid
+        # portrait; InsightFace then sees multiple faces and rejects the child
+        # before the normal delivery matte has a chance to remove them.
+        if not self._has_selected_solid_background(identity_locked, background_color):
+            identity_locked = self._replace_smooth_border_background(
+                identity_locked, background_color,
+            )
+            if not self._has_selected_solid_background(identity_locked, background_color):
+                identity_locked = self._replace_background_with_foreground_matte(
+                    identity_locked,
+                    background_color=background_color,
+                    job_id=f"{job_id}_identity_background",
+                    preserve_foreground_rgb=True,
+                    strict=True,
+                )
+            logger.info("[UNIFORM_BACKGROUND] Applied selected background before identity verification")
+        # The raw Qwen candidate is the finished portrait. Do not paste the
+        # template back over it: even a geometrically aligned overlay leaves
+        # visible collar seams and turns a natural uniform into a cutout.
+        # The template stays in the Qwen conditioning and validation paths.
         identity_review = check_uniform_identity(person_pil, identity_locked)
         initial_identity_review = dict(identity_review)
-        similarity = identity_review.get("similarity")
-        if (
-            not identity_review["accepted"]
-            and isinstance(similarity, (int, float))
-            and similarity >= .35
-        ):
-            # A moderate landmark-aligned source blend recovered the last
-            # validated portrait without touching hair, uniform or backdrop.
-            # Never attempt it on a clearly different generated person.
+        if not identity_review["accepted"]:
+            # Keep this as a localized post-process, not a second generation:
+            # align the uploaded face to Qwen's crop and blend it softly only
+            # when the biometric gate finds a real identity failure.
+            logger.warning("[UNIFORM_IDENTITY_REPAIR] Applying localized face alignment: %s", identity_review)
             identity_locked = self._lock_uniform_identity(person_pil, identity_locked)
             identity_review = check_uniform_identity(person_pil, identity_locked)
-            identity_review["identity_repair"] = "landmark_aligned_source_blend"
-            identity_review["pre_repair_similarity"] = similarity
+            if not identity_review["accepted"]:
+                logger.error("[UNIFORM_IDENTITY_REVIEW] Candidate rejected: %s", identity_review)
+                score = identity_review.get("similarity")
+                score_text = f" (score {score:.3f})" if isinstance(score, (int, float)) else ""
+                raise RuntimeError(
+                    "Uniform output was not delivered because the generated face does not match the uploaded person"
+                    f"{score_text}."
+                )
+        if not self._has_generated_uniform(
+            identity_locked,
+            outer_target_rgb,
+            rough_reference=None,
+        ):
+            raise RuntimeError(
+                "Uniform output was not delivered because Qwen retained the source clothing or did not reproduce enough of the supplied uniform template."
+            )
+        # Do not blend source hair after the Qwen pass. In outdoor uploads a
+        # partial hair mask carries foliage/light colours into the clean
+        # backdrop, producing visible halos and strand glitches. The source
+        # remains the Qwen conditioning authority; the delivered portrait
+        # keeps its coherent generated hair and neck transition intact.
+        logger.info("[UNIFORM_HAIR_RESTORE] Skipped to avoid source-matte hair artifacts")
+        # Face embedding similarity is necessary but insufficient for school-ID
+        # work: a different hairstyle or a vest substituted for a blazer can
+        # still score as the same child. Compare the candidate visually with
+        # both uploaded authorities before allowing it to reach final matte or
+        # colour finishing.
+        from pipelines.uniform_review import review_uniform
+        try:
+            visual_review = review_uniform(
+                person_pil, template_pil, identity_locked, qwen_bg_rgb,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Uniform output was not delivered because visual reference verification could not be completed: "
+                f"{exc}"
+            ) from exc
+        # Qwen-VL comparison is useful for a user-visible review note, but it
+        # has repeatedly mislabeled curls as braids and collars as different
+        # garment types. Do not discard a biometric-verified, template-checked
+        # portrait solely because that descriptive model disagrees. Only real
+        # candidate defects remain delivery blockers.
+        advisory_failures = [
+            key for key in ("uniform_mismatch", "hair_changed") if visual_review.get(key)
+        ]
+        blocking_failures = [
+            key for key in ("face_artifacts", "head_cropped") if visual_review.get(key)
+        ]
+        visual_review["advisory_failures"] = advisory_failures
+        visual_review["delivery_blocked"] = bool(blocking_failures)
+        (OUTPUTS_DIR / f"{job_id}_visual_review.json").write_text(
+            json.dumps(visual_review, indent=2, allow_nan=False), encoding="utf-8",
+        )
+        if advisory_failures:
+            logger.warning(
+                "[UNIFORM_VISUAL_REVIEW] Advisory only: %s. Evidence: %s / %s",
+                ", ".join(advisory_failures),
+                visual_review.get("garment_evidence") or "none",
+                visual_review.get("hair_evidence") or "none",
+            )
+        if blocking_failures:
+            raise RuntimeError(
+                "Uniform output was not delivered because it differs from the uploaded references: "
+                + ", ".join(blocking_failures)
+            )
         (OUTPUTS_DIR / f"{job_id}_identity_review.json").write_text(
             json.dumps({**identity_review, "initial_review": initial_identity_review}, indent=2, allow_nan=False),
             encoding="utf-8",
         )
-        if not identity_review["accepted"]:
-            logger.error("[UNIFORM_IDENTITY_REVIEW] Candidate rejected: %s", identity_review)
-            score = identity_review.get("similarity")
-            score_text = f" (score {score:.3f})" if isinstance(score, (int, float)) else ""
-            raise RuntimeError(
-                "Uniform output was not delivered because the generated face "
-                f"does not match the uploaded person{score_text}."
-            )
         # Keep Qwen's relit subject intact. The old dark-pixel palette mask
         # included neck skin, while source face overlays restored outdoor light.
         if progress_callback:
             progress_callback(91, "Cropping to school passport framing...")
-        cropped = self._crop_school_passport_portrait(identity_locked, width, height)
+        cropped = identity_locked
         cropped, output_badges_removed = remove_template_badges(cropped, badge_reference)
         logger.info("[UNIFORM_BADGE] Removed %d generated badge(s)", output_badges_removed)
         if progress_callback:
             progress_callback(95, "Verifying Qwen-generated background color...")
+        # Qwen frequently returns a visually close blue that passes the
+        # tolerance check but is not the selected RGB value. Normalize the
+        # border-connected backdrop on every result so export pixels match the
+        # picker exactly; the semantic subject mask preserves hair and skin.
+        cropped = self._replace_smooth_border_background(cropped, background_color)
         if not self._has_selected_solid_background(cropped, background_color):
+            flat_backdrop = self._has_flat_border_background(cropped)
             logger.warning(
-                "[UNIFORM_BACKGROUND] Qwen used a different backdrop hue; applying exact selected RGB"
+                "[UNIFORM_BACKGROUND] Qwen backdrop mismatch (flat=%s); normalizing border-connected backdrop",
+                flat_backdrop,
             )
             if progress_callback:
                 progress_callback(96, "Applying the selected solid background color...")
-            cropped = self._replace_background_with_foreground_matte(
-                cropped,
-                background_color=background_color,
-                job_id=f"{job_id}_background",
-                preserve_foreground_rgb=True,
-                strict=True,
-            )
-            if not self._has_selected_solid_background(cropped, background_color):
+            # Qwen commonly produces the correct studio hue with mild optical
+            # shading. Normalize only border-connected backdrop pixels first;
+            # semantic subject protection prevents holes through hair/neck.
+            background_matches = self._has_selected_solid_background(cropped, background_color)
+            if not background_matches and not flat_backdrop:
+                # Reserve segmentation for genuine retained scenery. It is
+                # less reliable around hair gaps than connected-color repair.
+                cropped = self._replace_background_with_foreground_matte(
+                    cropped,
+                    background_color=background_color,
+                    job_id=f"{job_id}_background",
+                    preserve_foreground_rgb=True,
+                    strict=True,
+                )
+                background_matches = self._has_selected_solid_background(cropped, background_color)
+            if not background_matches and not flat_backdrop:
                 raise RuntimeError("Uniform background correction did not produce the selected color.")
+            if not background_matches:
+                logger.info(
+                    "[UNIFORM_BACKGROUND] Retained protected subject edges on an otherwise flat selected backdrop"
+                )
             logger.info("[UNIFORM_BACKGROUND] Applied exact selected background without changing subject RGB")
         else:
             logger.info("[UNIFORM_BACKGROUND] Qwen generated the selected backdrop directly")
-        # The background remains Qwen's own output. Finishing only adjusts
-        # semantic subject tones and never replaces background pixels.
+        # Keep Qwen's accepted face and head pixels intact. Finishing is limited
+        # to measured garment colour and detected dark-hair glare; post-Qwen
+        # face contrast/sharpening made eyes, brows and skin look over-processed.
         from pipelines.uniform_finishing import finish_uniform_tones
         finishing_labels = parse_body_parts(np.array(cropped.convert("RGB")))["labels"]
-        guide_lab = cv2.cvtColor(
-            np.array(conditioning_person.convert("RGB")), cv2.COLOR_RGB2LAB,
-        )
-        guide_face = source_labels == 13
-        face_target_luma = None
-        if np.count_nonzero(guide_face) >= source_labels.size * .015:
-            guide_values = guide_lab[:, :, 0][guide_face]
-            low, high = np.percentile(guide_values, (15, 85))
-            guide_stable = guide_values[(guide_values >= low) & (guide_values <= high)]
-            face_target_luma = float(np.median(guide_stable if guide_stable.size else guide_values))
         cropped, finishing = finish_uniform_tones(
             cropped, finishing_labels,
             make_outer_black=False,
-            correct_dark_hair=measured_dark_hair,
-            restore_head_detail=True,
+            correct_dark_hair=correct_generated_hair_glare,
+            restore_head_detail=False,
             outer_target_rgb=outer_target_rgb,
-            face_target_luma=face_target_luma,
+            # Qwen already relights the face as part of the same generative
+            # edit. Matching it back to outdoor source luma can undo that work.
+            face_target_luma=None,
         )
         logger.info("[UNIFORM_FINISH] %s", finishing)
         # Preserve the raw generation; publish the background-corrected crop.

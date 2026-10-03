@@ -884,6 +884,9 @@
               <a id="enhance-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
                 ↓ Download Enhanced Image (<span id="enhance-dl-name-display"></span>)
               </a>
+              <a id="enhance-safe-dl-btn" class="btn-action" href="#" download="" style="display:none;flex:1;justify-content:center;text-decoration:none;font-weight:600;">
+                ↓ Download Source-Preserving Version
+              </a>
             </div>
           </div>
         </div>
@@ -1310,9 +1313,10 @@
       downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
     }
 
-    function renderEnhanceResult(url, downloadUrl = url, reviewLabel = '') {
+    function renderEnhanceResult(url, downloadUrl = url, reviewLabel = '', safeDownloadUrl = '') {
       const afterImg = document.getElementById('enhance-img-after');
       const dlBtn = document.getElementById('enhance-dl-btn');
+      const safeDlBtn = document.getElementById('enhance-safe-dl-btn');
       afterImg.onload = () => {
         setEnhanceAfterState('complete');
         const stage = document.getElementById('enhance-after-stage');
@@ -1322,6 +1326,8 @@
       };
       afterImg.src = url;
       dlBtn.href = downloadUrl;
+      safeDlBtn.href = safeDownloadUrl || '#';
+      safeDlBtn.style.display = safeDownloadUrl ? 'inline-flex' : 'none';
     }
 
     async function startEnhance() {
@@ -1358,7 +1364,7 @@
         fd.append('upscale_factor', upscaleFactor);
         fd.append('width', 600);
         fd.append('height', 800);
-        fd.append('steps', 8);
+        fd.append('steps', 20);
 
         const resp = await fetch(`${API}/qwen/enhance`, {
           method: 'POST',
@@ -1405,7 +1411,20 @@
       enhanceState.pollInterval = setInterval(async () => {
         try {
           const resp = await fetch(`${API}/job/${jobId}`);
-          if (!resp.ok) return;
+          if (resp.status === 404) {
+            clearInterval(enhanceState.pollInterval);
+            enhanceState.pollInterval = null;
+            enhanceState.jobId = null;
+            enhanceState.processing = false;
+            btn.disabled = false;
+            cancelBtn.style.display = 'none';
+            retryBtn.style.display = 'inline-flex';
+            pBox.style.display = 'none';
+            msgEl.textContent = 'This job expired after the server restarted. Click Retry to run it again.';
+            setEnhanceAfterState('ready');
+            return;
+          }
+          if (!resp.ok) throw new Error(`Job status failed (HTTP ${resp.status})`);
           const job = await resp.json();
 
           if (job.status === 'queued') {
@@ -1433,19 +1452,22 @@
             const candidateUrl = rawCandidate
               ? `/${String(rawCandidate).replace(/^\/+/, '')}?t=${Date.now()}`
               : '';
-            // A rejected Qwen candidate is review-only. Show it alongside the
-            // original upload so the user can compare it directly, while the
-            // download remains the validation-approved output.
+            // The main preview and primary download must refer to the same
+            // generated file. When identity QA rejects it, retain the
+            // source-preserving result as a separate secondary download.
             enhanceState.resultUrl = candidateUrl || outUrl;
             renderEnhanceResult(
               enhanceState.resultUrl,
-              outUrl,
-              candidateUrl ? 'Qwen Generation - Review' : ''
+              candidateUrl || outUrl,
+              candidateUrl ? 'Qwen Generation - Review' : '',
+              candidateUrl ? outUrl : ''
             );
 
             const downloadName = (job.metadata && job.metadata.download_name) || job.original_filename || enhanceState.origName || 'enhanced.png';
             const dlBtn = document.getElementById('enhance-dl-btn');
             dlBtn.download = downloadName;
+            const safeDlBtn = document.getElementById('enhance-safe-dl-btn');
+            safeDlBtn.download = `source_preserving_${downloadName}`;
             document.getElementById('enhance-dl-name-display').textContent = downloadName;
             document.getElementById('enhance-compare').style.display = 'grid';
 
@@ -1683,7 +1705,19 @@
       uniformState.pollInterval = setInterval(async () => {
         try {
           const resp = await fetch(`${API}/job/${jobId}`);
-          if (!resp.ok) return;
+          if (resp.status === 404) {
+            clearInterval(uniformState.pollInterval);
+            uniformState.pollInterval = null;
+            uniformState.jobId = null;
+            document.getElementById('uniform-progress').style.display = 'none';
+            document.getElementById('uniform-cancel-btn').style.display = 'none';
+            document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
+            document.getElementById('uniform-run-btn').disabled = false;
+            document.getElementById('uniform-msg').textContent = 'This job expired after the server restarted. Click Retry to run it again.';
+            setUniformAfterState('ready');
+            return;
+          }
+          if (!resp.ok) throw new Error(`Job status failed (HTTP ${resp.status})`);
           const job = await resp.json();
 
           if (job.status === 'queued') {
@@ -1891,7 +1925,7 @@
         fd.append('upscale_factor', upscaleFactor);
         fd.append('width', 600);
         fd.append('height', 800);
-        fd.append('steps', 8);
+        fd.append('steps', 20);
         fd.append('priority', 'bulk');
 
         const resp = await fetch(`${API}/qwen/enhance`, { method: 'POST', body: fd });
@@ -1913,7 +1947,17 @@
             }
             try {
               const jResp = await fetch(`${API}/job/${jobId}`);
-              if (!jResp.ok) return;
+              if (jResp.status === 404) {
+                clearInterval(pollTimer);
+                item.status = 'failed';
+                item.progress = 0;
+                item.message = 'Job expired after server restart. Retry this item.';
+                updateBulkItemUI(item);
+                updateBulkStats();
+                resolve();
+                return;
+              }
+              if (!jResp.ok) throw new Error(`Job status failed (HTTP ${jResp.status})`);
               const job = await jResp.json();
 
               if (job.status === 'queued') {

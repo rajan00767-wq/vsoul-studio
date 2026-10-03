@@ -986,7 +986,7 @@ async def api_qwen_enhance(
     width: int = Form(600),
     height: int = Form(800),
     mode: str = Form("qwen"),
-    steps: int = Form(8),
+    steps: int = Form(20),
     priority: str = Form("normal"),
     request: Request = None,
 ):

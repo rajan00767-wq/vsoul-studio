@@ -581,6 +581,29 @@ def build_dynamic_identity_prompt(
         jewelry_lock = f"Preserve visible jewelry and wearables ({j_clean}). "
 
     hair_desc = " ".join(part for part in (hair_style, hair_geometry, hair_color) if part).strip()
+    measured_skin_rgb = vl_brief.get("measured_skin_rgb")
+    measured_hair_rgb = vl_brief.get("measured_hair_rgb")
+    measured_color_lock = ""
+    if isinstance(measured_skin_rgb, (list, tuple)) and len(measured_skin_rgb) == 3:
+        measured_color_lock += (
+            f"Use the uploaded evenly lit facial pixels as complexion authority (measured median RGB {tuple(measured_skin_rgb)}); "
+            "studio lighting may change luminance but must not change skin chroma or undertone. "
+        )
+    if isinstance(measured_hair_rgb, (list, tuple)) and len(measured_hair_rgb) == 3:
+        measured_hair_luma = sum(
+            float(channel) * weight
+            for channel, weight in zip(measured_hair_rgb, (.2126, .7152, .0722))
+        )
+        if measured_hair_luma < 82:
+            hair_color = "black to very dark brown"
+            measured_color_lock += (
+                "Shaded source strands confirm black to very dark-brown base hair. Remove sunlight and color cast, "
+                "but do not turn it medium brown, golden, gray, green or blue. "
+            )
+        else:
+            measured_color_lock += (
+                "Use shaded source strands as the base hair-pigment authority; remove glare without recoloring hair. "
+            )
     clothing_details = ", ".join(
         re.sub(r"[^a-zA-Z0-9 ,.-]", "", str(vl_brief.get(key) or ""))[:50]
         for key in ("clothing_color_pattern", "clothing_collar", "clothing_fasteners")
@@ -621,10 +644,14 @@ def build_dynamic_identity_prompt(
 
     # Allow lighting and detail restoration while preserving identity and design.
     parts = [
-        "Restore this photograph as a natural indoor studio passport portrait of the same person.",
+        "Make localized photographic corrections to this uploaded portrait; do not recreate the person or compose a substitute studio model.",
+        "The uploaded face, expression, facial asymmetry, hair silhouette, hairline, tied sections, and garment pixels are authoritative and must remain visibly the same.",
         lighting_instruction,
         "Preserve natural skin pigmentation and the hair's base color; do not reproduce blue, silver, or golden sunlight reflections as hair color. Avoid warm amber or cool blue color grading.",
-        "Reconstruct degraded detail in the face, hair and fabric; reduce compression artifacts while retaining realistic skin texture and individual hair strands.",
+        measured_color_lock,
+        "Perform photographic restoration, not face recreation or beautification. Recover only plausible detail supported by the source; preserve natural pores, fine lines, under-eye texture, small facial asymmetries, and age-appropriate proportions.",
+        "Reduce compression artifacts while retaining the exact source face shape, hairline, hair silhouette, tied sections, parting, flyaways, and individual hair strands. Do not replace real hair with a smooth idealized hairstyle.",
+        "Preserve every visible source hair clip, tie, bow, ribbon, bead, flower, and tied hair section exactly where it appears, including small pale accessories near the crown. Never remove, merge, duplicate, recolor, or invent hair accessories.",
         f"Replace the entire background, including visible gaps between curls, with a seamless solid {bg_desc} backdrop. Keep backdrop color off the subject.",
         "Preserve identity, facial proportions, eye size, expression and natural skin pigmentation. Lighting may change; anatomy and garment design must stay the same.",
         f"Preserve source hairstyle and base color: {hair_desc}. Bright sun reflections are lighting, not a new hair color.",
@@ -633,9 +660,9 @@ def build_dynamic_identity_prompt(
         headwear_lock,
         jewelry_lock,
         f"Keep the same {framing_desc}, pose, head angle, and gaze.",
-        "Keep the entire head and all hair accessories visible with space above them, and include the shoulders and upper chest for passport cropping. Preserve an existing camera-facing pose.",
+        "Keep the entire head and all hair accessories visible. Reserve at least 8 percent clear backdrop above the highest hair or accessory. Frame only head, shoulders and upper chest; end below the shoulders and never show waist, arms or hands. Preserve an existing camera-facing pose.",
         glasses_pos,
-        "Avoid beauty retouching, waxy skin, painted hair and exaggerated eyes."
+        "Avoid beauty retouching, airbrushed or porcelain skin, facial symmetry correction, CGI appearance, waxy skin, painted hair and exaggerated eyes."
     ]
 
     base_prompt = " ".join(p.strip() for p in parts if p and p.strip())
@@ -1397,7 +1424,7 @@ def process_single_enhance(
     upscale_factor: int,
     qwen_prompt: str,
     progress=None,
-    qwen_steps: int = 8,
+    qwen_steps: int = 20,
 ):
     """Processes one uploaded photo with Indian passport dimensions."""
     progress = _as_progress(progress)
@@ -1469,28 +1496,48 @@ def process_single_enhance(
                 frame_bg_bgr = (int(raw_hex[4:6], 16), int(raw_hex[2:4], 16), int(raw_hex[0:2], 16))
             except (TypeError, ValueError):
                 frame_bg_bgr = (255, 255, 255)
-            # Use Qwen's semantic studio-colour guidance. Exact post-generation
-            # recolouring cut into pale hair and light clothing, so the Qwen
-            # result remains the single source of subject and backdrop pixels.
-            # UI labels such as 'Light Blue' contradict the saturated preset.
-            # Describe the selected value, not an older display label.
-            bg_names = {
-                "#047EF6": "vivid blue",
-                "#FFFFFF": "pure white",
-                "#F2F2F2": "light neutral gray",
-                "#20242B": "dark charcoal",
-            }
-            bg_desc = f"{bg_names.get(selected_hex.upper(), 'custom color')} {selected_hex}"
+            # Keep backdrop colour out of Qwen's portrait conditioning. Strong
+            # colours can spill into pale clothing, skin highlights and hair.
+            # Qwen creates one clean white-background portrait; the selected
+            # hex is applied afterward only to the connected backdrop.
+            qwen_bg_desc = "neutral middle gray #808080"
             progress(0.10, desc="Analyzing portrait framing and clothing details...")
             from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
             vl_brief = uniform_vl_analyzer.analyze_portrait(image)
+            try:
+                from pipelines.schp_service import parse as parse_body_parts
+                from pipelines.uniform_composite import measure_source_person_colors
+                source_labels = parse_body_parts(np.array(image.convert("RGB")))["labels"]
+                measured_colors = measure_source_person_colors(image, source_labels)
+                vl_brief["measured_skin_rgb"] = measured_colors.get("skin_rgb")
+                vl_brief["measured_hair_rgb"] = measured_colors.get("hair_rgb")
+            except Exception as color_error:
+                logger.warning("[QWEN_ENHANCE] Source color measurement unavailable: %s", color_error)
+            source_gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+            source_h, source_w = source_gray.shape[:2]
+            face_detail_region = source_gray[
+                int(source_h * 0.08):int(source_h * 0.62),
+                int(source_w * 0.18):int(source_w * 0.82),
+            ]
+            vl_brief["source_min_dimension"] = min(source_w, source_h)
+            vl_brief["source_face_detail_score"] = float(
+                cv2.Laplacian(face_detail_region, cv2.CV_64F).var()
+            ) if face_detail_region.size else 0.0
+            from pipelines.qwen_edit_pipeline import _select_enhancement_steps
+            generation_steps, step_reasons = _select_enhancement_steps(vl_brief, qwen_steps)
             logger.info(
-                "[QWEN_ENHANCE] VL decision source=%s sunlight=%s head-hotspot=%s crown=%s hair-risk=%s",
+                "[QWEN_ENHANCE] VL decision source=%s sunlight=%s head-hotspot=%s crown=%s hair-risk=%s steps=%d reasons=%s",
                 vl_brief.get("source"),
                 bool(vl_brief.get("direct_sunlight_present", False)),
                 bool(vl_brief.get("head_hair_hotspot_present", False)),
                 bool(vl_brief.get("crown_near_top_edge", False)),
                 vl_brief.get("hair_edge_risk"),
+                generation_steps,
+                ", ".join(step_reasons),
+            )
+            progress(
+                0.12,
+                desc=f"Selected {generation_steps} restoration steps for this portrait...",
             )
             direct_sunlight_confirmed = str(
                 vl_brief.get("direct_sunlight_present", "")
@@ -1501,7 +1548,7 @@ def process_single_enhance(
             # the source edge; passport framing handles the final layout.
             qwen_source = image.convert("RGB")
             if bool(vl_brief.get("crown_near_top_edge", False)):
-                source_rgb = tuple(reversed(frame_bg_bgr))
+                source_rgb = (255, 255, 255)
                 pad_side = max(4, int(image.width * 0.015))
                 pad_top = max(28, int(image.height * 0.12))
                 padded = Image.new(
@@ -1509,7 +1556,7 @@ def process_single_enhance(
                 )
                 padded.paste(qwen_source, (pad_side, pad_top))
                 qwen_source = padded
-            prompt = build_dynamic_identity_prompt(image, bg_desc, qwen_prompt, vl_brief)
+            prompt = build_dynamic_identity_prompt(image, qwen_bg_desc, qwen_prompt, vl_brief)
             logger.info("[QWEN_ENHANCE] Restoration prompt: %s", prompt)
 
             _, glasses_negative = _glasses_prompt_bits(image)
@@ -1526,23 +1573,22 @@ def process_single_enhance(
                     "extra person, second face, extra hands, object, decoration, pattern, scenery, "
                     "altered identity, altered hair, bleached hair, recolored hair, altered clothing, cropped hair crown, text, watermark, "
                     "blur, plastic skin, distorted face, enlarged eyes, head turn, changed pose, body rotation, "
+                    "airbrushed skin, porcelain skin, beauty filter, perfectly symmetrical face, CGI portrait, doll-like face, idealized hairstyle, "
                     "different camera angle, changed gaze, changed expression, recentered subject, missing jewelry, "
                     "altered jewelry, duplicated jewelry, " + glasses_negative
                 ),
-                background_color=bg_desc,
+                background_color=qwen_bg_desc,
                 # Base 2511 uses true CFG; the distilled four-step adapter
                 # needs its separate low-guidance configuration.
-                true_cfg_scale=1.02 if int(qwen_steps) <= 4 else 4.0,
-                # Eight steps is the production enhancement balance; Uniform
-                # Swap keeps its separate twenty-step fidelity setting.
-                steps=max(1, int(qwen_steps)),
+                true_cfg_scale=1.02 if generation_steps <= 4 else 2.0,
+                steps=generation_steps,
                 # Do not use a separate AI upscaler in this route.
                 upscale_factor=1,
                 # Qwen needs a sufficiently large latent canvas to reconstruct
                 # fine hair, facial detail, and fabric from small phone photos.
                 # This is not a post-generation upscaler.
-                max_generation_dimension=704,
-                minimum_generation_dimension=704,
+                max_generation_dimension=640,
+                minimum_generation_dimension=640,
                 keep_generation_resolution=True,
                 # A second Qwen face pass re-generated the face instead of
                 # restoring it, so the full-portrait edit remains the only
@@ -1569,9 +1615,9 @@ def process_single_enhance(
             raw_candidate_path = getattr(qwen_service, "last_qwen_candidate_path", None)
             if qwen_accepted and raw_candidate_path and Path(raw_candidate_path).is_file():
                 candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
-                # Retain Qwen's own backdrop for the comparison image. A
-                # second colour-only pass cannot safely distinguish pale blue
-                # studio backdrop from the generated garment or hair shine.
+                candidate_pil = qwen_service._replace_smooth_border_background(
+                    candidate_pil, selected_hex
+                )
                 if passport_format and passport_format != "Original Dimensions (Enhanced)":
                     candidate_bgr = cv2.cvtColor(np.array(candidate_pil), cv2.COLOR_RGB2BGR)
                     candidate_pil = Image.fromarray(cv2.cvtColor(
@@ -1596,6 +1642,13 @@ def process_single_enhance(
             if qwen_accepted:
                 progress(0.93, desc="Finalizing the Qwen studio portrait...")
                 qwen_pil = Image.open(str(res_path)).convert("RGB")
+                qwen_pil = qwen_service._replace_smooth_border_background(
+                    qwen_pil, selected_hex
+                )
+                if not qwen_service._has_selected_solid_background(qwen_pil, selected_hex):
+                    qwen_pil = apply_selected_background_matte(
+                        qwen_pil, tuple(reversed(frame_bg_bgr))
+                    )
                 # Source sunlight does not prove that the generated portrait
                 # still has glare. Applying the source flag here darkened normal
                 # facial midtones and flattened hair after Qwen's lighting edit.
@@ -1612,11 +1665,32 @@ def process_single_enhance(
                 candidate_path = None
             else:
                 logger.warning("[QWEN_ENHANCE] Rejected Qwen candidate; using source-preserving fallback.")
-                # Keep the complete Qwen image available for the explicit UI
-                # comparison. It is not auto-selected, but the user can judge
-                # the full generation beside the original source photo.
+                # Keep the Qwen generation available as an explicit user
+                # choice. Frame this copy exactly like the final passport
+                # export so the preview and downloaded candidate are the same
+                # image rather than an uncropped diagnostic file.
                 if raw_candidate_path and Path(raw_candidate_path).is_file():
-                    candidate_path = Path(raw_candidate_path)
+                    candidate_pil = Image.open(str(raw_candidate_path)).convert("RGB")
+                    candidate_pil = qwen_service._replace_smooth_border_background(
+                        candidate_pil, selected_hex
+                    )
+                    if passport_format and passport_format != "Original Dimensions (Enhanced)":
+                        candidate_bgr = cv2.cvtColor(np.array(candidate_pil), cv2.COLOR_RGB2BGR)
+                        candidate_pil = Image.fromarray(cv2.cvtColor(
+                            photo_restorer.frame_passport_photo(
+                                candidate_bgr,
+                                target_format=passport_format,
+                                bg_color_bgr=frame_bg_bgr,
+                                headroom_ratio=0.26,
+                                head_height_ratio=0.56,
+                            ),
+                            cv2.COLOR_BGR2RGB,
+                        ))
+                    candidate_path = _save_matching_input(
+                        candidate_pil,
+                        OUTPUTS_DIR / f"qwen_candidate_{Path(res_path).stem}.png",
+                        fallback="qwen_candidate.png",
+                    )
                 # The model changed protected hair/identity evidence. Keep the
                 # uploaded subject pixels intact; deterministic relighting here
                 # also distorted skin and hair in the fallback export.

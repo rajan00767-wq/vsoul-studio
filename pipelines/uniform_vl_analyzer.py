@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import re
 import subprocess
@@ -21,6 +22,37 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 MODEL_DIR = Path("models/qwen2.5-vl-3b-instruct")
+# Bump whenever the visual-analysis prompts or normalization rules change.
+# Cached observations are generation inputs, so retaining an old "vest" or
+# "bow" interpretation after a prompt correction silently recreates the same
+# incorrect Qwen edit for identical uploads.
+VL_CACHE_VERSION = "content-v3"
+
+
+def _analysis_cache_path(kind: str, *images: Image.Image) -> Path:
+    """Return a stable cache path for analysis of identical image pixels."""
+    digest = hashlib.sha256(f"{VL_CACHE_VERSION}:{kind}".encode("ascii"))
+    for image in images:
+        rgb = image.convert("RGB")
+        digest.update(f"{rgb.width}x{rgb.height}".encode("ascii"))
+        digest.update(rgb.tobytes())
+    cache_dir = Path("scratch/cache/vl_analysis")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{kind}_{digest.hexdigest()[:24]}.json"
+
+
+def _read_analysis_cache(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_analysis_cache(path: Path, value: Dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 def clean_and_repair_json(text: str) -> Dict[str, Any]:
@@ -283,6 +315,8 @@ Uniform Blueprint (Image 2):
 Key garment guidelines:
 - Distinguish a standing band collar (mandarin collar) from a turtleneck: a standing band collar sits at the base of the neck with an open neck hole.
 - Distinguish a V-neck outer garment (e.g. V-neck vest) from a high collar: if the outer layer plunges or opens in front to expose the shirt, outer_neckline is "V-neck" or "open vest".
+- Distinguish a sleeveless vest from a blazer/jacket: a blazer has a separate front opening and folded lapels that frame the shirt; report "blazer with lapels" whenever those folded panels are visible. Do not call a blazer a vest merely because its sleeves are cropped or hidden.
+- Treat flower-shaped clips, bows, ribbons and hair ties as distinct accessories. Describe their visible shape and side exactly; never substitute one for another.
 Return JSON ONLY with keys: garment_components, shirt_collar, outer_neckline, shirt_color_and_pattern, outer_garment_color_and_shape, outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence, sleeve_length, button_layout, badge_present, badge_location, badge_bbox, hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_accessories, hair_accessory_details, visible_wearables.
 Do not describe or identify the person."""
 
@@ -436,13 +470,20 @@ Use concise generic descriptions. Do not identify the person."""
         }
         if not MODEL_DIR.is_dir():
             return result
+        analysis_cache = _analysis_cache_path("portrait", image)
+        cached = _read_analysis_cache(analysis_cache)
+        if cached is not None:
+            logger.info("[PortraitVL] Analysis cache hit: %s", analysis_cache.name)
+            return cached
         cache_dir = Path("scratch/cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
         image_path = cache_dir / f"portrait_vl_{stamp}.png"
         worker_path = cache_dir / f"portrait_vl_{stamp}.py"
         try:
-            image.convert("RGB").save(image_path)
+            inspection = image.convert("RGB")
+            inspection.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            inspection.save(image_path)
             worker_code = f'''import gc
 import json
 import torch
@@ -453,6 +494,7 @@ from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditi
 model_dir = Path({str(MODEL_DIR.resolve())!r})
 image_path = Path({str(image_path.resolve())!r})
 prompt = {self._PORTRAIT_PROMPT!r}
+hair_prompt = {self._HAIR_RETRY_PROMPT!r}
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
 processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
@@ -468,8 +510,19 @@ inputs = processor(text=[text], images=[portrait], padding=True, return_tensors=
 with torch.inference_mode():
     generated = model.generate(**inputs, max_new_tokens=384, do_sample=False)
 response = processor.batch_decode(generated[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
-print(response)
-del generated, inputs, portrait, model, processor
+head_crop = portrait.crop((0, 0, portrait.width, max(1, int(portrait.height * 0.72))))
+hair_messages = [{{"role": "user", "content": [{{"type": "image", "image": head_crop}}, {{"type": "text", "text": hair_prompt}}]}}]
+hair_text = processor.apply_chat_template(hair_messages, tokenize=False, add_generation_prompt=True)
+hair_inputs = processor(text=[hair_text], images=[head_crop], padding=True, return_tensors="pt").to(model.device)
+with torch.inference_mode():
+    hair_generated = model.generate(**hair_inputs, max_new_tokens=256, do_sample=False)
+hair_response = processor.batch_decode(
+    hair_generated[:, hair_inputs.input_ids.shape[1]:], skip_special_tokens=True
+)[0].strip()
+print("---PORTRAIT_ANALYSIS_START---")
+print(json.dumps({{"portrait_raw": response, "hair_raw": hair_response}}))
+print("---PORTRAIT_ANALYSIS_END---")
+del generated, hair_generated, inputs, hair_inputs, portrait, head_crop, model, processor
 gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
@@ -479,14 +532,32 @@ if torch.cuda.is_available():
                 [sys.executable, str(worker_path)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr[-1200:] or "Qwen VL worker failed")
             response = completed.stdout.strip()
-            parsed = flatten_vl_dict(clean_and_repair_json(response))
+            match = re.search(
+                r"---PORTRAIT_ANALYSIS_START---\s*(\{.*?\})\s*---PORTRAIT_ANALYSIS_END---",
+                response,
+                flags=re.DOTALL,
+            )
+            combined = json.loads(match.group(1)) if match else {"portrait_raw": response}
+            parsed = flatten_vl_dict(clean_and_repair_json(combined.get("portrait_raw", "")))
             if isinstance(parsed, dict):
                 result.update(parsed)
+                hair_parsed = flatten_vl_dict(clean_and_repair_json(combined.get("hair_raw", "")))
+                if isinstance(hair_parsed, dict):
+                    for key in (
+                        "hair_style", "hair_parting", "hair_length", "hair_texture",
+                        "hair_color", "hair_accessories", "hair_accessory_details",
+                    ):
+                        value = hair_parsed.get(key)
+                        if value not in (None, "", "unknown", "uncertain"):
+                            result[key] = value
+                    result["hair_observations_raw"] = hair_parsed
                 for key in (
                     "crown_near_top_edge",
                     "direct_sunlight_present",
@@ -508,6 +579,7 @@ if torch.cuda.is_available():
                     str(result.get("clothing_description", "source clothing"))[:80],
                     result.get("skin_tone"),
                 )
+                _write_analysis_cache(analysis_cache, result)
         except Exception as exc:
             logger.warning("[PortraitVL] Analysis fallback: %s", exc)
         finally:
@@ -565,6 +637,11 @@ if torch.cuda.is_available():
         result = self.fallback(person, template)
         if not MODEL_DIR.is_dir():
             return result
+        analysis_cache = _analysis_cache_path("uniform", person, template)
+        cached = _read_analysis_cache(analysis_cache)
+        if cached is not None:
+            logger.info("[UniformVL] Analysis cache hit: %s", analysis_cache.name)
+            return cached
 
         cache_dir = Path("scratch/cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -573,8 +650,12 @@ if torch.cuda.is_available():
         template_path = cache_dir / f"uniform_t_{stamp}.png"
         worker_path = cache_dir / f"uniform_vl_{stamp}.py"
         try:
-            person.convert("RGB").save(person_path)
-            template.convert("RGB").save(template_path)
+            person_inspection = person.convert("RGB")
+            person_inspection.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            person_inspection.save(person_path)
+            template_inspection = template.convert("RGB")
+            template_inspection.thumbnail((640, 640), Image.Resampling.LANCZOS)
+            template_inspection.save(template_path)
             p_prompt = (
                 "Inspect this portrait only. Return JSON with keys: hair_style, hair_parting, hair_length, hair_texture, "
                 "hair_color, hair_accessories, hair_accessory_details, visible_wearables, clothing_description, "
@@ -612,10 +693,10 @@ if torch.cuda.is_available():
                 "- Describe collar ends and whether folded triangular points are actually present. Do not invent points, piping or trim.\n"
                 "- Separate the light base cloth from colored grid threads; specify their contrast and spacing relative to a button.\n"
                 "- fabric_detail describes visible weave and surface finish for each layer. Inspect dark fabric for fine grain before calling it smooth. Use uncertain if unresolved.\n"
-                "- construction_detail must describe the actual left and right front edges, angled or curved panel shapes, seam lines, topstitching and overlapping layers. A V-neck description alone is insufficient. Distinguish stitched panel edges from printed stripes and shadows. Do not invent lapels when only seams are visible.\n"
+                "- construction_detail must describe the actual left and right front edges, angled or curved panel shapes, seam lines, topstitching and overlapping layers. A V-neck description alone is insufficient. Distinguish stitched panel edges from printed stripes and shadows. Report a blazer or jacket with folded lapels when those folded triangular panels frame the shirt; do not downgrade it to a vest because sleeves are cropped or hidden.\n"
                 "- button_layout and button_color describe each visible layer separately: position, visible count, color and round/other shape. Do not infer hidden buttons below the crop.\n"
                 "- Before returning JSON, cross-check collar, cloth ground versus grid color, outer texture and panel edges against the image. Replace unsupported claims with uncertain. Use concise string values for descriptions, not generic uniform recommendations.\n"
-                "- Distinguish a V-neck outer vest from a high collar.\n"
+                "- Distinguish a V-neck outer vest from a blazer with lapels: a vest has no folded jacket panels framing the shirt.\n"
                 "- badge_present: true if an emblem, crest, logo patch, or school badge is visible.\n"
                 "- badge_bbox: [ymin, xmin, ymax, xmax] or [xmin, ymin, xmax, ymax] coordinates on this image, or null if no badge.\n"
                 "Return JSON only:"
@@ -623,7 +704,8 @@ if torch.cuda.is_available():
             h_prompt = (
                 "Inspect this enlarged head crop only. Return JSON with keys: hair_style, hair_parting, hair_length, "
                 "hair_texture, hair_color, hair_accessories, hair_accessory_details. Count every "
-                "distinct flower, bow, ribbon, clip, band or tie. Inspect the left and right sides separately and "
+                "distinct flower, bow, ribbon, clip, band or tie. Flowers have visible petal shapes; bows have looped fabric. "
+                "Do not call loose curls or decorative clips braids unless interwoven strands are visibly present. Inspect the left and right sides separately and "
                 "state each accessory's side, color, shape and count. Describe base hair pigment from shaded strands; "
                 "do not call sunlight glare blonde, gray or silver. Do not infer gender. Return JSON only:"
             )
@@ -718,7 +800,7 @@ if torch.cuda.is_available():
                 if result["head_hair_hotspot_present"]:
                     result["direct_sunlight_present"] = True
                 for key in (
-                    "hair_parting", "hair_length", "hair_texture", "hair_color",
+                    "hair_style", "hair_parting", "hair_length", "hair_texture", "hair_color",
                     "hair_accessories", "hair_accessory_details",
                 ):
                     value = h_dict.get(key)
@@ -748,6 +830,8 @@ if torch.cuda.is_available():
                 result.get("badge_bbox"),
                 result.get("hair_accessories"),
             )
+            if result.get("source") == "qwen2.5-vl":
+                _write_analysis_cache(analysis_cache, result)
         except Exception as exc:
             logger.warning("[UniformVL] Primary subprocess analysis failed: %s; using geometry fallback", exc)
         finally:
@@ -766,6 +850,11 @@ if torch.cuda.is_available():
         result.update({"collar_anchor_ratio": 0.96, "uniform_scale": 1.0, "fit_confidence": "limited"})
         if not MODEL_DIR.is_dir():
             return result
+        analysis_cache = _analysis_cache_path("board", board)
+        cached = _read_analysis_cache(analysis_cache)
+        if cached is not None:
+            logger.info("[UniformVL] Board-analysis cache hit: %s", analysis_cache.name)
+            return cached
 
         cache_dir = Path("scratch/cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -773,7 +862,9 @@ if torch.cuda.is_available():
         board_path = cache_dir / f"board_vl_{stamp}.png"
         worker_path = cache_dir / f"board_vl_{stamp}.py"
         try:
-            board.convert("RGB").save(board_path)
+            inspection = board.convert("RGB")
+            inspection.thumbnail((640, 640), Image.Resampling.LANCZOS)
+            inspection.save(board_path)
             worker_code = f'''import gc
 import json
 import torch
@@ -820,6 +911,7 @@ if torch.cuda.is_available():
                 if isinstance(parsed, dict):
                     result.update(parsed)
                     result["source"] = "qwen2.5-vl-board"
+                    _write_analysis_cache(analysis_cache, result)
         except Exception as exc:
             logger.warning("[UniformVL] Board analysis fallback: %s", exc)
         finally:
