@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List
 
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, BackgroundTasks, Request
+from utils.job_eta import estimate_job_time
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -386,6 +387,11 @@ async def bulk_status(ids: str):
             results.append({
                 "job_id": jid, "status": job.get("status"), "progress": job.get("progress"),
                 "message": job.get("message"), "output_path": job.get("output_path"),
+                **estimate_job_time(
+                    job,
+                    await loop.run_in_executor(None, _js.queue_position, jid)
+                    if job.get("status") == "queued" else 0,
+                ),
             })
     done = sum(1 for r in results if r["status"] in ("done", "failed", "timeout", "not_found"))
     return {"total": len(results), "done": done, "jobs": results}
@@ -405,6 +411,8 @@ async def get_job_status(job_id: str):
         job["queue_position"] = await loop.run_in_executor(None, _js.queue_position, job_id)
     else:
         job["queue_position"] = 0
+
+    job.update(estimate_job_time(job, job["queue_position"]))
 
     # Strip internal keys
     return {k: v for k, v in job.items() if not k.startswith("_")}

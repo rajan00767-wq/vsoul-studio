@@ -490,33 +490,129 @@ class BackgroundRemovalService:
             except Exception as exc:
                 logger.warning("SCHP fusion unavailable; retaining BiRefNet matte: %s", exc)
 
+        # Keep the network probability map as an independent safety signal.
+        # SCHP and scene-colour cleanup are useful for rejecting foliage, but
+        # neither is allowed to erase pixels that BiRefNet identified as the
+        # subject with high confidence (most importantly highlighted hair,
+        # curls, flowers, clips, and earrings).
+        raw_alpha_u8 = (np.clip(mask_r, 0.0, 1.0) * 255).astype(np.uint8)
         alpha_u8 = (alpha * 255).clip(0, 255).astype(np.uint8)
         alpha_u8 = _clean_alpha(alpha_u8)
         local_bg = _local_background(img_arr, alpha_u8)
         alpha_u8 = _trim_background_alpha(img_arr, alpha_u8, local_bg)
         alpha_u8 = _remove_schp_background_intrusions(img_arr, alpha_u8, schp_labels)
         if source_labels is not None:
-            # Qwen can repaint background foliage as a foreground-colored edge.
-            # Remove that green only when the corresponding original pixel was
-            # not apparel, so real green uniforms keep their source color.
-            rgb = img_arr.astype(np.int16)
-            generated_green = (
-                (rgb[:, :, 1] > rgb[:, :, 0] + 4)
-                & (rgb[:, :, 1] > rgb[:, :, 2] + 4)
-            )
-            source_apparel = np.isin(source_labels, [5, 6, 7, 10, 11, 12])
-            alpha_u8[generated_green & ~source_apparel] = 0
-            source_rgb = source_arr.astype(np.int16)
-            source_green = (
-                (source_rgb[:, :, 1] > source_rgb[:, :, 0] + 4)
-                & (source_rgb[:, :, 1] > source_rgb[:, :, 2] + 4)
-            )
-            # Faint green contamination can be labelled as clothing by the
-            # generated-image parser. Remove it only in the soft outside edge
-            # when the matching source pixel was not green fabric.
-            # When the source is not green at this point, any green repaint is
-            # a background leak, even if the generated matte marked it opaque.
-            alpha_u8[generated_green & ~source_green] = 0
+            # Learn the actual source-scene palette from pixels independently
+            # classified as background in the uploaded portrait. This removes
+            # brick, foliage, walls and other scenery that BiRefNet can retain
+            # inside curls without hard-coding a colour. A pixel is cleared
+            # only when it is close to that learned palette *and* the generated
+            # parser calls it background (or the matte is already weak), so a
+            # similarly coloured uniform, hair accessory or earring is kept.
+            source_background = source_labels == 0
+            source_bg_pixels = source_arr[source_background]
+            if source_bg_pixels.shape[0] >= 64:
+                # Deterministic quantized palette is cheaper and more stable
+                # than k-means while retaining every frequent scene colour.
+                quantized = (source_bg_pixels // 24) * 24 + 12
+                packed = (
+                    quantized[:, 0].astype(np.int32) << 16
+                    | quantized[:, 1].astype(np.int32) << 8
+                    | quantized[:, 2].astype(np.int32)
+                )
+                values, counts = np.unique(packed, return_counts=True)
+                palette_size = min(32, len(values))
+                palette_values = values[np.argsort(counts)[-palette_size:]]
+                palette_rgb = np.stack((
+                    (palette_values >> 16) & 255,
+                    (palette_values >> 8) & 255,
+                    palette_values & 255,
+                ), axis=1).astype(np.uint8)
+                palette_lab = cv2.cvtColor(
+                    palette_rgb.reshape(1, -1, 3), cv2.COLOR_RGB2LAB,
+                ).reshape(-1, 3).astype(np.float32)
+                generated_lab = cv2.cvtColor(
+                    img_arr, cv2.COLOR_RGB2LAB,
+                ).astype(np.float32)
+                palette_distance = np.min(
+                    np.linalg.norm(
+                        generated_lab[:, :, None, :] - palette_lab[None, None, :, :],
+                        axis=3,
+                    ),
+                    axis=2,
+                )
+                generated_parser_background = (
+                    (schp_labels == 0)
+                    if schp_labels is not None
+                    else np.zeros(alpha_u8.shape, dtype=bool)
+                )
+                aligned_with_source = bool(
+                    np.mean(np.abs(
+                        img_arr.astype(np.int16) - source_arr.astype(np.int16)
+                    )) < 2.0
+                )
+                if aligned_with_source:
+                    # For the pre-Qwen source canvas the coordinates match
+                    # exactly, so the source-background label is stronger than
+                    # BiRefNet at brick/leaf islands inside curls. Protect a
+                    # central face/neck corridor because LIP can label exposed
+                    # neck skin as background on low-resolution portraits.
+                    protected_face_neck = np.zeros(alpha_u8.shape, dtype=bool)
+                    face_y, face_x = np.where(source_labels == 13)
+                    if face_y.size:
+                        fx1, fx2 = int(face_x.min()), int(face_x.max())
+                        fy1, fy2 = int(face_y.min()), int(face_y.max())
+                        fw = max(1, fx2 - fx1 + 1)
+                        fh = max(1, fy2 - fy1 + 1)
+                        px1 = max(0, int(round(fx1 - fw * .16)))
+                        px2 = min(alpha_u8.shape[1], int(round(fx2 + fw * .16)) + 1)
+                        py1 = max(0, int(round(fy1 - fh * .08)))
+                        py2 = min(alpha_u8.shape[0], int(round(fy2 + fh * .46)) + 1)
+                        protected_face_neck[py1:py2, px1:px2] = True
+                    learned_scene_leak = (
+                        (palette_distance <= 20.0)
+                        & source_background
+                        & ~protected_face_neck
+                    )
+                else:
+                    learned_scene_leak = (
+                        (palette_distance <= 20.0)
+                        # Require both independent signals on a regenerated
+                        # portrait whose geometry may differ from the upload.
+                        & generated_parser_background
+                        & (alpha_u8 < 220)
+                    )
+                removed_scene_pixels = int(np.count_nonzero(learned_scene_leak))
+                if removed_scene_pixels:
+                    alpha_u8[learned_scene_leak] = 0
+                    logger.info(
+                        "[MASK_SOURCE_PALETTE] Removed %d source-scene pixels using %d dynamic colours",
+                        removed_scene_pixels, palette_size,
+                    )
+            # Do not colour-key green (or any other hue) here. The previous
+            # rule deleted valid dark/highlighted hair and accessories whenever
+            # their RGB happened to resemble the source scenery. Background
+            # rejection above already requires parser + learned-palette/matte
+            # evidence and therefore remains image-independent.
+
+        # Protect only BiRefNet's high-confidence subject core. Using the whole
+        # raw probability map as an alpha floor also preserves foliage/bokeh
+        # that the network weakly associates with curls. The soft edge continues
+        # to come from the refined matte, while confident hair/accessories cannot
+        # be punched out by parser or palette cleanup.
+        if schp_labels is not None:
+            human_mask = np.isin(schp_labels, [1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]).astype(np.uint8)
+            human_zone = cv2.dilate(
+                human_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            ).astype(bool)
+            raw_subject_core = (raw_alpha_u8 >= 184) & human_zone
+        else:
+            raw_subject_core = raw_alpha_u8 >= 184
+        if 'learned_scene_leak' in locals() and learned_scene_leak is not None:
+            raw_subject_core = raw_subject_core & ~learned_scene_leak
+        alpha_u8[raw_subject_core] = np.maximum(
+            alpha_u8[raw_subject_core], raw_alpha_u8[raw_subject_core]
+        )
         alpha_u8 = _clean_alpha(alpha_u8)
 
         alpha_img = Image.fromarray(alpha_u8, 'L')
@@ -542,11 +638,8 @@ class BackgroundRemovalService:
             rgba.save(str(_ddir / "debug_foreground_rgba.png"))
 
         if job_id:
-            raw_mask_img.save(str(_ddir / "raw_mask.png"))
             raw_mask_img.save(str(_ddir / f"{job_id}_raw_mask.png"))
-            alpha_img.save(str(_ddir / "alpha_matte.png"))
             alpha_img.save(str(_ddir / f"{job_id}_alpha_matte.png"))
-            rgba.save(str(_ddir / "foreground_rgba.png"))
             rgba.save(str(_ddir / f"{job_id}_foreground_rgba.png"))
 
         out = io.BytesIO()

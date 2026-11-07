@@ -185,7 +185,7 @@ class GUSUQPipeline:
         prompt: str,
         negative_prompt: str = "blurry, low quality, distorted, artifacts, bad anatomy, deformed",
         background_color: str = "white",
-        true_cfg_scale: float = 1.0,
+        true_cfg_scale: float = 1.2,
         steps: int = 4,
         upscale_factor: int = 1,
         use_birefnet_background: bool = True,
@@ -195,6 +195,12 @@ class GUSUQPipeline:
         keep_generation_resolution: bool = False,
         face_detail_refine: bool = False,
         seed: int = 42,
+        max_sequence_length: int = 256,
+        reference_images: Optional[list[Image.Image]] = None,
+        preserve_reference_aspect: bool = False,
+        return_raw_candidate: bool = False,
+        conditioning_max_dimension: int = 256,
+        conditioning_pixel_budget: Optional[int] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> Path:
         """
@@ -223,8 +229,14 @@ class GUSUQPipeline:
             height=h,
             steps=steps,
             upscale_factor=max(1, min(int(upscale_factor or 1), 4)),
-            true_cfg_scale=true_cfg_scale,
+            true_cfg_scale=max(1.0, min(1.5, float(true_cfg_scale if true_cfg_scale is not None else 1.2))),
+            max_sequence_length=max_sequence_length,
+            reference_images=reference_images,
+            preserve_reference_aspect=preserve_reference_aspect,
             face_detail_refine=face_detail_refine,
+            return_raw_candidate=return_raw_candidate,
+            conditioning_max_dimension=conditioning_max_dimension,
+            conditioning_pixel_budget=conditioning_pixel_budget,
             progress_callback=adapter_progress,
         )
 

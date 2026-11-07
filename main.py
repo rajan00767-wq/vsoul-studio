@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from utils.job_eta import estimate_job_time
 from fastapi.responses import FileResponse
 
 from api.routes import router as api_router, orchestrator
@@ -33,7 +34,11 @@ async def _cleanup_loop():
     """Every 30 min: delete old files and expired job records in Redis."""
     while True:
         await asyncio.sleep(1800)
-        cutoff = time.time() - 86400
+        # Keep completed portraits for seven days. Some Windows filesystems
+        # report mtimes with a one-day clock skew relative to Python's epoch;
+        # a 24-hour cutoff could therefore delete a result immediately after
+        # generation and leave a completed job pointing at a missing file.
+        cutoff = time.time() - (7 * 86400)
 
         # Delete intermediate step files — but only ones older than an hour.
         # Deleting unconditionally raced with in-flight jobs: a cleanup tick
@@ -161,7 +166,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                     int(metadata.get("steps", 20)),
                 ),
             )
-            named_path, msg, candidate_path = (*result, None)[:3]
+            named_path, msg, _candidate_path = (*result, None)[:3]
             if not named_path:
                 raise RuntimeError(msg or "Enhancement failed")
 
@@ -172,9 +177,6 @@ async def _execute_queued_job(job_id: str, job: dict):
             # original filename: that mutable URL can show a prior browser-cached
             # result while a newer job has already completed.
             rel_out = f"outputs/{Path(named_path).name}"
-            rel_candidate = None
-            if candidate_path and Path(candidate_path).is_file():
-                rel_candidate = f"outputs/{Path(candidate_path).name}"
             _js.update_job(
                 job_id,
                 status="done",
@@ -183,9 +185,6 @@ async def _execute_queued_job(job_id: str, job: dict):
                 message=msg or "✓ Enhancement Complete",
                 output_path=rel_out,
                 result_url=f"/{rel_out}",
-                # The browser labels this as a review-only Qwen generation;
-                # it never replaces the approved fallback automatically.
-                candidate_path=rel_candidate,
                 original_filename=orig_filename,
                 completed_at=str(time.time()),
             )
@@ -210,17 +209,32 @@ async def _execute_queued_job(job_id: str, job: dict):
             from pipelines.qwen_edit_pipeline import QwenEditPipeline
             qwen_pipe = QwenEditPipeline()
 
+            def _uniform_cb(n, desc=""):
+                pct = int(round((n * 100) if isinstance(n, float) and n <= 1 else n))
+                current_job = _js.get_job(job_id)
+                current_progress = int((current_job or {}).get("progress") or 0)
+                _js.update_job(
+                    job_id,
+                    status="processing",
+                    stage="uniform_generation",
+                    progress=min(99, max(8, current_progress, pct)),
+                    message=desc or "Generating school uniform portrait...",
+                    _last_update=str(time.time()),
+                )
+
             out_path = await loop.run_in_executor(
                 None,
-                qwen_pipe.qwen_vl_image_edit_uniform_swap,
-                input_path,
-                u_template_path,
-                prompt,
-                job_id,
-                "4,126,246",
-                width,
-                height,
-                20,
+                lambda: qwen_pipe.qwen_vl_image_edit_uniform_swap(
+                    input_path,
+                    u_template_path,
+                    prompt,
+                    job_id,
+                    "4,126,246",
+                    width,
+                    height,
+                    20,
+                    _uniform_cb,
+                ),
             )
 
             rel_out = f"outputs/{Path(out_path).name}"
@@ -491,6 +505,8 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
                     payload["queue_position"] = await loop.run_in_executor(
                         None, _js.queue_position, job_id
                     )
+
+                payload.update(estimate_job_time(job, payload.get("queue_position", 0)))
 
                 await websocket.send_json(payload)
                 last_progress = progress

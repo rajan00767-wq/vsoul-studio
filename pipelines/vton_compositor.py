@@ -409,12 +409,12 @@ class VTONCompositor:
         # Trim top/bottom background margins
         bg_arr = np.array(bg_color[:3], dtype=np.int32)
         diff = np.abs(img_arr.astype(np.int32) - bg_arr).max(axis=2)
-        non_bg = np.where(diff > 18)
+        non_bg = np.where(diff > 32)
         if len(non_bg[0]) > 0:
-            top_c = max(0, non_bg[0].min() - 10)
-            bot_c = min(h, non_bg[0].max() + 20)
-            left_c = max(0, non_bg[1].min() - 10)
-            right_c = min(w, non_bg[1].max() + 10)
+            top_c = max(0, non_bg[0].min() - 16)
+            bot_c = min(h, non_bg[0].max() + 16)
+            left_c = max(0, non_bg[1].min() - 14)
+            right_c = min(w, non_bg[1].max() + 14)
             cropped = image.crop((left_c, top_c, right_c, bot_c))
         else:
             cropped = image

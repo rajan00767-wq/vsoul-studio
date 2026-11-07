@@ -216,7 +216,7 @@ def _extract_clothing_mask(
         cloth[np.isin(u_labels, CLOTH_LABELS)] = 255
         cloth[np.isin(u_labels, TEMPLATE_IDENTITY)] = 0
         cloth = np.minimum(cloth, keep_bg)
-    cloth = _dilate_u8(cloth, 3, 1)
+    cloth = _dilate_u8(cloth, 7, 2)
     return _fill_tiny_holes_keep_collar(cloth)
 
 
@@ -290,8 +290,10 @@ def _erase_original_outfit(
     r = rgb[:, :, 0].astype(np.int16)
     g = rgb[:, :, 1].astype(np.int16)
     b = rgb[:, :, 2].astype(np.int16)
-    # Catch leftover polo/collar colours SCHP may miss
-    reddish = (r > 110) & ((r - g) > 28) & ((r - b) > 20)
+    # Catch leftover polo/collar colours SCHP may miss.
+    # Exclude warm skin tones by requiring high saturation and checking HSV hue.
+    hsv_erase = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    reddish = (r > 110) & ((r - g) > 38) & ((r - b) > 30) & (hsv_erase[:, :, 1] > 90)
     clothes[reddish] = 255
     lock_y = int(np.clip(metrics["chin_y"] - metrics["face_h"] * 0.18, 0, h - 1))
     clothes[:lock_y] = 0
@@ -335,14 +337,7 @@ def _match_garment_light(garment_rgb: np.ndarray, ref_rgb: np.ndarray, ref_mask:
     return cv2.cvtColor(g.astype(np.uint8), cv2.COLOR_LAB2RGB)
 
 
-def _crop_rgba(rgb: np.ndarray, mask_u8: np.ndarray, pad: int = 6) -> Optional[np.ndarray]:
-    ys, xs = np.where(mask_u8 > 40)
-    if len(ys) == 0:
-        return None
-    h, w = mask_u8.shape[:2]
-    y0, y1 = max(0, int(ys.min()) - pad), min(h, int(ys.max()) + pad + 1)
-    x0, x1 = max(0, int(xs.min()) - pad), min(w, int(xs.max()) + pad + 1)
-    return np.dstack([rgb[y0:y1, x0:x1], mask_u8[y0:y1, x0:x1]])
+def _crop_rgba(rgb: np.ndarray, mask_u8: np.ndarray, pad: int = 16) -> Optional[np.ndarray]:
     ys, xs = np.where(mask_u8 > 40)
     if len(ys) == 0:
         return None
@@ -435,8 +430,8 @@ def _frame_studio_portrait(
     if len(ys) == 0:
         img = Image.fromarray(rgb)
         return img.resize(target_size, Image.LANCZOS)
-    y0, y1 = max(0, ys.min() - 8), min(rgb.shape[0], ys.max() + 16)
-    x0, x1 = max(0, xs.min() - 8), min(rgb.shape[1], xs.max() + 8)
+    y0, y1 = max(0, ys.min() - 14), min(rgb.shape[0], ys.max() + 14)
+    x0, x1 = max(0, xs.min() - 12), min(rgb.shape[1], xs.max() + 12)
     cropped = Image.fromarray(rgb[y0:y1, x0:x1])
     cw, ch = cropped.size
     scale = min(tw * 0.92 / max(cw, 1), th * 0.90 / max(ch, 1))

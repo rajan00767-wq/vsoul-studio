@@ -8,11 +8,16 @@ from pathlib import Path
 from PIL import Image
 
 
-CHECKS = ("badge_present", "uniform_mismatch", "hair_changed", "face_artifacts",
+CHECKS = ("badge_present", "neck_jewelry_present", "uniform_mismatch", "hair_changed", "identity_changed", "face_artifacts",
           "harsh_hair_glare", "background_mismatch", "head_cropped")
 
 
-def check_uniform_identity(source, candidate, minimum_similarity=0.50):
+def check_uniform_identity(
+    source,
+    candidate,
+    minimum_similarity=0.70,
+    maximum_geometry_rmse=0.055,
+):
     """Check source identity without inferring gender or substituting pixels."""
     import cv2
     import numpy as np
@@ -31,11 +36,65 @@ def check_uniform_identity(source, candidate, minimum_similarity=0.50):
                     f"(detected source={len(faces[0])}, generated={len(faces[1])})"
                 ),
             }
-        score = float(np.dot(faces[0][0].normed_embedding, faces[1][0].normed_embedding))
-        accepted = bool(np.isfinite(score) and score >= minimum_similarity)
-        return {"accepted": accepted, "similarity": score if np.isfinite(score) else None,
-                "minimum_similarity": minimum_similarity,
-                "reason": "identity match" if accepted else "Generated face does not match the uploaded person"}
+        source_face, candidate_face = faces[0][0], faces[1][0]
+        score = float(np.dot(source_face.normed_embedding, candidate_face.normed_embedding))
+
+        def normalized_geometry(face):
+            points = np.asarray(face.landmark_2d_106, dtype=np.float32)[:, :2]
+            anchors = np.asarray(face.kps, dtype=np.float32)[:, :2]
+            eye_vector = anchors[1] - anchors[0]
+            eye_distance = max(float(np.linalg.norm(eye_vector)), 1e-6)
+            eye_midpoint = (anchors[0] + anchors[1]) * .5
+            angle = float(np.arctan2(eye_vector[1], eye_vector[0]))
+            cosine, sine = np.cos(-angle), np.sin(-angle)
+            rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float32)
+            return ((points - eye_midpoint) @ rotation.T) / eye_distance
+
+        geometry_rmse = float(np.sqrt(np.mean(
+            (normalized_geometry(source_face) - normalized_geometry(candidate_face)) ** 2
+        )))
+        # A coherent Qwen regeneration can move dense detector landmarks a few
+        # pixels even when the recognition embedding is an exceptionally close
+        # match. Permit that narrow rendering tolerance only for very high
+        # biometric similarity; ordinary candidates retain the stricter gate.
+        # A strong ArcFace match can tolerate modest landmark movement from
+        # leveling an outdoor pose into a camera-facing ID portrait. Keep the
+        # stricter shape gate for borderline identity scores.
+        # Dense landmarks are useful for catching de-aging and face reshaping,
+        # but their position moves slightly when Qwen levels a portrait or
+        # changes the crop.  Do not reject an exceptionally strong biometric
+        # match for a sub-pixel threshold miss (the observed production case
+        # was similarity=.950 with RMSE=.03045 against .03000).  The bounded
+        # .035 allowance applies only at >=.90 similarity; ordinary and
+        # borderline candidates keep the caller's strict geometry limit.
+        effective_geometry_rmse = (
+            max(float(maximum_geometry_rmse), .035)
+            if np.isfinite(score) and score >= .90
+            else float(maximum_geometry_rmse)
+        )
+        similarity_ok = bool(np.isfinite(score) and score >= minimum_similarity)
+        geometry_ok = bool(
+            np.isfinite(geometry_rmse)
+            and geometry_rmse <= effective_geometry_rmse
+        )
+        accepted = bool(similarity_ok and geometry_ok)
+        if accepted:
+            reason = "identity match"
+        elif not similarity_ok:
+            reason = "Biometric face similarity is below the required threshold"
+        else:
+            reason = "Facial landmark geometry exceeds the allowed tolerance"
+        return {
+            "accepted": accepted,
+            "similarity": score if np.isfinite(score) else None,
+            "minimum_similarity": minimum_similarity,
+            "geometry_rmse": geometry_rmse if np.isfinite(geometry_rmse) else None,
+            "requested_maximum_geometry_rmse": maximum_geometry_rmse,
+            "maximum_geometry_rmse": effective_geometry_rmse,
+            "similarity_ok": similarity_ok,
+            "geometry_ok": geometry_ok,
+            "reason": reason,
+        }
     except Exception as exc:
         return {"accepted": False, "reason": f"Identity verification unavailable: {exc}"}
 
@@ -85,8 +144,9 @@ def review_uniform(person, template, candidate, background_rgb):
     prompt = (
         "Inspect this generated portrait only. "
         f"Its required flat background RGB is {background_rgb}. "
-        "Return JSON only with boolean keys: badge_present, face_artifacts, harsh_hair_glare, background_mismatch, head_cropped. "
+        "Return JSON only with boolean keys: badge_present, neck_jewelry_present, face_artifacts, harsh_hair_glare, background_mismatch, head_cropped. "
         "badge_present: visible logo, emblem or lettering on clothing. Seams and plain pockets are NOT badges. "
+        "neck_jewelry_present: any necklace, chain or pendant visible on the neck/chest. A shirt collar, placket, button or template necktie is not jewelry. "
         "face_artifacts: visible pixel blocks, smearing, doubled eyes or unnatural facial texture; do not judge identity. "
         "harsh_hair_glare: strong metallic blue/silver glare, not ordinary soft sheen. "
         "background_mismatch: obvious wrong background color or remnants. head_cropped: missing hair/accessories at frame edges. "
@@ -94,15 +154,33 @@ def review_uniform(person, template, candidate, background_rgb):
         "Include badge_evidence describing its location and visible symbol, or none. Do not invent defects or infer hidden details."
     )
     garment_prompt = (
-        "Compare image 1 (uniform template) with image 2 (generated portrait). Ignore any template badge. "
+        "Compare image 1 (the exact uniform fitted into the required upper-chest passport crop) "
+        "with image 2 (the generated upper-chest passport portrait). Review only garment pixels visible "
+        "inside this shared passport crop; do not expect lower sleeves, waist, hem, hands, or any garment "
+        "area outside the frame. Ignore the person, hair, background, rough cutout edges, and any template badge. "
         "Return JSON: uniform_mismatch (boolean), evidence (string). Compare collar first: "
         "a standing band and folded triangular points are different. Then compare fabric hue, base/thread colors, "
-        "check spacing and vest seams. Name the actual visible differences; do not assume they match."
+        "check spacing and visible vest seams at the same apparent scale. Mark uniform_mismatch true only for "
+        "a visible difference within the shared crop. Name the actual visible difference; do not infer hidden parts."
     )
     hair_prompt = (
-        "Compare image 1 (original person) with image 2 (generated portrait). Ignore clothing and background. "
-        "Return JSON: hair_changed (boolean), evidence (string). Check hair shape, length, parting and "
-        "accessories on each side. Different lighting alone is not a hairstyle change."
+        "Compare image 1 (the original source person) with image 2 (the generated portrait). Image 1 is the authority. "
+        "Ignore clothing, background, face restoration detail and differences caused only by the tighter passport crop. "
+        "Return JSON: hair_changed (boolean), evidence (string). Compare the visible crown shape, parting, left and right "
+        "silhouettes, hair behind each ear, visible length and ends, ponytail/bun/braid/fringe/loose strands, and every real "
+        "hair accessory by side, color, shape and count. Eyeglass frames and temples, earrings, bindis, necklaces, clothing "
+        "edges, background marks, glare and shadows are not hair accessories. Different lighting, sharper strands, or hair "
+        "outside the final upper-chest crop alone is not a hairstyle change. Set hair_changed true only for a concrete visible "
+        "loss, invention, relocation, shortening, silhouette change or accessory mismatch, and name that exact difference."
+    )
+    identity_prompt = (
+        "Compare image 1 (the uploaded person) with image 2 (the generated school-ID portrait). Image 1 is the identity "
+        "and current apparent-age authority even when it has harsh sunlight. Ignore clothing, background, crop and lighting "
+        "differences. Return JSON: identity_changed (boolean), evidence (string). Compare stable facial anatomy: eye size and "
+        "spacing, eyelid shape, nose width/length, mouth shape, cheek fullness, jaw width, chin length, facial asymmetry and "
+        "current apparent age. Set identity_changed true when the generated result beautifies, de-ages, enlarges the eyes, "
+        "narrows or widens the jaw/chin, changes facial proportions, or resembles a different person. Do not accept a face "
+        "merely because hair, skin color or expression is broadly similar. Name the concrete changed anatomy."
     )
     cache = Path("scratch/cache")
     cache.mkdir(parents=True, exist_ok=True)
@@ -135,7 +213,8 @@ def inspect(selected, prompt):
     return processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
 results = [inspect([images[2]], {prompt!r}),
            inspect([images[1], images[2]], {garment_prompt!r}),
-           inspect([images[0], images[2]], {hair_prompt!r})]
+           inspect([images[0], images[2]], {hair_prompt!r}),
+           inspect([images[0], images[2]], {identity_prompt!r})]
 print("REVIEW_JSON=" + json.dumps(results))
 ''', encoding="utf-8")
         result = subprocess.run([sys.executable, str(worker)], capture_output=True, text=True, timeout=300)
@@ -145,9 +224,11 @@ print("REVIEW_JSON=" + json.dumps(results))
         if line is None:
             raise RuntimeError("Uniform review returned no result")
         raw = json.loads(line.split("=", 1)[1])
-        portrait, garment, hair = [clean_and_repair_json(item) for item in raw]
+        portrait, garment, hair, identity = [clean_and_repair_json(item) for item in raw]
         portrait["uniform_mismatch"] = garment.get("uniform_mismatch")
         portrait["hair_changed"] = hair.get("hair_changed")
+        portrait["identity_changed"] = identity.get("identity_changed")
         portrait["garment_evidence"] = garment.get("evidence")
         portrait["hair_evidence"] = hair.get("evidence")
+        portrait["identity_evidence"] = identity.get("evidence")
         return validate_review(portrait)

@@ -548,6 +548,50 @@ class PhotoRestorationService:
             return False
 
     @staticmethod
+    def has_harsh_portrait_sunlight(
+        image_pil: Image.Image,
+        face_bbox=None,
+    ) -> bool:
+        """Measure hard saturated light over the face, independent of VL prose."""
+        rgb = np.asarray(image_pil.convert("RGB"), dtype=np.uint8)
+        height, width = rgb.shape[:2]
+        if face_bbox is not None and len(face_bbox) >= 4:
+            x1, y1, x2, y2 = [int(round(float(value))) for value in face_bbox[:4]]
+            pad_x = max(4, int((x2 - x1) * .12))
+            pad_y = max(4, int((y2 - y1) * .12))
+            x1, x2 = max(0, x1 - pad_x), min(width, x2 + pad_x)
+            y1, y2 = max(0, y1 - pad_y), min(height, y2 + pad_y)
+            region = rgb[y1:y2, x1:x2]
+        else:
+            region = rgb[
+                int(height * .12):int(height * .64),
+                int(width * .18):int(width * .82),
+            ]
+        if region.size < 256:
+            return False
+        luminance = cv2.cvtColor(region, cv2.COLOR_RGB2LAB)[:, :, 0]
+        saturation = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)[:, :, 1]
+        p20, p95 = np.percentile(luminance, (20, 95))
+        saturation_p80 = float(np.percentile(saturation, 80))
+        # This check is used only after the VL analysis has already reported
+        # direct light. The former thresholds missed visibly harsh, clipped
+        # warm light by a few values (for example p95=185 and saturation=171),
+        # so uniform swap skipped the same bounded correction used by
+        # Enhancement. Keep all three signals mandatory while admitting that
+        # still-obvious residual-light case.
+        detected = bool(
+            p95 >= 168.0
+            and (p95 - p20) >= 95.0
+            and saturation_p80 >= 150.0
+        )
+        logger.info(
+            "[SUNLIGHT_MEASURE] p20=%.1f p95=%.1f contrast=%.1f "
+            "saturation_p80=%.1f detected=%s",
+            p20, p95, p95 - p20, saturation_p80, detected,
+        )
+        return detected
+
+    @staticmethod
     def neutralize_direct_sunlight(image_pil: Image.Image) -> Image.Image:
         """Compress face and hair hot spots without regenerating subject pixels."""
         image = np.array(image_pil.convert("RGB"))
@@ -584,7 +628,10 @@ class PhotoRestorationService:
             face_hot = np.clip((luminance - 132.0) / 68.0, 0.0, 1.0) * face_alpha
             hair_hot = np.clip((luminance - 112.0) / 78.0, 0.0, 1.0) * hair_alpha
             luminance -= face_hot * 42.0
-            luminance -= hair_hot * 48.0
+            # Sunlit dark hair in phone photos can be lifted all the way to
+            # pale grey.  Compress that highlight more firmly while retaining
+            # the original strand texture and excluding the face ellipse.
+            luminance -= hair_hot * 68.0
             lab[:, :, 0] = np.clip(luminance, 0, 255)
             # Strong sun can push skin toward orange. Blend chroma a little
             # toward neutral only inside the face highlight mask.
@@ -649,8 +696,8 @@ class PhotoRestorationService:
             # the guide instead of forcing a fixed skin colour.
             a_median = float(np.median(lab[:, :, 1][inner]))
             b_median = float(np.median(lab[:, :, 2][inner]))
-            a_shift = min(8.0, max(0.0, a_median - 151.0))
-            b_shift = min(12.0, max(0.0, b_median - 145.0))
+            a_shift = min(7.0, max(0.0, a_median - 146.0))
+            b_shift = min(20.0, max(0.0, b_median - 132.0))
             lab[:, :, 1] -= face_alpha * a_shift
             lab[:, :, 2] -= face_alpha * b_shift
 
@@ -684,7 +731,12 @@ class PhotoRestorationService:
                 bgr[-edge:, -edge:].reshape(-1, 3),
             ))
             backdrop = np.median(corners, axis=0).astype(np.float32)
-            backdrop_pixels = np.linalg.norm(bgr.astype(np.float32) - backdrop, axis=2) < 42.0
+            # Include Qwen's mild blue/gray studio falloff around the crown.
+            # A tighter key treated that smooth backdrop shade as bright hair
+            # and darkened it into visible islands above the head.
+            backdrop_pixels = np.linalg.norm(
+                bgr.astype(np.float32) - backdrop, axis=2,
+            ) < 64.0
 
             region = np.zeros((height, width), dtype=np.uint8)
             cv2.ellipse(
@@ -696,15 +748,886 @@ class PhotoRestorationService:
             alpha[backdrop_pixels] = 0.0
 
             lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-            hotspot = np.clip((lab[:, :, 0] - 120.0) / 85.0, 0.0, 1.0) * alpha
-            lab[:, :, 0] -= hotspot * 42.0
-            lab[:, :, 1] += (128.0 - lab[:, :, 1]) * hotspot * 0.08
-            lab[:, :, 2] += (128.0 - lab[:, :, 2]) * hotspot * 0.06
-            logger.info("[LIGHTING] Tamed generated forehead and hair hotspots")
+            # Do not perform a broad colour-keyed hotspot edit here. Pale
+            # backdrop falloff and bright skin can overlap in colour, which
+            # previously created a grey halo around hair and isolated pale
+            # islands on the face. The detected-face correction below and the
+            # semantic hair pass handle the two intended regions safely.
+            # Correct broad directional illumination and orange sunlight only
+            # inside the detected face. This changes low-frequency light, not
+            # landmarks or source texture.
+            faces = _get_insight_app().get(bgr)
+            face_correction = 0.0
+            if len(faces) == 1:
+                x1, y1, x2, y2 = [int(value) for value in faces[0].bbox]
+                face_w, face_h = max(24, x2 - x1), max(24, y2 - y1)
+                face_mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.ellipse(
+                    face_mask,
+                    ((x1 + x2) // 2, y1 + int(face_h * .50)),
+                    (int(face_w * .52), int(face_h * .57)),
+                    0, 0, 360, 255, -1,
+                )
+                face_alpha = cv2.GaussianBlur(
+                    face_mask, (0, 0), max(7.0, face_w * .055),
+                ).astype(np.float32) / 255.0
+                inner = face_mask > 230
+                illumination = cv2.GaussianBlur(
+                    lab[:, :, 0], (0, 0), max(13.0, face_w * .16),
+                )
+                target_l = float(np.clip(np.median(illumination[inner]), 122.0, 145.0))
+                correction = np.clip(target_l - illumination, -30.0, 22.0)
+                lab[:, :, 0] += correction * face_alpha * .55
+
+                # Hard side-light is directional: a global median can reduce
+                # it yet still leave one cheek brighter than its counterpart.
+                # Compare only low-frequency illumination at mirrored facial
+                # positions, then move both sides gently toward their shared
+                # value. Fine skin texture, eyes and facial geometry are not
+                # part of this correction field.
+                rx1, ry1 = max(0, x1), max(0, y1)
+                rx2, ry2 = min(width, x2), min(height, y2)
+                directional_mean = 0.0
+                if rx2 - rx1 >= 24 and ry2 - ry1 >= 24:
+                    illumination_roi = illumination[ry1:ry2, rx1:rx2]
+                    mirrored_l = np.fliplr(illumination_roi)
+                    symmetry_delta = np.clip(
+                        (mirrored_l - illumination_roi) * .5, -13.0, 13.0,
+                    )
+                    roi_h, roi_w = symmetry_delta.shape
+                    fade_y = max(4, int(roi_h * .16))
+                    fade_x = max(4, int(roi_w * .10))
+                    edge_window_y = np.ones(roi_h, dtype=np.float32)
+                    edge_window_x = np.ones(roi_w, dtype=np.float32)
+                    edge_window_y[:fade_y] = np.linspace(0.0, 1.0, fade_y)
+                    edge_window_y[-fade_y:] = np.linspace(1.0, 0.0, fade_y)
+                    edge_window_x[:fade_x] = np.linspace(0.0, 1.0, fade_x)
+                    edge_window_x[-fade_x:] = np.linspace(1.0, 0.0, fade_x)
+                    symmetry_window = edge_window_y[:, None] * edge_window_x[None, :]
+                    symmetry_delta *= symmetry_window
+                    symmetry_field = np.zeros((height, width), dtype=np.float32)
+                    symmetry_field[ry1:ry2, rx1:rx2] = symmetry_delta
+                    lab[:, :, 0] += symmetry_field * face_alpha * .66
+                    directional_mean = float(np.mean(np.abs(symmetry_delta)))
+
+                    # Balance only broad directional colour cast. Restricting
+                    # this to blurred LAB chroma retains the person's actual
+                    # complexion, lip colour, moles and local skin detail.
+                    for channel, limit, gain in ((1, 5.0, .30), (2, 8.0, .38)):
+                        chroma_low = cv2.GaussianBlur(
+                            lab[:, :, channel], (0, 0), max(11.0, face_w * .13),
+                        )
+                        chroma_roi = chroma_low[ry1:ry2, rx1:rx2]
+                        chroma_delta = np.clip(
+                            (np.fliplr(chroma_roi) - chroma_roi) * .5,
+                            -limit, limit,
+                        )
+                        chroma_delta *= symmetry_window
+                        chroma_field = np.zeros((height, width), dtype=np.float32)
+                        chroma_field[ry1:ry2, rx1:rx2] = chroma_delta
+                        lab[:, :, channel] += chroma_field * face_alpha * gain
+                a_med = float(np.median(lab[:, :, 1][inner]))
+                b_med = float(np.median(lab[:, :, 2][inner]))
+                # This routine is invoked only after measured harsh sunlight.
+                # A clipped warm source can remain orange even after luminance
+                # balancing, so remove the broad cast more decisively while
+                # retaining all high-frequency skin texture and geometry.
+                a_shift = min(7.0, max(0.0, a_med - 144.0))
+                b_shift = min(22.0, max(0.0, b_med - 132.0))
+                lab[:, :, 1] -= face_alpha * a_shift * .82
+                lab[:, :, 2] -= face_alpha * b_shift * .90
+                face_correction = float(np.mean(np.abs(correction[inner])))
+                logger.info(
+                    "[LIGHTING] Balanced directional face light (mean=%.1f)",
+                    directional_mean,
+                )
+
+                # Extend the same illumination-only correction to visible
+                # neck and body skin.  A fixed oval cannot cover those areas,
+                # and a plain colour threshold can damage warm uniforms. SCHP
+                # supplies semantic face/arm/leg candidates; face-relative
+                # chroma then admits the neck while rejecting clothing. This
+                # remains dynamic for children/adults and every crop/pose.
+                try:
+                    from pipelines.schp_service import parse as parse_body_parts
+
+                    rgb_for_parse = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    labels = parse_body_parts(rgb_for_parse)["labels"]
+                    semantic_limbs = np.isin(labels, (14, 15, 16, 17))
+                    face_seed = (labels == 13) & inner
+                    if int(face_seed.sum()) < 96:
+                        face_seed = inner
+                    face_a = float(np.median(lab[:, :, 1][face_seed]))
+                    face_b = float(np.median(lab[:, :, 2][face_seed]))
+                    chroma_distance = np.sqrt(
+                        (lab[:, :, 1] - face_a) ** 2
+                        + (lab[:, :, 2] - face_b) ** 2
+                    )
+
+                    chroma_skin = chroma_distance <= 24.0
+                    # Normalize exposed limbs independently. Do not flatten
+                    # the neck vertically: the natural chin-to-neck falloff is
+                    # legitimate studio shading, and treating it as a body
+                    # hotspot creates a visible horizontal seam. Qwen's clean
+                    # generated neck remains authoritative.
+                    body_skin = semantic_limbs & chroma_skin & ~backdrop_pixels
+                    body_skin = cv2.morphologyEx(
+                        body_skin.astype(np.uint8), cv2.MORPH_OPEN,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    ).astype(bool)
+                    if int(body_skin.sum()) >= 96:
+                        body_alpha = cv2.GaussianBlur(
+                            body_skin.astype(np.uint8) * 255,
+                            (0, 0), max(4.0, face_w * .025),
+                        ).astype(np.float32) / 255.0
+                        # Blend continuously into the face correction. A hard
+                        # face-mask subtraction created a horizontal exposure
+                        # seam beneath the chin on close passport crops.
+                        body_alpha *= np.clip(1.0 - face_alpha, 0.0, 1.0)
+                        body_alpha[backdrop_pixels] = 0.0
+                        body_illumination = cv2.GaussianBlur(
+                            lab[:, :, 0], (0, 0), max(9.0, face_w * .11),
+                        )
+                        body_values = body_illumination[body_skin]
+                        body_spread = float(
+                            np.percentile(body_values, 90)
+                            - np.percentile(body_values, 10)
+                        )
+                        if body_spread >= 14.0:
+                            body_target = float(np.median(body_values))
+                            body_correction = np.clip(
+                                body_target - body_illumination, -22.0, 18.0,
+                            )
+                            lab[:, :, 0] += body_correction * body_alpha * .52
+
+                            # Remove only local excess warm glare relative to
+                            # this person's own face chroma; do not impose a
+                            # fixed complexion or alter normally lit skin.
+                            warm_excess = np.clip(
+                                lab[:, :, 2] - (face_b + 7.0), 0.0, 12.0,
+                            )
+                            lab[:, :, 2] -= warm_excess * body_alpha * .34
+                            logger.info(
+                                "[LIGHTING] Normalized visible neck/body sunlight "
+                                "(spread=%.1f)", body_spread,
+                            )
+                except Exception as body_error:
+                    logger.warning(
+                        "[LIGHTING] Visible body-skin correction skipped: %s",
+                        body_error,
+                    )
+            logger.info(
+                "[LIGHTING] Tamed hotspots and normalized face illumination (mean=%.1f)",
+                face_correction,
+            )
             return Image.fromarray(cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB))
         except Exception as exc:
             logger.warning("[LIGHTING] Generated hotspot correction skipped: %s", exc)
             return image_pil
+
+    @staticmethod
+    def balance_face_light_luminance_only(image_pil: Image.Image) -> Image.Image:
+        """Balance directional face light without recolouring or smoothing.
+
+        This is intentionally narrower than ``tame_generated_portrait_hotspots``.
+        It adjusts only the low-frequency LAB luminance inside one detected
+        face.  Colour is deliberately not modified: an earlier mirrored-
+        chroma correction could turn one cheek pale/cyan.  Facial detail,
+        complexion, hair, accessories, clothing and backdrop therefore remain
+        unchanged while the directional illumination field is flattened.
+        """
+        try:
+            rgb = np.asarray(image_pil.convert("RGB"), dtype=np.uint8)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            faces = _get_insight_app().get(bgr)
+            if len(faces) != 1:
+                return image_pil
+
+            height, width = rgb.shape[:2]
+            x1, y1, x2, y2 = [int(round(float(v))) for v in faces[0].bbox]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            face_w, face_h = x2 - x1, y2 - y1
+            if face_w < 32 or face_h < 32:
+                return image_pil
+
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            luminance = lab[:, :, 0]
+            # A cheek-sized sunlight patch is smaller than the complete face;
+            # use a local illumination field while remaining far broader than
+            # eyes, pores or expression detail.
+            sigma = max(10.0, face_w * .075)
+            illumination = cv2.GaussianBlur(luminance, (0, 0), sigma)
+            roi = illumination[y1:y2, x1:x2]
+            mirrored = np.fliplr(roi)
+            inner = roi[
+                int(face_h * .10):max(int(face_h * .11), int(face_h * .88)),
+                int(face_w * .10):max(int(face_w * .11), int(face_w * .90)),
+            ]
+            studio_level = float(np.median(inner)) if inner.size else float(np.median(roi))
+            # A neutral frontal studio field is mostly uniform but not flat.
+            # Retain a small amount of symmetric modelling and move the broad
+            # illumination toward this same face's median.  The target comes
+            # from the generated person, never from a fixed skin colour.
+            target_field = studio_level * .88 + mirrored * .12
+            delta = np.clip(target_field - roi, -34.0, 24.0)
+            glare_region = roi > (target_field + 4.0)
+
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                mask,
+                ((x1 + x2) // 2, y1 + int(face_h * .46)),
+                (int(face_w * .48), int(face_h * .43)),
+                0, 0, 360, 255, -1,
+            )
+            alpha = cv2.GaussianBlur(
+                mask, (0, 0), max(7.0, face_w * .045),
+            ).astype(np.float32) / 255.0
+            correction = np.zeros((height, width), dtype=np.float32)
+            correction[y1:y2, x1:x2] = delta
+            # A restrained blend removes the obvious sun patch while keeping
+            # natural modelling and every high-frequency facial feature.
+            luminance += correction * alpha * .95
+            core = mask > 220
+            if np.any(core):
+                # Compress residual *low-frequency* glare rather than bright
+                # pixels.  This keeps eye catchlights, pores, lips and other
+                # real high-frequency detail while removing the broad cheek/
+                # nose sunlight field.
+                balanced_field = cv2.GaussianBlur(
+                    luminance, (0, 0), sigma,
+                )
+                face_median = float(np.median(balanced_field[core]))
+                field_excess = np.clip(
+                    balanced_field - (face_median + 7.0), 0.0, 24.0,
+                )
+                luminance -= field_excess * alpha * .58
+                field_deficit = np.clip(
+                    (face_median - 7.0) - balanced_field, 0.0, 18.0,
+                )
+                # Lift only broad cast-shadow fields. High-frequency natural
+                # contrast in eyes, brows, lips and pores is not part of this
+                # illumination map and therefore remains unchanged.
+                luminance += field_deficit * alpha * .48
+            lab[:, :, 0] = np.clip(luminance, 0, 255)
+
+            # A clipped Qwen highlight can also lose skin chroma and appear as
+            # a white/cyan patch even after its brightness is corrected. Fill
+            # only that detected glare field from this face's own stable
+            # midtone colour. Never transfer the outdoor source illuminant and
+            # never impose a hard-coded complexion.
+            colour_alpha = alpha.copy()
+            landmarks = np.asarray(getattr(faces[0], "kps", []), dtype=np.float32)
+            if landmarks.shape == (5, 2):
+                protection = np.zeros((height, width), dtype=np.uint8)
+                eye_radius = max(5, int(face_w * .085))
+                mouth_radius = max(6, int(face_w * .105))
+                for px, py in landmarks[:2]:
+                    cv2.circle(protection, (int(px), int(py)), eye_radius, 255, -1)
+                for px, py in landmarks[3:5]:
+                    cv2.circle(protection, (int(px), int(py)), mouth_radius, 255, -1)
+                protected = cv2.GaussianBlur(
+                    protection, (0, 0), max(2.0, face_w * .012),
+                ).astype(np.float32) / 255.0
+                colour_alpha *= 1.0 - protected
+
+            glare = np.zeros((height, width), dtype=np.float32)
+            glare[y1:y2, x1:x2] = glare_region.astype(np.float32)
+            colour_alpha *= cv2.GaussianBlur(
+                glare, (0, 0), max(3.0, face_w * .018),
+            )
+            for channel, ceiling in ((1, 5.0), (2, 12.0)):
+                channel_field = cv2.GaussianBlur(
+                    lab[:, :, channel], (0, 0), sigma,
+                )
+                stable_values = channel_field[core]
+                if not stable_values.size:
+                    continue
+                stable_tone = float(np.median(stable_values))
+                # Measure the actual clipped skin colour here. Using only the
+                # blurred chroma field underestimated small white/cyan cheek
+                # patches and left them visible after luminance repair.
+                local = lab[y1:y2, x1:x2, channel]
+                symmetric = np.fliplr(local)
+                target_colour = stable_tone * .65 + symmetric * .35
+                # Bleached highlights need chroma restored, never removed.
+                # This one-way bound prevents a yellow/orange or blue cast.
+                colour_delta = np.clip(target_colour - local, 0.0, ceiling)
+                correction_colour = np.zeros((height, width), dtype=np.float32)
+                correction_colour[y1:y2, x1:x2] = colour_delta
+                lab[:, :, channel] += correction_colour * colour_alpha * .82
+
+            # The same direct light often continues beyond the detected face
+            # onto the crown, neck and exposed upper-body skin.  Correct those
+            # semantic regions in the same pass so the face is not left evenly
+            # lit above a sunlit neck/chest.  Every target tone is measured
+            # from this generated portrait; no complexion or hair colour is
+            # hard-coded and no source-background pixels are copied.
+            try:
+                from pipelines.schp_service import parse as parse_body_parts
+
+                labels = parse_body_parts(rgb)["labels"]
+                low_l = cv2.GaussianBlur(
+                    lab[:, :, 0], (0, 0), max(8.0, face_w * .070),
+                )
+
+                # Stable complexion comes from the already-balanced inner
+                # face.  Restrict the extra skin search to the person's centre
+                # below the chin so similarly coloured backdrop or clothing
+                # cannot be selected.
+                stable_skin = core & (labels == 13)
+                if int(stable_skin.sum()) < 96:
+                    stable_skin = core
+                skin_a = float(np.median(lab[:, :, 1][stable_skin]))
+                skin_b = float(np.median(lab[:, :, 2][stable_skin]))
+                skin_chroma_distance = np.sqrt(
+                    (lab[:, :, 1] - skin_a) ** 2
+                    + (lab[:, :, 2] - skin_b) ** 2
+                )
+                torso_window = np.zeros((height, width), dtype=bool)
+                tx1 = max(0, x1 - int(face_w * .50))
+                tx2 = min(width, x2 + int(face_w * .50))
+                ty1 = max(0, y1 + int(face_h * .72))
+                ty2 = min(height, y2 + int(face_h * 1.10))
+                torso_window[ty1:ty2, tx1:tx2] = True
+                semantic_skin = np.isin(labels, (13, 14, 15, 16, 17))
+                extra_skin = (
+                    (semantic_skin | (torso_window & (skin_chroma_distance <= 17.0)))
+                    & ~core
+                    & (labels != 2)
+                )
+                extra_skin = cv2.morphologyEx(
+                    extra_skin.astype(np.uint8), cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                ).astype(bool)
+                if int(extra_skin.sum()) >= 96:
+                    skin_alpha = cv2.GaussianBlur(
+                        extra_skin.astype(np.uint8) * 255, (0, 0),
+                        max(3.0, face_w * .018),
+                    ).astype(np.float32) / 255.0
+                    skin_alpha *= np.clip(1.0 - alpha * .80, 0.0, 1.0)
+                    skin_values = low_l[extra_skin]
+                    skin_target_l = float(np.percentile(skin_values, 55))
+                    skin_delta = np.clip(
+                        skin_target_l - low_l, -28.0, 20.0,
+                    )
+                    skin_delta[np.abs(skin_delta) < 4.0] = 0.0
+                    # Balance both sunlight and its paired cast shadow so the
+                    # neck/body do not retain a directional outdoor-light cue
+                    # beneath an evenly relit face.
+                    lab[:, :, 0] += skin_delta * skin_alpha * .74
+                    for channel, tone, ceiling in (
+                        (1, skin_a, 5.0), (2, skin_b, 10.0),
+                    ):
+                        depleted = np.clip(
+                            tone - lab[:, :, channel], 0.0, ceiling,
+                        )
+                        lab[:, :, channel] += depleted * skin_alpha * .65
+
+                # SCHP hair plus a face-relative head window prevents flowers,
+                # backdrop and clothing from being darkened. Work on the
+                # low-frequency field so normal strand shine remains, while
+                # broad silver/orange sunlight is compressed.
+                hair_window = np.zeros((height, width), dtype=bool)
+                hx1 = max(0, x1 - int(face_w * .72))
+                hx2 = min(width, x2 + int(face_w * .72))
+                hy1 = max(0, y1 - int(face_h * .58))
+                hy2 = min(height, y2 + int(face_h * .68))
+                hair_window[hy1:hy2, hx1:hx2] = True
+                hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+                hair = (
+                    (labels == 2) & hair_window
+                    & (hsv[:, :, 2] < 242)
+                    & ~core
+                )
+                if int(hair.sum()) >= 128:
+                    hair_alpha = cv2.GaussianBlur(
+                        hair.astype(np.uint8) * 255, (0, 0),
+                        max(2.5, face_w * .014),
+                    ).astype(np.float32) / 255.0
+                    hair_values = low_l[hair]
+                    hair_target_l = float(np.percentile(hair_values, 62))
+                    hair_excess = np.clip(
+                        low_l - (hair_target_l + 16.0), 0.0, 16.0,
+                    )
+                    # Keep strand highlights and the backdrop visible through
+                    # natural curls. Only take the edge off broad glare; an
+                    # aggressive dark-hair pass exaggerates those openings as
+                    # white holes and makes the result look cut out.
+                    lab[:, :, 0] -= hair_excess * hair_alpha * .24
+                logger.info(
+                    "[PORTRAIT_LIGHT] Extended correction to skin=%d hair=%d pixels",
+                    int(extra_skin.sum()), int(hair.sum()),
+                )
+            except Exception as region_error:
+                logger.warning(
+                    "[PORTRAIT_LIGHT] Hair/body extension skipped: %s",
+                    region_error,
+                )
+            corrected = cv2.cvtColor(
+                lab.astype(np.uint8), cv2.COLOR_LAB2RGB,
+            )
+            logger.info(
+                "[FACE_LIGHT] Balanced directional luminance only (mean_abs=%.2f)",
+                float(np.mean(np.abs(delta))),
+            )
+            return Image.fromarray(corrected, "RGB")
+        except Exception as exc:
+            logger.warning("[FACE_LIGHT] Luminance-only balance skipped: %s", exc)
+            return image_pil
+
+    @staticmethod
+    def balance_exposed_body_sunlight_only(image_pil: Image.Image) -> Image.Image:
+        """Remove residual directional sun from visible neck/chest skin only.
+
+        Qwen sometimes relights the face correctly while reproducing an orange
+        sun patch and paired shadow on exposed upper-body skin. This pass never
+        touches the detected face, hair, accessories, clothing or backdrop.
+        Target light is derived from the generated portrait's opposite-side
+        skin and its own stable face chroma; no fixed complexion is imposed.
+        """
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            rgb = np.asarray(image_pil.convert("RGB"), dtype=np.uint8)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            faces = _get_insight_app().get(bgr)
+            if len(faces) != 1:
+                return image_pil
+            height, width = rgb.shape[:2]
+            x1, y1, x2, y2 = [int(round(float(v))) for v in faces[0].bbox]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            face_w, face_h = x2 - x1, y2 - y1
+            if face_w < 32 or face_h < 32:
+                return image_pil
+
+            labels = parse_body_parts(rgb)["labels"]
+            lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+            original_lab = lab.copy()
+            face_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                face_mask,
+                ((x1 + x2) // 2, y1 + int(face_h * .48)),
+                (int(face_w * .38), int(face_h * .34)),
+                0, 0, 360, 255, -1,
+            )
+            stable_face = (face_mask > 220) & (labels == 13)
+            if int(stable_face.sum()) < 96:
+                stable_face = face_mask > 220
+            skin_a = float(np.median(lab[:, :, 1][stable_face]))
+            skin_b = float(np.median(lab[:, :, 2][stable_face]))
+            chroma_distance = np.sqrt(
+                (lab[:, :, 1] - skin_a) ** 2
+                + (lab[:, :, 2] - skin_b) ** 2
+            )
+
+            center_x = (x1 + x2) // 2
+            body_window = np.zeros((height, width), dtype=bool)
+            bx1 = max(0, center_x - int(face_w * .82))
+            bx2 = min(width, center_x + int(face_w * .82))
+            by1 = max(0, y2 - int(face_h * .01))
+            by2 = min(height, y2 + int(face_h * 1.35))
+            body_window[by1:by2, bx1:bx2] = True
+            semantic_skin = np.isin(labels, (13, 14, 15, 16, 17))
+            # Do not require a foreground SCHP label here.  Dappled sunlight
+            # frequently makes exposed chest skin get parsed as background,
+            # which used to punch the exact bright fragments out of the repair
+            # mask.  The tight, face-relative chroma gate and central neckline
+            # window are the foreground safeguards; they adapt to every
+            # subject's own complexion instead of imposing a fixed skin tone.
+            body_skin = body_window & (
+                (semantic_skin & (chroma_distance <= 34.0))
+                | (chroma_distance <= 30.0)
+            )
+            body_skin &= labels != 2
+            body_skin &= face_mask == 0
+            body_skin = cv2.morphologyEx(
+                body_skin.astype(np.uint8), cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+            ).astype(bool)
+            body_skin = cv2.morphologyEx(
+                body_skin.astype(np.uint8), cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            ).astype(bool)
+            if int(body_skin.sum()) < 120:
+                return image_pil
+
+            # Use a tighter illumination scale than the face relighting pass.
+            # Leaf-shaped sun streaks on a neck/chest are often only a few
+            # percent of the face width; the old broad blur averaged them into
+            # their surroundings and left the visible pattern intact.
+            sigma = max(5.0, face_w * .018)
+            low_l = cv2.GaussianBlur(lab[:, :, 0], (0, 0), sigma)
+            # Model neutral studio illumination as one robust skin level per
+            # image row. This preserves the natural neck-to-chest vertical
+            # falloff, but removes left/right dappled sun. Mirroring was unsafe
+            # when an open asymmetric jacket occupied the opposite side.
+            row_level = np.full(height, np.nan, dtype=np.float32)
+            for row in range(by1, by2):
+                values = low_l[row, body_skin[row]]
+                if values.size >= 6:
+                    row_level[row] = float(np.median(values))
+            valid_rows = np.flatnonzero(np.isfinite(row_level))
+            if valid_rows.size < 4:
+                return image_pil
+            row_level[by1:by2] = np.interp(
+                np.arange(by1, by2), valid_rows, row_level[valid_rows],
+            )
+            smoothed_rows = cv2.GaussianBlur(
+                row_level[by1:by2].reshape(-1, 1),
+                (1, 0), sigmaX=0.0, sigmaY=max(3.0, face_h * .018),
+            ).reshape(-1)
+            target_l = low_l.copy()
+            target_l[by1:by2, :] = smoothed_rows[:, None]
+            # Normalize the complete exposed-skin illumination field. Selecting
+            # only thresholded hotspot fragments preserved the recognizable
+            # leaf/sun pattern between them. The correction itself remains
+            # low-frequency and close to zero on already even skin.
+            affected = body_skin
+            if int(affected.sum()) < 64:
+                return image_pil
+            # Keep full strength across the interior of exposed skin.  A wide
+            # mask blur made alpha vary across narrow sun streaks, preserving
+            # their silhouette even when their average brightness changed.
+            # Only feather a few pixels at the skin/clothing boundary.
+            alpha = cv2.GaussianBlur(
+                affected.astype(np.uint8) * 255, (0, 0), 2.2,
+            ).astype(np.float32) / 255.0
+            # Fade in below the face box so detector geometry can never leave
+            # a horizontal neck seam.
+            transition_h = max(10, int(face_h * .16))
+            vertical_ramp = np.ones(height, dtype=np.float32)
+            vertical_ramp[:by1] = 0.0
+            ramp_end = min(height, by1 + transition_h)
+            vertical_ramp[by1:ramp_end] = np.linspace(
+                0.0, 1.0, ramp_end - by1, dtype=np.float32,
+            )
+            alpha *= vertical_ramp[:, None]
+
+            # Rebuild only the low-frequency illumination/chroma field.  Keep
+            # small luminance detail (pores and camera texture), while removing
+            # leaf-shaped sun and shadow patterns rather than merely dimming
+            # them.  Complexion comes from this subject's stable face pixels.
+            fine_l = lab[:, :, 0] - cv2.GaussianBlur(
+                lab[:, :, 0], (0, 0), 2.2,
+            )
+            neutral_l = target_l + np.clip(fine_l, -7.0, 7.0)
+            lab[:, :, 0] += np.clip(
+                neutral_l - lab[:, :, 0], -44.0, 34.0,
+            ) * alpha
+            lab[:, :, 1] += np.clip(
+                skin_a - lab[:, :, 1], -18.0, 18.0,
+            ) * alpha * .94
+            lab[:, :, 2] += np.clip(
+                skin_b - lab[:, :, 2], -22.0, 18.0,
+            ) * alpha * .96
+
+            # Preserve thin, high-contrast jewelry and clothing-edge detail.
+            # These structures are much sharper than a sun/shadow field and
+            # should never be recolored to skin even when a closing operation
+            # bridges across a narrow necklace chain.
+            detail_protect = body_window & (np.abs(fine_l) >= 18.0)
+            detail_alpha = cv2.GaussianBlur(
+                detail_protect.astype(np.uint8) * 255, (0, 0), .8,
+            ).astype(np.float32) / 255.0
+            detail_alpha *= alpha
+            lab = (
+                lab * (1.0 - detail_alpha[:, :, None])
+                + original_lab * detail_alpha[:, :, None]
+            )
+            logger.info(
+                "[BODY_LIGHT] Corrected residual neck/chest sunlight on %d pixels",
+                int(affected.sum()),
+            )
+            return Image.fromarray(
+                cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+            )
+        except Exception as exc:
+            logger.warning("[BODY_LIGHT] Body-only sunlight correction skipped: %s", exc)
+            return image_pil
+
+    @staticmethod
+    def restore_sunlit_hair_tone(image_pil: Image.Image) -> Image.Image:
+        """Recover dark crown tone from shaded hair without redrawing strands.
+
+        Direct sun can clip a dark crown to silver/grey even after luminance
+        compression.  The face geometry bounds this correction to the crown;
+        shaded hair in the same upload supplies the target tone.  Skin, green
+        scenery, and bright/purple flower accessories are explicitly excluded.
+        """
+        try:
+            rgb = np.array(image_pil.convert("RGB"))
+            height, width = rgb.shape[:2]
+            faces = _get_insight_app().get(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            if len(faces) != 1:
+                return image_pil
+
+            x1, y1, x2, y2 = [int(value) for value in faces[0].bbox]
+            face_w, face_h = max(24, x2 - x1), max(24, y2 - y1)
+            center_x = (x1 + x2) // 2
+            crown = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                crown,
+                (center_x, max(0, y1 - int(face_h * 0.08))),
+                (int(face_w * 0.82), int(face_h * 0.72)),
+                0, 0, 360, 255, -1,
+            )
+            crown[int(y1 + face_h * 0.38):, :] = 0
+
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+            ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+            hue, saturation, value = cv2.split(hsv)
+            skin = (
+                (ycrcb[:, :, 1] >= 133) & (ycrcb[:, :, 1] <= 178)
+                & (ycrcb[:, :, 2] >= 72) & (ycrcb[:, :, 2] <= 132)
+            )
+            green = (hue >= 30) & (hue <= 100) & (saturation >= 38)
+            purple_flower = (hue >= 118) & (hue <= 172) & (saturation >= 22)
+            bright_flower = (value >= 205) & (saturation <= 42)
+            allowed = (
+                (crown > 0) & ~skin & ~green & ~purple_flower & ~bright_flower
+            )
+            try:
+                from pipelines.schp_service import parse as parse_body_parts
+
+                labels = parse_body_parts(rgb)["labels"]
+                semantic_hair = labels == 2
+                # SCHP is used only as a positive hair authority here. The
+                # colour/backdrop guards below still prevent its occasional
+                # crown over-segmentation from touching the studio backdrop.
+                allowed &= semantic_hair
+            except Exception as parse_error:
+                logger.warning("[HAIR_TONE] Semantic hair mask unavailable: %s", parse_error)
+
+            lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+            edge = max(4, min(18, height // 20, width // 20))
+            border_samples = np.concatenate((
+                lab[:edge, :edge].reshape(-1, 3),
+                lab[:edge, -edge:].reshape(-1, 3),
+                lab[-edge:, :edge].reshape(-1, 3),
+                lab[-edge:, -edge:].reshape(-1, 3),
+            ))
+            backdrop_lab = np.median(border_samples, axis=0)
+            # The crown ellipse necessarily overlaps the backdrop above the
+            # head. Never interpret that smooth generated colour as sunlit
+            # hair; doing so created a dark grey cap around the crown.
+            backdrop_like = np.linalg.norm(
+                lab - backdrop_lab[None, None, :], axis=2,
+            ) <= 60.0
+            allowed &= ~backdrop_like
+            dark_seed = allowed & (value >= 22) & (value <= 112)
+            if int(dark_seed.sum()) < max(20, int(face_w * face_h * 0.002)):
+                return image_pil
+            seed_l = float(np.median(lab[:, :, 0][dark_seed]))
+            seed_a = float(np.median(lab[:, :, 1][dark_seed]))
+            seed_b = float(np.median(lab[:, :, 2][dark_seed]))
+            excess = np.clip((lab[:, :, 0] - (seed_l + 10.0)) / 72.0, 0.0, 1.0)
+            if float(excess[allowed].max(initial=0.0)) <= 0.02:
+                return image_pil
+
+            # Natural dark hair contains many thin bright strands. Treating
+            # those as a sunlight patch turns them into flat grey paint. Only
+            # continue when the glare contains a genuinely broad connected
+            # region that survives an opening wider than individual strands.
+            glare_candidate = allowed & (excess >= .30)
+            broad_glare = cv2.morphologyEx(
+                glare_candidate.astype(np.uint8), cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1,
+            ).astype(bool)
+            minimum_broad_area = max(28, int(face_w * face_h * .0035))
+            if int(broad_glare.sum()) < minimum_broad_area:
+                logger.info(
+                    "[HAIR_TONE] Skipped: generated hair contains only "
+                    "natural strand highlights (broad=%d threshold=%d)",
+                    int(broad_glare.sum()), minimum_broad_area,
+                )
+                return image_pil
+
+            # Use a continuous crown field instead of a binary glare map.
+            # The binary map left isolated grey holes between bright strands;
+            # this preserves their relative texture and only compresses their
+            # low-frequency highlight intensity.
+            alpha = cv2.GaussianBlur(
+                allowed.astype(np.uint8) * 255, (17, 17), 3.5
+            ).astype(np.float32) / 255.0
+            alpha *= excess * 0.86
+            alpha[~allowed] = 0.0
+            target_l = seed_l + np.clip((lab[:, :, 0] - seed_l) * .28, 0.0, 28.0)
+            lab[:, :, 0] += (target_l - lab[:, :, 0]) * alpha
+            # Very small chroma stabilization avoids a green/grey cast while
+            # retaining the generated hair's own colour and flower edges.
+            lab[:, :, 1] += (seed_a - lab[:, :, 1]) * alpha * 0.34
+            lab[:, :, 2] += (seed_b - lab[:, :, 2]) * alpha * 0.34
+            logger.info(
+                "[HAIR_TONE] Recovered sunlit crown from shaded source hair L=%.1f",
+                seed_l,
+            )
+            return Image.fromarray(
+                cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+            )
+        except Exception as exc:
+            logger.warning("[HAIR_TONE] Sunlit crown recovery skipped: %s", exc)
+            return image_pil
+
+    @staticmethod
+    def restore_source_face_microtexture(
+        source_pil: Image.Image,
+        portrait_pil: Image.Image,
+        strength: float = 0.48,
+    ) -> Image.Image:
+        """Restore real facial detail without copying source colour or pixels.
+
+        Qwen can smooth pores and fine feature contrast even when identity is
+        correct. Align the source by landmarks, extract only its high-frequency
+        luminance, and add that detail inside a softly eroded facial hull. The
+        generated lighting, complexion, geometry, hair and backdrop remain
+        entirely from the accepted portrait.
+        """
+        try:
+            from skimage.transform import SimilarityTransform
+
+            source_rgb = np.asarray(source_pil.convert("RGB"), dtype=np.uint8)
+            target_rgb = np.asarray(portrait_pil.convert("RGB"), dtype=np.uint8)
+            height, width = target_rgb.shape[:2]
+            detector = _get_insight_app()
+            source_faces = detector.get(cv2.cvtColor(source_rgb, cv2.COLOR_RGB2BGR))
+            target_faces = detector.get(cv2.cvtColor(target_rgb, cv2.COLOR_RGB2BGR))
+            if len(source_faces) != 1 or len(target_faces) != 1:
+                return portrait_pil
+
+            transform = SimilarityTransform()
+            transform.estimate(source_faces[0].kps, target_faces[0].kps)
+            matrix = transform.params[:2, :].astype(np.float32)
+            source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
+            warped_gray = cv2.warpAffine(
+                source_gray, matrix, (width, height),
+                flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT,
+            ).astype(np.float32)
+            source_detail = warped_gray - cv2.GaussianBlur(
+                warped_gray, (0, 0), 1.15,
+            )
+            source_detail = np.clip(source_detail, -22.0, 22.0)
+
+            landmarks = getattr(source_faces[0], "landmark_2d_106", None)
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if landmarks is not None and len(landmarks) >= 20:
+                aligned = cv2.transform(
+                    np.asarray(landmarks, dtype=np.float32).reshape(-1, 1, 2),
+                    matrix,
+                ).reshape(-1, 2)
+                cv2.fillConvexPoly(mask, cv2.convexHull(aligned.astype(np.int32)), 255)
+            else:
+                x1, y1, x2, y2 = [int(v) for v in target_faces[0].bbox]
+                cv2.ellipse(
+                    mask, ((x1 + x2) // 2, (y1 + y2) // 2),
+                    (max(8, int((x2 - x1) * .43)), max(8, int((y2 - y1) * .48))),
+                    0, 0, 360, 255, -1,
+                )
+            mask = cv2.erode(
+                mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1,
+            )
+            alpha = cv2.GaussianBlur(mask, (17, 17), 4.0).astype(np.float32) / 255.0
+            target_lab = cv2.cvtColor(target_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+            target_lab[:, :, 0] = np.clip(
+                target_lab[:, :, 0]
+                + source_detail * alpha * float(np.clip(strength, 0.0, 0.5)),
+                0, 255,
+            )
+            logger.info("[FACE_TEXTURE] Restored aligned source microtexture")
+            return Image.fromarray(
+                cv2.cvtColor(target_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+            )
+        except Exception as exc:
+            logger.warning("[FACE_TEXTURE] Source microtexture recovery skipped: %s", exc)
+            return portrait_pil
+
+    @staticmethod
+    def match_source_skin_chroma(
+        source_pil: Image.Image,
+        portrait_pil: Image.Image,
+    ) -> Image.Image:
+        """Match generated skin undertone to the source without changing light.
+
+        Qwen can keep identity and studio illumination yet shift medium/deep
+        skin toward yellow.  Measure robust midtone skin independently in both
+        images, then apply only a tightly bounded LAB a/b offset to semantic
+        skin pixels. Luminance, anatomy, texture, hair and backdrop are kept
+        byte-for-byte outside the soft skin mask.
+        """
+        try:
+            from pipelines.schp_service import parse as parse_body_parts
+
+            source_rgb = np.asarray(source_pil.convert("RGB"), dtype=np.uint8)
+            output_rgb = np.asarray(portrait_pil.convert("RGB"), dtype=np.uint8)
+            source_labels = parse_body_parts(source_rgb)["labels"]
+            output_labels = parse_body_parts(output_rgb)["labels"]
+
+            source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+            output_lab = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+            def stable_face_sample(lab: np.ndarray, labels: np.ndarray):
+                face = labels == 13
+                if int(face.sum()) < 96:
+                    return None
+                lightness = lab[:, :, 0]
+                values = lightness[face]
+                low, high = np.percentile(values, (20, 80))
+                stable = face & (lightness >= low) & (lightness <= high)
+                if int(stable.sum()) < 64:
+                    stable = face
+                return np.median(lab[stable], axis=0)
+
+            source_tone = stable_face_sample(source_lab, source_labels)
+            output_tone = stable_face_sample(output_lab, output_labels)
+            if source_tone is None or output_tone is None:
+                return portrait_pil
+
+            # Chroma-only: preserve Qwen's accepted studio exposure. The
+            # strict bound prevents a coloured source illuminant from being
+            # copied wholesale into the finished portrait.
+            chroma_delta = np.clip(source_tone[1:] - output_tone[1:], -7.0, 7.0)
+            # Direct sun can make even the robust source sample artificially
+            # yellow. Never transfer additional yellow from the upload; this
+            # correction may only remove a generated yellow cast. The red/
+            # green undertone remains a bounded source-relative adjustment.
+            chroma_delta[1] = min(0.0, float(chroma_delta[1]))
+            if float(np.linalg.norm(chroma_delta)) < 1.25:
+                return portrait_pil
+
+            output_skin = np.isin(output_labels, (13, 14, 15, 16, 17))
+            chroma_distance = np.sqrt(
+                (output_lab[:, :, 1] - output_tone[1]) ** 2
+                + (output_lab[:, :, 2] - output_tone[2]) ** 2
+            )
+            # Semantic labels locate skin; person-specific chroma excludes
+            # eyes, lips, jewelry and similarly labelled garment fragments.
+            skin = output_skin & (chroma_distance <= 23.0)
+            skin = cv2.morphologyEx(
+                skin.astype(np.uint8), cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            )
+            if int(skin.sum()) < 96:
+                return portrait_pil
+            alpha = cv2.GaussianBlur(
+                skin * 255, (0, 0), 2.2,
+            ).astype(np.float32) / 255.0
+            output_lab[:, :, 1] += alpha * float(chroma_delta[0]) * .82
+            output_lab[:, :, 2] += alpha * float(chroma_delta[1]) * .82
+            corrected = cv2.cvtColor(
+                output_lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB,
+            )
+            logger.info(
+                "[SKIN_CHROMA] Matched source undertone without luminance change "
+                "(da=%.1f db=%.1f)",
+                float(chroma_delta[0]), float(chroma_delta[1]),
+            )
+            return Image.fromarray(corrected, "RGB")
+        except Exception as exc:
+            logger.warning("[SKIN_CHROMA] Source undertone match skipped: %s", exc)
+            return portrait_pil
 
     @staticmethod
     def lock_source_hair(
@@ -745,9 +1668,10 @@ class PhotoRestorationService:
             fw, fh = max(24, x2 - x1), max(24, y2 - y1)
             cx = (x1 + x2) // 2
             hair_region = np.zeros((h, w), dtype=np.uint8)
-            cv2.ellipse(hair_region, (cx, max(0, y1 + int(fh * 0.12))), (int(fw * 0.92), int(fh * 0.95)), 0, 0, 360, 255, -1)
+            # Wider ellipse to cover long/curly women's hair extending past shoulders
+            cv2.ellipse(hair_region, (cx, max(0, y1 + int(fh * 0.05))), (int(fw * 1.25), int(fh * 1.30)), 0, 0, 360, 255, -1)
             # Never copy source facial pixels back over the restored face.
-            cv2.ellipse(hair_region, (cx, y1 + fh // 2), (int(fw * 0.58), int(fh * 0.64)), 0, 0, 360, 0, -1)
+            cv2.ellipse(hair_region, (cx, y1 + fh // 2), (int(fw * 0.56), int(fh * 0.62)), 0, 0, 360, 0, -1)
 
             hsv_source = cv2.cvtColor(warped_source, cv2.COLOR_BGR2HSV)
             hsv_target = cv2.cvtColor(portrait_bgr, cv2.COLOR_BGR2HSV)
@@ -759,7 +1683,7 @@ class PhotoRestorationService:
                 # Phone portraits can contain blue/grey specular hair detail
                 # above the old dark-only threshold. Keep those true source
                 # strands so Qwen cannot replace them with silver strokes.
-                (hsv_source[:, :, 2] < 178)
+                (hsv_source[:, :, 2] < 210)
                 & (hsv_source[:, :, 1] < 205)
                 & ~((hsv_source[:, :, 0] >= 32) & (hsv_source[:, :, 0] <= 95) & (hsv_source[:, :, 1] >= 40))
             ).astype(np.uint8) * 255
@@ -767,7 +1691,8 @@ class PhotoRestorationService:
             # This excludes original dark branches that lie over the new solid
             # backdrop, while allowing source texture to correct pale streaks
             # within Qwen's existing hair silhouette.
-            target_hair_seed = (hsv_target[:, :, 2] < 125).astype(np.uint8) * 255
+            # Raised from 125->165 to include medium-brown and lighter dark hair
+            target_hair_seed = (hsv_target[:, :, 2] < 165).astype(np.uint8) * 255
             target_hair_area = cv2.dilate(
                 target_hair_seed,
                 # A wider local halo includes Qwen's bright, synthetic hair
@@ -817,20 +1742,22 @@ class PhotoRestorationService:
             x1, y1, x2, y2 = [int(value) for value in faces_target[0].bbox]
             fw, fh = max(24, x2 - x1), max(24, y2 - y1)
             hair_region = np.zeros((h, w), dtype=np.uint8)
-            cv2.ellipse(hair_region, ((x1 + x2) // 2, max(0, y1 + int(fh * 0.12))),
-                        (int(fw * 0.92), int(fh * 0.95)), 0, 0, 360, 255, -1)
+            # Wider ellipse to cover long/curly women's hair extending past shoulders
+            cv2.ellipse(hair_region, ((x1 + x2) // 2, max(0, y1 + int(fh * 0.05))),
+                        (int(fw * 1.25), int(fh * 1.30)), 0, 0, 360, 255, -1)
+            # Inner face exclusion stays proportional
             cv2.ellipse(hair_region, ((x1 + x2) // 2, y1 + fh // 2),
-                        (int(fw * 0.58), int(fh * 0.64)), 0, 0, 360, 0, -1)
+                        (int(fw * 0.56), int(fh * 0.62)), 0, 0, 360, 0, -1)
 
             source_hsv = cv2.cvtColor(warped_source, cv2.COLOR_BGR2HSV)
             target_hsv = cv2.cvtColor(portrait_bgr, cv2.COLOR_BGR2HSV)
             source_dark_hair = (
-                (source_hsv[:, :, 2] < 178)
+                (source_hsv[:, :, 2] < 210)
                 & (source_hsv[:, :, 1] < 205)
                 & ~((source_hsv[:, :, 0] >= 32) & (source_hsv[:, :, 0] <= 95) & (source_hsv[:, :, 1] >= 40))
             ).astype(np.uint8) * 255
             target_hair_neighborhood = cv2.dilate(
-                (target_hsv[:, :, 2] < 150).astype(np.uint8) * 255,
+                (target_hsv[:, :, 2] < 175).astype(np.uint8) * 255,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23)), iterations=1,
             )
             mask = cv2.bitwise_and(hair_region, source_dark_hair)
@@ -931,6 +1858,7 @@ class PhotoRestorationService:
         orig_pil: Image.Image,
         qwen_pil: Image.Image,
         identity_lock_strength: float = 0.88,
+        preserve_outside_face: bool = False,
     ) -> Image.Image:
         """
         Fuses Qwen's regenerated lighting, background, and textures with 100% of the
@@ -1018,6 +1946,14 @@ class PhotoRestorationService:
 
                 w_matched = cv2.cvtColor(w_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
                 fused = (w_matched.astype(np.float32) * mask_3c + qwen_bgr.astype(np.float32) * (1.0 - mask_3c)).clip(0, 255).astype(np.uint8)
+
+                # Uniform Swap must preserve Qwen's garment and exact backdrop
+                # pixels byte-for-byte outside the soft facial hull. The legacy
+                # global saturation pass is retained for callers that explicitly
+                # want portrait-wide grading, but is skipped by the bounded
+                # uniform identity repair.
+                if preserve_outside_face:
+                    return Image.fromarray(cv2.cvtColor(fused, cv2.COLOR_BGR2RGB))
 
                 # Moderate overall saturation to professional portrait standards
                 hsv = cv2.cvtColor(fused, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -1152,7 +2088,7 @@ class PhotoRestorationService:
                         "altered face, wrong identity, plastic skin, changed hairstyle, changed dress, "
                         "missing jewelry, blurry earrings, distorted ornaments, smudged fabric, deformed eyes"
                     ),
-                    true_cfg_scale=3.8,
+                    true_cfg_scale=1.2,  # Strictly kept between 1.0 and 1.5 to prevent burning colors
                     steps=4,
                 )
                 pil_res = Image.open(gen_path).convert("RGB")
@@ -1303,17 +2239,20 @@ class PhotoRestorationService:
         """
         h_orig, w_orig = img_bgr.shape[:2]
 
-        if "35 x 45" in target_format or "ICAO" in target_format:
+        if "35 x 45" in target_format or "ICAO" in target_format or "2 x 2" in target_format or "Visa" in target_format:
+            # Strictly non-square portrait format (35 x 45 mm)
             target_w, target_h = 630, 810
             target_aspect = 35.0 / 45.0
-        elif "2 x 2" in target_format or "Visa" in target_format:
-            target_w, target_h = 600, 600
-            target_aspect = 1.0
         elif "3:4" in target_format or "Studio" in target_format:
             target_w, target_h = 600, 800
             target_aspect = 3.0 / 4.0
         else:
-            return img_bgr
+            if h_orig == w_orig:
+                # Disallow square dimensions: convert to standard portrait format
+                target_w, target_h = 630, 810
+                target_aspect = 35.0 / 45.0
+            else:
+                return img_bgr
 
         geom = _head_geometry(img_bgr)
         if geom is not None:
@@ -1322,6 +2261,53 @@ class PhotoRestorationService:
             crop_h = est_head_h / max(float(head_height_ratio), 0.20)
             crop_h *= 1.12
             crop_w = crop_h * target_aspect
+
+            # Face geometry alone does not include wide curls, ponytails,
+            # flowers, bows or clips. On a portrait Qwen canvas, estimate the
+            # significant foreground extent against the flat border colour and
+            # zoom out just enough to keep that complete head silhouette. The
+            # face remains the horizontal anchor, so an asymmetric accessory
+            # cannot pull the person off centre.
+            try:
+                edge = max(4, min(18, h_orig // 24, w_orig // 24))
+                corners = np.concatenate((
+                    img_bgr[:edge, :edge].reshape(-1, 3),
+                    img_bgr[:edge, -edge:].reshape(-1, 3),
+                    img_bgr[-edge:, :edge].reshape(-1, 3),
+                    img_bgr[-edge:, -edge:].reshape(-1, 3),
+                ))
+                backdrop = np.median(corners, axis=0).astype(np.float32)
+                foreground = np.linalg.norm(
+                    img_bgr.astype(np.float32) - backdrop, axis=2,
+                ) > 22.0
+                # Require a small vertical run so JPEG noise or a single edge
+                # pixel cannot force an unnecessary zoom-out.
+                column_counts = foreground.sum(axis=0)
+                valid_columns = np.flatnonzero(
+                    column_counts >= max(4, int(h_orig * .006))
+                )
+                if valid_columns.size:
+                    content_x1 = int(valid_columns[0])
+                    content_x2 = int(valid_columns[-1]) + 1
+                    side_safety = max(8.0, w_orig * .025)
+                    required_half_width = max(
+                        face_cx - content_x1,
+                        content_x2 - face_cx,
+                    ) + side_safety
+                    accessory_safe_width = required_half_width * 2.0
+                    if accessory_safe_width > crop_w:
+                        crop_w = accessory_safe_width
+                        crop_h = crop_w / target_aspect
+                        logger.info(
+                            "[PASSPORT_FRAME] Expanded for hair/accessories "
+                            "x=%d..%d crop=%.0fx%.0f",
+                            content_x1, content_x2, crop_w, crop_h,
+                        )
+            except Exception as extent_error:
+                logger.warning(
+                    "[PASSPORT_FRAME] Hair/accessory extent check skipped: %s",
+                    extent_error,
+                )
 
             # Never invent a huge empty canvas — zoom out only as far as the photo allows
             fit = min(1.0, w_orig / max(crop_w, 1.0), h_orig / max(crop_h, 1.0))

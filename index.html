@@ -884,9 +884,6 @@
               <a id="enhance-dl-btn" class="btn-action" href="#" download="" style="flex:1;justify-content:center;text-decoration:none;font-weight:600;background:linear-gradient(135deg, var(--gold) 0%, var(--gold-dim) 100%);color:#000;">
                 ↓ Download Enhanced Image (<span id="enhance-dl-name-display"></span>)
               </a>
-              <a id="enhance-safe-dl-btn" class="btn-action" href="#" download="" style="display:none;flex:1;justify-content:center;text-decoration:none;font-weight:600;">
-                ↓ Download Source-Preserving Version
-              </a>
             </div>
           </div>
         </div>
@@ -1212,6 +1209,12 @@
       cancelled: false
     };
 
+    function formatJobEta(job) {
+      const text = String(job?.estimated_time || '').trim();
+      if (!text || text === 'complete' || text === 'stopped') return '';
+      return ` • ${text}`;
+    }
+
     // ─── Toast ─────────────────────────────────────────────────────────────
     function toast(msg, type = 'info') {
       const wrap = document.getElementById('toasts');
@@ -1313,10 +1316,9 @@
       downloadRow.style.display = state === 'complete' ? 'flex' : 'none';
     }
 
-    function renderEnhanceResult(url, downloadUrl = url, reviewLabel = '', safeDownloadUrl = '') {
+    function renderEnhanceResult(url, downloadUrl = url, reviewLabel = '') {
       const afterImg = document.getElementById('enhance-img-after');
       const dlBtn = document.getElementById('enhance-dl-btn');
-      const safeDlBtn = document.getElementById('enhance-safe-dl-btn');
       afterImg.onload = () => {
         setEnhanceAfterState('complete');
         const stage = document.getElementById('enhance-after-stage');
@@ -1326,8 +1328,6 @@
       };
       afterImg.src = url;
       dlBtn.href = downloadUrl;
-      safeDlBtn.href = safeDownloadUrl || '#';
-      safeDlBtn.style.display = safeDownloadUrl ? 'inline-flex' : 'none';
     }
 
     async function startEnhance() {
@@ -1436,7 +1436,7 @@
             const prog = Math.max(1, Math.min(job.progress || 1, 99));
             fillEl.style.width = `${prog}%`;
             pctEl.textContent = `${prog}%`;
-            msgEl.textContent = job.message || 'Processing on GPU (1-by-1)…';
+            msgEl.textContent = `${job.message || 'Processing on GPU (1-by-1)…'}${formatJobEta(job)}`;
           } else if (job.status === 'done') {
             clearInterval(enhanceState.pollInterval);
             enhanceState.processing = false;
@@ -1448,26 +1448,14 @@
 
             const rawPath = (job && (job.output_path || job.result_url)) || '';
             const outUrl = (typeof rawPath === 'string' && rawPath.startsWith('http')) ? rawPath : `/${String(rawPath).replace(/^\/+/, '')}?t=${Date.now()}`;
-            const rawCandidate = job.candidate_path || '';
-            const candidateUrl = rawCandidate
-              ? `/${String(rawCandidate).replace(/^\/+/, '')}?t=${Date.now()}`
-              : '';
-            // The main preview and primary download must refer to the same
-            // generated file. When identity QA rejects it, retain the
-            // source-preserving result as a separate secondary download.
-            enhanceState.resultUrl = candidateUrl || outUrl;
-            renderEnhanceResult(
-              enhanceState.resultUrl,
-              candidateUrl || outUrl,
-              candidateUrl ? 'Qwen Generation - Review' : '',
-              candidateUrl ? outUrl : ''
-            );
+            // Enhancement exposes exactly one deliverable: the Qwen-generated
+            // portrait. Preview and download always point to the same file.
+            enhanceState.resultUrl = outUrl;
+            renderEnhanceResult(outUrl, outUrl);
 
             const downloadName = (job.metadata && job.metadata.download_name) || job.original_filename || enhanceState.origName || 'enhanced.png';
             const dlBtn = document.getElementById('enhance-dl-btn');
             dlBtn.download = downloadName;
-            const safeDlBtn = document.getElementById('enhance-safe-dl-btn');
-            safeDlBtn.download = `source_preserving_${downloadName}`;
             document.getElementById('enhance-dl-name-display').textContent = downloadName;
             document.getElementById('enhance-compare').style.display = 'grid';
 
@@ -1645,6 +1633,14 @@
     async function startUniformSwap() {
       if (!uniformState.personFile || !uniformState.uniformFile) return;
 
+      // A completed job's poller can still fire while the retry upload is in
+      // flight and overwrite the new run with the previous failure message.
+      if (uniformState.pollInterval) {
+        clearInterval(uniformState.pollInterval);
+        uniformState.pollInterval = null;
+      }
+      uniformState.jobId = null;
+
       const btn = document.getElementById('uniform-run-btn');
       btn.disabled = true;
       uniformState.abortController = new AbortController();
@@ -1730,7 +1726,7 @@
             const progress = Math.max(1, Math.min(job.progress || 1, 99));
             document.getElementById('uniform-fill').style.width = `${progress}%`;
             document.getElementById('uniform-pct').textContent = `${progress}%`;
-            document.getElementById('uniform-msg').textContent = job.message || 'Fitting uniform…';
+            document.getElementById('uniform-msg').textContent = `${job.message || 'Fitting uniform…'}${formatJobEta(job)}`;
             setUniformLoadingCopy(job.message);
           }
 
@@ -1963,12 +1959,12 @@
               if (job.status === 'queued') {
                 item.status = 'queued';
                 item.progress = 0;
-                item.message = job.queue_position > 0 ? `Position #${job.queue_position} in queue` : 'Queued…';
+                item.message = `${job.queue_position > 0 ? `Position #${job.queue_position} in queue` : 'Queued…'}${formatJobEta(job)}`;
                 updateBulkItemUI(item);
               } else if (job.status === 'processing') {
                 item.status = 'processing';
                 item.progress = Math.max(1, Math.min(job.progress || 1, 99));
-                item.message = job.message || 'Processing on GPU…';
+                item.message = `${job.message || 'Processing on GPU…'}${formatJobEta(job)}`;
                 updateBulkItemUI(item);
               } else if (job.status === 'done') {
                 clearInterval(pollTimer);

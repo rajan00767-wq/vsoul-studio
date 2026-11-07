@@ -19,14 +19,16 @@ def restore_uniform_hair_accessories(image, aligned_source, labels, aligned_sour
     # can import matte errors, outdoor shadow, or background pixels around
     # long strands. Restore only the common, confident hair interior and let
     # Qwen keep its own clean outer edge.
+    # Reduced erosion kernel from 3->2 so fine/thin women's hair strands
+    # are not completely removed before the safe-dilation step
     generated_hair_core = cv2.erode(
         generated_hair,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
         iterations=1,
     )
     generated_hair_safe = cv2.dilate(
         generated_hair_core,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
         iterations=1,
     )
     restore_mask = source_hair.astype(bool) & generated_hair_safe.astype(bool)
@@ -95,13 +97,15 @@ def restore_uniform_hair_accessories(image, aligned_source, labels, aligned_sour
         area = int(stats[component, cv2.CC_STAT_AREA])
         if 8 <= area <= max_accessory_area:
             accessory |= component_labels == component
+    # Raised base hair blend from 0.38->0.52 for stronger restoration of
+    # women's long hair detail that Qwen tends to smooth out
     base_alpha = cv2.GaussianBlur(
         restore_mask.astype(np.uint8) * 255, (7, 7), 0,
-    ).astype(np.float32) / 255.0 * .38
+    ).astype(np.float32) / 255.0 * .52
     accessory_alpha = cv2.GaussianBlur(
         accessory.astype(np.uint8) * 255, (5, 5), 0,
-    ).astype(np.float32) / 255.0 * .72
-    alpha = np.clip(base_alpha + accessory_alpha, 0.0, .82)
+    ).astype(np.float32) / 255.0 * .78
+    alpha = np.clip(base_alpha + accessory_alpha, 0.0, .88)
     result = rgb.astype(np.float32) * (1.0 - alpha[:, :, None]) + matched_source * alpha[:, :, None]
     metadata["accessory_restore_pixels"] = int(np.count_nonzero(accessory))
     metadata["applied"] = True
@@ -258,7 +262,9 @@ def finish_uniform_tones(
 
             # Compress the bright end smoothly across dark hair. This retains
             # strand contrast and avoids isolated dark marks at the parting.
-            strength = np.clip((luma - 72.0) / 108.0, 0.0, 1.0)
+            # Lowered from 72->58 to catch medium-brightness glare in women's
+            # lighter brown hair that was being missed
+            strength = np.clip((luma - 58.0) / 122.0, 0.0, 1.0)
             strength *= correction_mask.astype(np.float32)
             alpha = cv2.GaussianBlur(strength, (7, 7), 1.4)
             adjustment = alpha * 38.0
