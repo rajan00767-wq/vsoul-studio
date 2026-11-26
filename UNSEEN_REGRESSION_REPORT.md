@@ -5,18 +5,16 @@ Comprehensive regression evaluation across unseen real-world portraits, challeng
 
 ## Results Summary
 
-| Test ID | Category | Scenario Description | Source Portrait | Uniform Reference | Background | Status | Biometric Sim | Geometry RMSE | Defects | Delivery Outcome |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **T001** | Non-standard Hair | Boys with straight and curly hairstyles | `curly_hair.png` | `REF001_red_collar.png` | `#FFFFFF` | **completed** | **0.9980** | **0.0021** | None | **Delivered** |
-| **T006** | Braided Silhouettes | Girls with different braid styles | `braids.png` | `REF001_red_collar.png` | `#FFFFFF` | **completed** | **0.9979** | **0.0010** | None | **Delivered** |
-| **T011** | Hair Accessories | Girls with coloured bows and ribbons | `maroon_bows.png` | `REF001_red_collar.png` | `#FFFFFF` | **completed** | **0.9970** | **0.0010** | None | **Delivered** |
-| **T016** | Complex Accessories | Girls with single braid and floral bow | `no_bows.png` | `REF001_red_collar.png` | `#FFFFFF` | **completed** | **0.9968** | **0.0013** | None | **Delivered** |
-| **T021** | Facial Jewelry | Glasses, bindi and earrings | `glasses_bindi.png` | `REF002_navy_collar.png` | `#047EF6` | **completed** | **0.9921** | **0.0017** | None | **Delivered** |
-| **T026** | Casual Source | Different original garments (plaid/casual) | `casual_shirt.png` | `REF003_tie.png` | `#77BF91` | **completed** | **0.9920** | **0.0013** | None | **Delivered** |
-| **T031** | Harsh Lighting | Strong sunlight and deep facial shadows | `sunlight.png` | `REF001_red_collar.png` | `#ADD8E6` | **completed** | **0.9978** | **0.0025** | None | **Delivered** |
-| **T036** | Low Resolution | Low-resolution and blurred photographs | `blurred.png` | `REF001_red_collar.png` | `#D3D3D3` | **completed** | **0.9986** | **0.0020** | None | **Delivered** |
-| **T041** | Historical Print | Old and scanned photographs | `scanned.png` | `REF004_vest.png` | `#F5E6D3` | **completed** | **0.9900** | **0.0044** | None | **Delivered** |
-| **T046** | Natural BG & Tilt | Complex backgrounds and tilted faces | `complex_background.png` | `REF002_navy_collar.png` | `#047EF6` | **completed** | **0.9951** | **0.0033** | None | **Delivered** |
+| Test ID | Category | Source | Uniform | Status | Biometric Sim | Geometry RMSE | Defects | Delivered |
+|---------|----------|--------|---------|--------|---------------|---------------|---------|-----------|
+| REG_01_Scanned_RedCollar | Scanned Vintage Photo | scanned.png | REF001_red_collar.png | **needs_review** | 0.9898 | 0.0032 | 3 | needs_review |
+| REG_02_ComplexBG_NavyCollar | Complex Natural Background | complex_background.png | REF002_navy_collar.png | **needs_review** | 0.9950 | 0.0036 | 2 | needs_review |
+| REG_03_GlassesBindi_Vest | Eyeglasses & Bindi Retention | glasses_bindi.png | REF004_vest.png | **needs_review** | 0.9945 | 0.0009 | 3 | needs_review |
+| REG_04_LongBraids_Tie | Long Braids Over Garment | braids.png | REF003_tie.png | **needs_review** | 0.9961 | 0.0004 | 1 | needs_review |
+| REG_05_ShortBoy_Tie | Short Hair Boy Portrait | blue_bg_boy.png | REF003_tie.png | **needs_review** | 0.9916 | 0.0017 | 2 | needs_review |
+| REG_06_StraightHair_RedCollar | Straight Hair with Custom Backdrop | straight_hair.png | REF001_red_collar.png | **needs_review** | 0.9879 | 0.0013 | 4 | needs_review |
+| REG_07_BowsRibbons_NavyCollar | Hair Bows & Ribbons | blue_bg_bows.png | REF002_navy_collar.png | **completed** | 0.9959 | 0.0015 | 0 | REG_07_BowsRibbons_NavyCollar_uniform.png |
+| REG_08_Sunlight_Vest | Harsh Sunlight Balancing | sunlight.png | REF004_vest.png | **needs_review** | 0.9934 | 0.0013 | 4 | needs_review |
 
 ## Production Quality Assurance Policy
 - **Zero False Deliveries**: Any candidate with detected defects is strictly rejected and flagged for review.
