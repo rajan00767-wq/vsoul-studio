@@ -36,6 +36,15 @@ class UniformIdentityTests(unittest.TestCase):
         face = self.face([1., 0.])
         self.assertTrue(self.check([[face], [face]])["accepted"])
 
+    def test_global_crop_scale_and_translation_do_not_fake_geometry_failure(self):
+        a = self.face([1., 0.])
+        b = self.face([.82, np.sqrt(1.0 - .82 ** 2)])
+        b.landmark_2d_106 = b.landmark_2d_106 * 1.35 + np.asarray((17.0, -9.0))
+        b.kps = b.kps * 1.35 + np.asarray((17.0, -9.0))
+        result = self.check([[a], [b]])
+        self.assertTrue(result["accepted"])
+        self.assertLess(result["geometry_rmse"], .005)
+
     def test_high_similarity_regeneration_gets_narrow_geometry_tolerance(self):
         a = self.face([1., 0.])
         b = self.face([1., 0.])
@@ -79,6 +88,12 @@ class UniformIdentityTests(unittest.TestCase):
         result = self.check([[a], [b]], maximum_geometry_rmse=.030)
         self.assertTrue(result["accepted"])
         self.assertEqual(result["requested_maximum_geometry_rmse"], .030)
+        self.assertEqual(result["maximum_geometry_rmse"], .050)
+
+    def test_merely_strong_similarity_keeps_narrow_geometry_tolerance(self):
+        a = self.face([1., 0.])
+        b = self.face([.92, np.sqrt(1.0 - .92 ** 2)])
+        result = self.check([[a], [b]], maximum_geometry_rmse=.030)
         self.assertEqual(result["maximum_geometry_rmse"], .035)
 
     def test_identity_failure_reports_the_failed_gate(self):

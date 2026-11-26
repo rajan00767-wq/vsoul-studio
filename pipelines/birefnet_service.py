@@ -268,48 +268,96 @@ def _remove_schp_background_intrusions(
             if component_area < max(96, int(cleaned.size * 0.002)) and not np.any(component & near_main):
                 cleaned[component] = 0
     return cleaned
-def _estimate_background_color(img_rgb: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
-    """Robust color estimate from definite background around image borders."""
-    border = np.zeros(alpha_u8.shape, dtype=bool)
-    h, w = alpha_u8.shape
-    pad = max(3, min(h, w) // 32)
-    border[:pad, :] = True
-    border[-pad:, :] = True
-    border[:, :pad] = True
-    border[:, -pad:] = True
-    samples = img_rgb[(alpha_u8 < 24) & border]
-    if samples.size == 0:
-        samples = img_rgb[alpha_u8 < 12]
-    if samples.size == 0:
-        return np.array([255.0, 255.0, 255.0], dtype=np.float32)
-    return np.median(samples.reshape(-1, 3), axis=0).astype(np.float32)
 
 
-def _decontaminate_foreground(img_rgb: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
+def _recover_schp_missed_accessories(
+    alpha_u8: np.ndarray,
+    raw_alpha_u8: np.ndarray,
+    schp_labels: np.ndarray | None,
+) -> np.ndarray:
+    """Restore confident BiRefNet matte that SCHP calls background.
+
+    LIP-20 has no label for a hair ribbon, so a large bow reads as label 0 and
+    the intrusion cleanup zeroes it even when BiRefNet is certain. Measured on
+    job 30399633/bothfix: the viewer-right bow lost 4117 pixels whose raw alpha
+    averaged 251 and whose SCHP label was background for 4104 of them, and the
+    viewer-left bow lost a further ~2800. The delivered portrait then showed
+    clipped, smeared bows.
+
+    Recovery is deliberately narrow: only pixels BiRefNet is confident about,
+    only inside a band around the parsed person (so a detached background
+    object cannot re-enter), and only where the current alpha has dropped out.
     """
-    Pull edge pixels away from the estimated source background color.
-
-    This targets white/black/color halos without shrinking the alpha matte, so
-    hair strands, flowers, earrings, and soft accessories remain present.
-    """
-    rgb = img_rgb.astype(np.float32)
-    alpha = alpha_u8.astype(np.float32) / 255.0
-
-    # Estimate local background colors by inpainting foreground pixels from
-    # nearby definite-background pixels. This handles green gardens, white
-    # walls, and mixed school-photo backgrounds better than one global color.
-    local_bg = _local_background(img_rgb, alpha_u8)
-
-    edge = (alpha > 0.01) & (alpha < 0.98)
-    uncertain = np.clip(1.0 - np.abs(alpha - 0.5) * 2.0, 0.0, 1.0)
-    strength = np.clip((1.0 - alpha) * (0.35 + 0.55 * uncertain), 0.0, 0.88)
-
-    corrected_full = (rgb - local_bg * strength[:, :, None]) / np.maximum(
-        1.0 - strength[:, :, None],
-        0.28,
+    if schp_labels is None:
+        return alpha_u8
+    confident = raw_alpha_u8 >= 200
+    dropped = confident & (alpha_u8 < 128)
+    if not np.any(dropped):
+        return alpha_u8
+    person = (schp_labels > 0).astype(np.uint8)
+    if not np.any(person):
+        return alpha_u8
+    # A ribbon sits at the head, within roughly a head-width of parsed hair.
+    reach = cv2.dilate(
+        person,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)),
+        iterations=1,
+    ).astype(bool)
+    recoverable = dropped & reach
+    if not np.any(recoverable):
+        return alpha_u8
+    # Keep whole connected pieces, not a ragged subset: a half-restored bow
+    # loop is worse than none.
+    count, labels_r, stats_r, _ = cv2.connectedComponentsWithStats(
+        recoverable.astype(np.uint8), 8,
     )
-    corrected = rgb.copy()
-    corrected[edge] = corrected_full[edge]
+    restored = alpha_u8.copy()
+    for idx in range(1, count):
+        if int(stats_r[idx, cv2.CC_STAT_AREA]) < 64:
+            continue
+        piece = labels_r == idx
+        restored[piece] = np.maximum(restored[piece], raw_alpha_u8[piece])
+    return restored
+
+
+def _connected_raw_subject_core(
+    raw_alpha_u8: np.ndarray,
+    schp_labels: np.ndarray | None,
+) -> np.ndarray:
+    """Return confident BiRefNet components attached to the parsed person.
+
+    SCHP has no ribbon/bow class and commonly calls translucent loops
+    background.  The later source-palette cleanup then learns those blue or
+    red accessory pixels as "scene" and deletes them, even when BiRefNet's raw
+    matte correctly contains the complete bow.  Preserve an entire confident
+    raw component when it touches a dilated parser-confirmed human region.
+    Detached scenery cannot pass this attachment test.
+    """
+    confident_raw = (raw_alpha_u8 >= 184).astype(np.uint8)
+    if schp_labels is None:
+        return confident_raw.astype(bool)
+    human_mask = np.isin(
+        schp_labels, [1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
+    ).astype(np.uint8)
+    if not np.any(human_mask):
+        return np.zeros(raw_alpha_u8.shape, dtype=bool)
+    human_zone = cv2.dilate(
+        human_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+    ).astype(bool)
+    component_count, component_labels, component_stats, _ = (
+        cv2.connectedComponentsWithStats(confident_raw, 8)
+    )
+    attached = np.zeros(raw_alpha_u8.shape, dtype=bool)
+    for component_id in range(1, component_count):
+        component_area = int(component_stats[component_id, cv2.CC_STAT_AREA])
+        if component_area < 12:
+            continue
+        component = component_labels == component_id
+        human_overlap = int(np.count_nonzero(component & human_zone))
+        if human_overlap >= max(4, int(component_area * .0015)):
+            attached |= component
+    return attached
 
 
 def _estimate_background_color(img_rgb: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
@@ -501,6 +549,19 @@ class BackgroundRemovalService:
         local_bg = _local_background(img_arr, alpha_u8)
         alpha_u8 = _trim_background_alpha(img_arr, alpha_u8, local_bg)
         alpha_u8 = _remove_schp_background_intrusions(img_arr, alpha_u8, schp_labels)
+        # LIP-20 has no hair-ribbon label, so the cleanup above deletes bows
+        # that BiRefNet matted confidently. Put those back before the scene
+        # -leak logic runs; a bow is part of the hairstyle the uniform swap is
+        # required to preserve.
+        alpha_u8 = _recover_schp_missed_accessories(
+            alpha_u8, raw_alpha_u8, schp_labels,
+        )
+        # Compute this before palette rejection.  Otherwise a real bow that
+        # SCHP labelled background becomes part of the learned source-scene
+        # palette and is deleted a second time after accessory recovery.
+        raw_subject_core = _connected_raw_subject_core(
+            raw_alpha_u8, schp_labels,
+        )
         if source_labels is not None:
             # Learn the actual source-scene palette from pixels independently
             # classified as background in the uploaded portrait. This removes
@@ -564,16 +625,131 @@ class BackgroundRemovalService:
                         fy1, fy2 = int(face_y.min()), int(face_y.max())
                         fw = max(1, fx2 - fx1 + 1)
                         fh = max(1, fy2 - fy1 + 1)
-                        px1 = max(0, int(round(fx1 - fw * .16)))
-                        px2 = min(alpha_u8.shape[1], int(round(fx2 + fw * .16)) + 1)
-                        py1 = max(0, int(round(fy1 - fh * .08)))
-                        py2 = min(alpha_u8.shape[0], int(round(fy2 + fh * .46)) + 1)
-                        protected_face_neck[py1:py2, px1:px2] = True
-                    learned_scene_leak = (
-                        (palette_distance <= 20.0)
-                        & source_background
-                        & ~protected_face_neck
+                        face_guard = np.zeros(alpha_u8.shape, dtype=np.uint8)
+                        face_cx = (fx1 + fx2) * .5
+                        face_cy = (fy1 + fy2) * .5
+                        cv2.ellipse(
+                            face_guard,
+                            (int(round(face_cx)), int(round(face_cy))),
+                            (max(2, int(round(fw * .42))), max(2, int(round(fh * .55)))),
+                            0, 0, 360, 255, -1,
+                        )
+                        protected_face_neck = face_guard > 0
+                        # Protect the anatomical central neck corridor without
+                        # shielding side curls and their enclosed scene holes.
+                        nx1 = max(0, int(round(face_cx - fw * .35)))
+                        nx2 = min(alpha_u8.shape[1], int(round(face_cx + fw * .35)) + 1)
+                        ny1 = max(0, int(round(fy2 - fh * .03)))
+                        ny2 = min(alpha_u8.shape[0], int(round(fy2 + fh * .46)) + 1)
+                        protected_face_neck[ny1:ny2, nx1:nx2] = True
+                    source_lab = cv2.cvtColor(
+                        source_arr, cv2.COLOR_RGB2LAB,
                     )
+                    # SCHP commonly calls foliage/brick visible through curl
+                    # gaps "hair".  Because this branch is coordinate-aligned
+                    # to the untouched upload, reject those chromatic scene
+                    # pixels when they match the learned source-background
+                    # palette.  Keep dark hair and pale clips/flowers: only a
+                    # saturated, mid-light scene-colour impostor can pass.
+                    # Estimate whether each quantized colour belongs mostly
+                    # to parser-confirmed scenery in *this upload*. This keeps
+                    # silver/brown highlighted strands whose colour occurs
+                    # primarily on hair, while removing green leaves or brick
+                    # fragments whose bins overwhelmingly occur in the scene.
+                    bins_per_channel = 11
+                    source_bins = (
+                        (source_arr[:, :, 0] // 24).astype(np.int32)
+                        * bins_per_channel * bins_per_channel
+                        + (source_arr[:, :, 1] // 24).astype(np.int32)
+                        * bins_per_channel
+                        + (source_arr[:, :, 2] // 24).astype(np.int32)
+                    )
+                    bin_count = bins_per_channel ** 3
+                    total_counts = np.bincount(
+                        source_bins.ravel(), minlength=bin_count,
+                    )
+                    background_counts = np.bincount(
+                        source_bins[source_background].ravel(),
+                        minlength=bin_count,
+                    )
+                    background_confidence = (
+                        background_counts[source_bins].astype(np.float32)
+                        / np.maximum(total_counts[source_bins], 1)
+                    )
+                    source_hsv = cv2.cvtColor(
+                        source_arr, cv2.COLOR_RGB2HSV,
+                    )
+                    saturated_background = (
+                        source_background & (source_hsv[:, :, 1] >= 50)
+                    )
+                    hue_histogram = np.bincount(
+                        (source_hsv[:, :, 0][saturated_background] // 10).astype(np.int32),
+                        minlength=18,
+                    )
+                    # Keep several scene hues because foliage often spans
+                    # yellow-green through cyan while brick/wall pixels occupy
+                    # a separate red family. Hair glare has a different hue
+                    # and is additionally protected by face/neck geometry.
+                    dominant_scene_hue_bins = np.argsort(hue_histogram)[-8:]
+                    scene_hue_match = np.isin(
+                        source_hsv[:, :, 0] // 10,
+                        dominant_scene_hue_bins,
+                    )
+                    hair_pixels = source_labels == 2
+                    hair_l_values = source_lab[:, :, 0][hair_pixels]
+                    if hair_l_values.size >= 64:
+                        dark_hair_cut = float(np.percentile(hair_l_values, 40.0))
+                        dark_hair_anchor = np.median(
+                            source_lab[:, :, 1:][
+                                hair_pixels
+                                & (source_lab[:, :, 0] <= dark_hair_cut)
+                            ],
+                            axis=0,
+                        )
+                        hair_chroma_distance = np.linalg.norm(
+                            source_lab[:, :, 1:] - dark_hair_anchor[None, None, :],
+                            axis=2,
+                        )
+                    else:
+                        hair_chroma_distance = np.zeros(source_labels.shape, dtype=np.float32)
+                    distance_to_parser_background = cv2.distanceTransform(
+                        (~source_background).astype(np.uint8),
+                        cv2.DIST_L2,
+                        5,
+                    )
+                    scene_dominant_hair_colour = (
+                        hair_pixels
+                        & scene_hue_match
+                        & (source_hsv[:, :, 1] >= 55)
+                        & (source_lab[:, :, 0] >= 48)
+                        & (
+                            (hair_chroma_distance >= 18.0)
+                            | (distance_to_parser_background <= 26.0)
+                        )
+                    )
+                    studio_bg_apertures = (
+                        (
+                            (source_arr.min(axis=2) >= 210)
+                            | (palette_distance <= 22.0)
+                        )
+                        & (np.ptp(source_arr.astype(np.int16), axis=2) <= 35)
+                        & ~protected_face_neck
+                        & (source_labels != 13)
+                        & (source_labels != 2)
+                        & (
+                            (np.arange(source_arr.shape[1])[None, :] < face_cx - fw * 0.20)
+                            | (np.arange(source_arr.shape[1])[None, :] > face_cx + fw * 0.20)
+                        )
+                        & (np.arange(source_arr.shape[0])[:, None] >= fy1 + fh * 0.35)
+                    )
+                    learned_scene_leak = (
+                        (
+                            (palette_distance <= 20.0)
+                            & (source_background | scene_dominant_hair_colour)
+                            & ~raw_subject_core
+                        )
+                        | studio_bg_apertures
+                    ) & ~protected_face_neck
                 else:
                     learned_scene_leak = (
                         (palette_distance <= 20.0)
@@ -600,20 +776,55 @@ class BackgroundRemovalService:
         # that the network weakly associates with curls. The soft edge continues
         # to come from the refined matte, while confident hair/accessories cannot
         # be punched out by parser or palette cleanup.
-        if schp_labels is not None:
-            human_mask = np.isin(schp_labels, [1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]).astype(np.uint8)
-            human_zone = cv2.dilate(
-                human_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-            ).astype(bool)
-            raw_subject_core = (raw_alpha_u8 >= 184) & human_zone
-        else:
-            raw_subject_core = raw_alpha_u8 >= 184
         if 'learned_scene_leak' in locals() and learned_scene_leak is not None:
             raw_subject_core = raw_subject_core & ~learned_scene_leak
         alpha_u8[raw_subject_core] = np.maximum(
             alpha_u8[raw_subject_core], raw_alpha_u8[raw_subject_core]
         )
         alpha_u8 = _clean_alpha(alpha_u8)
+        # Median speck cleanup must not fill scene holes that were explicitly
+        # proven from the coordinate-aligned upload. Reassert the learned
+        # rejection after cleanup so foliage between curls stays transparent.
+        if 'learned_scene_leak' in locals() and learned_scene_leak is not None:
+            alpha_u8[learned_scene_leak] = 0
+
+        # Close internal cavities inside the subject alpha (hair partings, curl gaps, bows, ties, fabric)
+        # so the person is never hollowed out with transparent holes.
+        # Genuine background apertures (e.g. windows of background between neck/jaw and lateral hair/braids/arms)
+        # match the border background palette and must be preserved as background.
+        bg_cand = (alpha_u8 < 128).astype(np.uint8)
+        n_bg, labels_bg, stats_bg, _ = cv2.connectedComponentsWithStats(bg_cand, connectivity=8)
+        if n_bg > 1:
+            top_and_side_borders = np.zeros(alpha_u8.shape, dtype=bool)
+            top_and_side_borders[0, :] = True
+            top_and_side_borders[:int(alpha_u8.shape[0] * 0.4), 0] = True
+            top_and_side_borders[:int(alpha_u8.shape[0] * 0.4), -1] = True
+            border_bg_labels = np.unique(labels_bg[top_and_side_borders])
+            border_bg_labels = border_bg_labels[border_bg_labels != 0]
+            border_mask = np.isin(labels_bg, border_bg_labels)
+            if np.any(border_mask):
+                border_bg_mean = np.median(img_arr[border_mask], axis=0)
+            else:
+                border_bg_mean = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+
+            for comp_id in range(1, n_bg):
+                if comp_id in border_bg_labels:
+                    continue
+                comp_mask = labels_bg == comp_id
+                comp_area = stats_bg[comp_id, cv2.CC_STAT_AREA]
+                comp_mean_rgb = np.mean(img_arr[comp_mask], axis=0)
+                comp_dist_to_bg = float(np.linalg.norm(comp_mean_rgb - border_bg_mean))
+                # Genuine apertures (holes between hair/head/arms and body) match the border background
+                is_palette_match = comp_dist_to_bg <= 32.0
+                is_neutral_bg = (comp_mean_rgb.min() >= 210) and (np.ptp(comp_mean_rgb) <= 35)
+                has_studio_aperture = (
+                    np.any(studio_bg_apertures[comp_mask])
+                    if ('studio_bg_apertures' in locals() and studio_bg_apertures is not None)
+                    else False
+                )
+                is_genuine_aperture = (comp_area >= 12) and (is_palette_match or is_neutral_bg or has_studio_aperture)
+                if not is_genuine_aperture:
+                    alpha_u8[comp_mask] = 255
 
         alpha_img = Image.fromarray(alpha_u8, 'L')
         if debug:
@@ -667,3 +878,27 @@ class BackgroundRemovalService:
 
 # Module-level singleton — imported by orchestrator.py
 background_removal = BackgroundRemovalService()
+
+
+def extract_matte(image):
+    """Extract (H, W) uint8 [0, 255] foreground alpha matte using BiRefNet."""
+    from PIL import Image
+    import numpy as np
+    import io
+    if isinstance(image, Image.Image):
+        with io.BytesIO() as buf:
+            image.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
+    elif isinstance(image, np.ndarray):
+        pil_img = Image.fromarray(image)
+        with io.BytesIO() as buf:
+            pil_img.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
+    elif isinstance(image, (bytes, bytearray)):
+        img_bytes = bytes(image)
+    else:
+        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    cutout_bytes = background_removal.remove_background(img_bytes)
+    cutout = Image.open(io.BytesIO(cutout_bytes)).convert("RGBA")
+    return np.asarray(cutout.getchannel("A"), dtype=np.uint8)

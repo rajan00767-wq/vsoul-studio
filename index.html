@@ -812,6 +812,16 @@
           </div>
         </div>
 
+        <!-- Prompt strategy -->
+        <div style="display:grid;grid-template-columns:minmax(0, 1fr);gap:0.55rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
+          <label class="control-label" for="enhance-prompt-mode">Enhancement Prompt</label>
+          <select id="enhance-prompt-mode" class="backdrop-hex-input" style="width:100%;max-width:none;">
+            <option value="dynamic" selected>Dynamic VL Prompt (Recommended)</option>
+            <option value="static_test">Simple Static Prompt (Test)</option>
+          </select>
+          <div class="dz-sub">Dynamic mode uses the portrait analyser for targeted restoration. Static Test uses one short universal instruction while keeping the same uploaded-image identity checks, selected backdrop, and passport framing.</div>
+        </div>
+
         <!-- Quick Controls -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
           <div>
@@ -938,6 +948,18 @@
               </div>
             </div>
           </div>
+        </div>
+
+        <div class="dz-sub">The person and uniform are analysed together by VL, then one image-edit generation fits the referenced uniform to that person.</div>
+
+        <!-- Performance / Quality Profile -->
+        <div style="display:grid;grid-template-columns:minmax(0, 1fr);gap:0.55rem;background:var(--surface);padding:0.85rem 1rem;border:1px solid var(--border);border-radius:var(--radius);">
+          <label class="control-label" for="uniform-generation-mode">Performance & Quality Mode</label>
+          <select id="uniform-generation-mode" class="backdrop-hex-input" style="width:100%;max-width:none;">
+            <option value="quality" selected>Studio Quality (1216px · Maximum Face Identity - Default)</option>
+            <option value="turbo">Turbo Speed (1024px · Saves ~5 Minutes for Quick Proofs)</option>
+          </select>
+          <div class="dz-sub">Studio Quality renders at 1216px for strict biometric facial & skin-tone fidelity. Turbo Speed renders at 1024px (~5 minutes faster) for rapid previews.</div>
         </div>
 
         <!-- Backdrop -->
@@ -1365,6 +1387,7 @@
         fd.append('width', 600);
         fd.append('height', 800);
         fd.append('steps', 20);
+        fd.append('prompt_mode', document.getElementById('enhance-prompt-mode').value);
 
         const resp = await fetch(`${API}/qwen/enhance`, {
           method: 'POST',
@@ -1461,16 +1484,17 @@
 
             toast('✦ Studio enhancement complete!', 'success');
 
-          } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
+          } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled' || job.status === 'needs_review') {
             clearInterval(enhanceState.pollInterval);
+            enhanceState.pollInterval = null;
             enhanceState.processing = false;
             btn.disabled = false;
             cancelBtn.style.display = 'none';
             retryBtn.style.display = 'inline-flex';
-            msgEl.textContent = `Failed: ${job.message || 'Error occurred'}`;
-            toast(`Enhancement failed: ${job.message || 'Error'}`, 'error');
+            msgEl.textContent = `${job.status === 'needs_review' ? 'Needs Review: ' : 'Failed: '}${job.message || 'Error occurred'}`;
+            toast(`Enhancement ${job.status === 'needs_review' ? 'flagged for review' : 'failed'}: ${job.message || 'Error'}`, job.status === 'needs_review' ? 'warning' : 'error');
             setEnhanceAfterState('ready');
-            document.getElementById('enhance-after-badge').textContent = 'Source Preview';
+            document.getElementById('enhance-after-badge').textContent = job.status === 'needs_review' ? 'Flagged for Review' : 'Source Preview';
           }
         } catch (e) {}
       }, 4000);
@@ -1661,7 +1685,8 @@
         fd.append('person_file', uniformState.personFile);
         fd.append('uniform_file', uniformState.uniformFile);
         fd.append('engine', 'qwen-image-edit');
-        fd.append('fit_mode', 'Qwen VL + Qwen Image Edit (20-Step)');
+        let generationMode = (document.getElementById('uniform-generation-mode') || {}).value || 'quality';
+        fd.append('generation_mode', generationMode);
         fd.append('bg_color', getBackdropRgb('uniform'));
 
         const resp = await fetch(`${API}/uniform`, {
@@ -1755,15 +1780,45 @@
             document.getElementById('uniform-compare').style.display = 'grid';
             toast('👔 School uniform fitted successfully!', 'success');
 
-          } else if (job.status === 'failed') {
+          } else if (job.status === 'needs_review') {
             clearInterval(uniformState.pollInterval);
+            uniformState.pollInterval = null;
+            document.getElementById('uniform-progress').style.display = 'none';
+            document.getElementById('uniform-run-btn').disabled = false;
+            document.getElementById('uniform-cancel-btn').style.display = 'none';
+            document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
+
+            const diagPath = job.diagnostic_path || '';
+            const diagUrl = diagPath ? (diagPath.startsWith('http') ? diagPath : `/${diagPath.replace(/^\/+/, '')}?t=${Date.now()}`) : '';
+            if (diagUrl) {
+              const afterImg = document.getElementById('uniform-img-after');
+              afterImg.onload = () => {
+                setUniformAfterState('complete');
+                const stage = document.getElementById('uniform-after-stage');
+                stage.classList.remove('is-revealing');
+                requestAnimationFrame(() => stage.classList.add('is-revealing'));
+                document.getElementById('uniform-after-badge').textContent = 'Flagged for Review';
+              };
+              afterImg.src = diagUrl;
+              document.getElementById('uniform-compare').style.display = 'grid';
+            } else {
+              setUniformAfterState('ready');
+              document.getElementById('uniform-after-badge').textContent = 'Flagged for Review';
+            }
+            document.getElementById('uniform-msg').textContent = `Needs Review: ${job.message || 'Defects detected during quality gating'}`;
+            toast(`Uniform swap flagged for review: ${job.message || 'Defects detected'}`, 'warning');
+
+          } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
+            clearInterval(uniformState.pollInterval);
+            uniformState.pollInterval = null;
+            document.getElementById('uniform-progress').style.display = 'none';
             document.getElementById('uniform-cancel-btn').style.display = 'none';
             document.getElementById('uniform-retry-btn').style.display = 'inline-flex';
             document.getElementById('uniform-msg').textContent = `Failed: ${job.message || 'Error occurred'}`;
             document.getElementById('uniform-run-btn').disabled = false;
             setUniformAfterState('ready');
             document.getElementById('uniform-after-badge').textContent = 'Source Preview';
-            toast(`Uniform fitting failed: ${job.message}`, 'error');
+            toast(`Uniform fitting failed: ${job.message || 'Error'}`, 'error');
           }
         } catch (e) {}
       }, 4000);
@@ -1979,11 +2034,11 @@
                 updateBulkItemUI(item);
                 updateBulkStats();
                 resolve();
-              } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled') {
+              } else if (job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled' || job.status === 'needs_review') {
                 clearInterval(pollTimer);
-                item.status = 'failed';
+                item.status = job.status === 'needs_review' ? 'needs_review' : 'failed';
                 item.progress = 0;
-                item.message = job.message || 'Failed';
+                item.message = job.status === 'needs_review' ? `Review: ${job.message || 'Gated'}` : (job.message || 'Failed');
                 updateBulkItemUI(item);
                 updateBulkStats();
                 resolve();

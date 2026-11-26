@@ -5,6 +5,9 @@ This process handles only HTTP requests, WebSocket streaming, and cleanup.
 """
 
 import asyncio
+import gc
+import os
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +18,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from utils.job_eta import estimate_job_time
 from fastapi.responses import FileResponse
+
+# Transformers 5.x imports the optional `kernels` package whenever it is
+# installed. On this managed Windows machine its native kernels_data DLL is
+# blocked by Application Control, although none of this application's models
+# require Hub Kernels. Mark that optional integration unavailable before the
+# API imports SCHP/Qwen modules so server startup remains deterministic.
+os.environ.setdefault("USE_HUB_KERNELS", "NO")
+os.environ.setdefault("YOLO_CONFIG_DIR", os.path.join(tempfile.gettempdir(), "ultralytics"))
+# This process runs every queued job back to back in one CUDA context, so the
+# caching allocator's fragmentation accumulates across jobs. Job two then
+# failed with "CUDA out of memory. Tried to allocate 80.00 MiB ... 371.77 MiB
+# is reserved by PyTorch but unallocated" on an otherwise idle 8 GB card. The
+# isolated prompt-encoder worker already sets this; the server that actually
+# runs diffusion did not. It must be set before torch is first imported.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+try:
+    import transformers.utils.import_utils as _transformers_import_utils
+    _transformers_import_utils.is_kernels_available = lambda *args, **kwargs: False
+except Exception:
+    pass
 
 from api.routes import router as api_router, orchestrator
 from utils.logger import get_logger
@@ -164,6 +187,7 @@ async def _execute_queued_job(job_id: str, job: dict):
                     "",
                     _cb,
                     int(metadata.get("steps", 20)),
+                    prompt_mode=str(metadata.get("prompt_mode") or "dynamic"),
                 ),
             )
             named_path, msg, _candidate_path = (*result, None)[:3]
@@ -190,66 +214,6 @@ async def _execute_queued_job(job_id: str, job: dict):
             )
             logger.info("[QUEUE_WORKER_DONE] Qwen Enhance job=%s -> %s", job_id, named_path)
 
-        elif job_type == "qwen_uniform_swap":
-            _js.update_job(
-                job_id,
-                status="processing",
-                stage="uniform_fitting",
-                progress=25,
-                message="Fitting school uniform & studio lighting...",
-                started_at=str(time.time()),
-            )
-
-            input_path = job.get("input_path")
-            u_template_path = metadata.get("uniform_template_path")
-            prompt = metadata.get("prompt")
-            width = int(metadata.get("width", 600))
-            height = int(metadata.get("height", 800))
-
-            from pipelines.qwen_edit_pipeline import QwenEditPipeline
-            qwen_pipe = QwenEditPipeline()
-
-            def _uniform_cb(n, desc=""):
-                pct = int(round((n * 100) if isinstance(n, float) and n <= 1 else n))
-                current_job = _js.get_job(job_id)
-                current_progress = int((current_job or {}).get("progress") or 0)
-                _js.update_job(
-                    job_id,
-                    status="processing",
-                    stage="uniform_generation",
-                    progress=min(99, max(8, current_progress, pct)),
-                    message=desc or "Generating school uniform portrait...",
-                    _last_update=str(time.time()),
-                )
-
-            out_path = await loop.run_in_executor(
-                None,
-                lambda: qwen_pipe.qwen_vl_image_edit_uniform_swap(
-                    input_path,
-                    u_template_path,
-                    prompt,
-                    job_id,
-                    "4,126,246",
-                    width,
-                    height,
-                    20,
-                    _uniform_cb,
-                ),
-            )
-
-            rel_out = f"outputs/{Path(out_path).name}"
-            _js.update_job(
-                job_id,
-                status="done",
-                stage="done",
-                progress=100,
-                message="✓ School uniform fitted successfully!",
-                output_path=rel_out,
-                result_url=f"/{rel_out}",
-                completed_at=str(time.time()),
-            )
-            logger.info("[QUEUE_WORKER_DONE] Qwen Uniform Swap job=%s -> %s", job_id, out_path)
-
         elif job_type == "uniform_swap":
             _js.update_job(
                 job_id,
@@ -263,11 +227,30 @@ async def _execute_queued_job(job_id: str, job: dict):
             uniform_path = metadata.get("uniform_path")
             orig_name = job.get("original_filename") or metadata.get("download_name") or "person.png"
             bg_color = metadata.get("bg_color") or "4,126,246"
+            generation_mode = str(metadata.get("generation_mode") or metadata.get("profile") or "quality")
 
-            from pipelines.qwen_edit_pipeline import qwen_service
+            # qwen_vl_image_edit_uniform_swap pipeline execution
+            from pipelines.uniform_swap import UniformSwapConfig, uniform_swap_orchestrator
+
+            # Authoritative configuration propagation from job metadata
+            config = UniformSwapConfig.from_job_metadata(
+                metadata,
+                requested_width=metadata.get("width"),
+                requested_height=metadata.get("height"),
+            )
+            logger.info(
+                "[QUEUE_WORKER] Uniform swap job=%s config: strategy=%s, latent_lock=%s, rgb_rest=%s, steps=%d, res=%s, bg=%s",
+                job_id, config.conditioning_strategy, config.latent_identity_lock, config.rgb_identity_restoration,
+                config.steps, config.generation_resolution, config.background_color
+            )
 
             def _cb(n, desc=""):
                 pct = int(round((n * 100) if n <= 1 else n))
+                current_job = _js.get_job(job_id)
+                # See _uniform_cb above: a progress tick that unconditionally
+                # writes status="processing" silently undoes a user's cancel.
+                if current_job and current_job.get("status") == "cancelled":
+                    raise JobCancelledError("Uniform swap cancelled by user")
                 _js.update_job(
                     job_id,
                     status="processing",
@@ -276,33 +259,127 @@ async def _execute_queued_job(job_id: str, job: dict):
                     _last_update=str(time.time()),
                 )
 
-            named_path = await loop.run_in_executor(
+            delivery_res = await loop.run_in_executor(
                 None,
-                lambda: qwen_service.qwen_vl_image_edit_uniform_swap(
+                lambda: uniform_swap_orchestrator.run(
                     person_path,
                     uniform_path,
+                    config=config,
                     job_id=f"qwen_uniform_{job_id[:8]}",
-                    background_color=bg_color,
-                    width=560,
-                    height=720,
-                    steps=20,
                     progress_callback=_cb,
                 ),
             )
-            if not named_path:
+            if not delivery_res:
                 raise RuntimeError("Qwen Image Edit uniform swap failed")
 
+            # Task 7: Correct production delivery gating
+            if hasattr(delivery_res, "passed") and not delivery_res.passed:
+                diag_name = delivery_res.diagnostic_path.name if delivery_res.diagnostic_path else "candidate.png"
+                failure_msg = f"Needs review: {'; '.join(delivery_res.defects)}" if delivery_res.defects else "Uniform swap flagged for review"
+                logger.warning("[QUEUE_WORKER] Job %s gated for review: %s", job_id, failure_msg)
+                import json as _json
+                stage_timings = getattr(delivery_res, "trace", {}).get("stages", {})
+                exec_time = getattr(delivery_res, "trace", {}).get("total_duration_seconds", 0)
+                _js.update_job(
+                    job_id,
+                    status="needs_review",
+                    stage="needs_review",
+                    progress=100,
+                    message=failure_msg,
+                    source_quality_notes=_json.dumps(delivery_res.defects),
+                    diagnostic_path=f"outputs/debug_phases/{diag_name}",
+                    output_path="",
+                    result_url="",
+                    defects=delivery_res.defects,
+                    stage_timings=stage_timings,
+                    execution_time=exec_time,
+                )
+                return
+
+            named_path = delivery_res.delivered_path if hasattr(delivery_res, "delivered_path") and delivery_res.delivered_path else Path(delivery_res)
             rel_out = f"outputs/{Path(named_path).name}"
+            # Surface measured ceilings on this upload to whoever submitted
+            # it. A log line reaches the operator of the server, not the
+            # person who chose the photo, and these two limits are properties
+            # of the upload that no pipeline stage can recover: the only fix
+            # is a different source image.
+            quality_notes = []
+            import json as _json
+            try:
+                audit_path = Path("outputs") / (
+                    Path(named_path).name.replace("_uniform.png", "_instructions.json")
+                )
+                if audit_path.exists():
+                    audit = _json.loads(audit_path.read_text(encoding="utf-8"))
+                    if audit.get("source_detail_sufficient") is False:
+                        quality_notes.append(
+                            "the uploaded face is smaller than the delivered frame, "
+                            "so facial detail stays soft"
+                        )
+                    if audit.get("torso_evidence_sufficient") is False:
+                        quality_notes.append(
+                            "the upload shows little chest below the chin, "
+                            "so the body fit is approximate"
+                        )
+            except Exception as note_error:
+                logger.warning(
+                    "[QUEUE_WORKER] Could not read source-quality notes: %s",
+                    note_error,
+                )
+            # Defects measured on the delivered portrait itself. These used to
+            # reach only the server log, so the person who uploaded the photo
+            # was never told the render had a known problem - job 5a1bbeaa
+            # shipped a visibly stretched neck with a clean completion
+            # message. The review stage always delivers, so a note is the
+            # only way the user learns to retry or pick another photo.
+            try:
+                review_path = Path("outputs") / (
+                    Path(named_path).name.replace(
+                        "_uniform.png", "_visual_review.json",
+                    )
+                )
+                if review_path.exists():
+                    review = _json.loads(review_path.read_text(encoding="utf-8"))
+                    if "neck_stretched_measured" in (
+                        review.get("advisory_failures") or []
+                    ):
+                        quality_notes.append(
+                            "the fitted collar sits lower than in your photo, "
+                            "so the neck looks longer than it should"
+                        )
+                    for warning, text in (
+                        ("head_cropped", "the top of the head is clipped"),
+                        ("face_artifacts", "the face shows rendering artifacts"),
+                        ("harsh_hair_glare", "bright glare remains on the hair"),
+                    ):
+                        if warning in (review.get("quality_warnings") or []):
+                            quality_notes.append(text)
+            except Exception as review_error:
+                logger.warning(
+                    "[QUEUE_WORKER] Could not read delivered-portrait review: %s",
+                    review_error,
+                )
+            completion_message = "School uniform fitting complete!"
+            if quality_notes:
+                completion_message += (
+                    " Note: " + "; ".join(quality_notes)
+                    + ". A higher-resolution half-body photo gives a better result."
+                )
+            stage_timings = getattr(delivery_res, "trace", {}).get("stages", {})
+            exec_time = getattr(delivery_res, "trace", {}).get("total_duration_seconds", 0)
             _js.update_job(
                 job_id,
                 status="done",
                 stage="done",
                 progress=100,
-                message="School uniform fitting complete!",
+                message=completion_message,
+                source_quality_notes=_json.dumps(quality_notes) if quality_notes else "",
                 output_path=rel_out,
                 result_url=f"/{rel_out}",
                 original_filename=orig_name,
                 completed_at=str(time.time()),
+                stage_timings=stage_timings,
+                execution_time=exec_time,
             )
             logger.info("[QUEUE_WORKER_DONE] Uniform job=%s -> %s", job_id, named_path)
 
@@ -317,6 +394,12 @@ async def _execute_queued_job(job_id: str, job: dict):
                     config = {}
 
             def _cb(progress, message, status="processing", stage="", extra=None):
+                # Same cooperative-cancel contract as the uniform routes: stop
+                # at the next progress tick instead of writing "processing"
+                # back over the user's cancel and running to completion.
+                current_job = _js.get_job(job_id)
+                if current_job and current_job.get("status") == "cancelled":
+                    raise JobCancelledError("Enhancement cancelled by user")
                 fields = {
                     "status": status,
                     "progress": int(progress),
@@ -376,6 +459,38 @@ async def _execute_queued_job(job_id: str, job: dict):
             error_message=str(exc),
             completed_at=str(time.time()),
         )
+    finally:
+        _release_cuda_between_jobs(job_id)
+
+
+def _release_cuda_between_jobs(job_id: str) -> None:
+    """Drop this job's GPU allocations before the next one starts.
+
+    Every queued job shares one CUDA context in this process, and the uniform
+    route runs ~1400 lines of post-processing after diffusion without releasing
+    anything. Job two then died with "CUDA out of memory. Tried to allocate
+    80.00 MiB" while 5.56 GiB was still allocated on an idle card. Reclaiming at
+    the job boundary keeps a long-running server from degrading into a restart.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        before = torch.cuda.memory_allocated()
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated()
+        logger.info(
+            "[QUEUE_WORKER] Released GPU memory after job %s: %.2f GiB -> %.2f GiB",
+            job_id, before / 1024 ** 3, after / 1024 ** 3,
+        )
+    except Exception as cleanup_error:
+        # Never let reclamation failure mask the job's own outcome.
+        logger.warning(
+            "[QUEUE_WORKER] GPU cleanup after job %s failed: %s", job_id, cleanup_error,
+        )
 
 
 async def _queue_worker_loop():
@@ -421,6 +536,31 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Output dir: %s", OUTPUTS_DIR.absolute())
     logger.info("[STARTUP] Redis: %s", "OK" if _js.health_check() else "UNAVAILABLE")
     logger.info("[STARTUP] Queue length on start: %d", _js.queue_length())
+
+    # Pre-warm CPU/RAM models on startup so they are not loaded repeatedly
+    # during jobs. On memory-constrained launches this can be disabled without
+    # changing the pipeline; both services then initialize lazily on first use.
+    skip_cpu_prewarm = os.getenv("VSOUL_SKIP_CPU_PREWARM", "0").strip().lower() in {
+        "1", "true", "yes",
+    }
+    if skip_cpu_prewarm:
+        logger.info("[STARTUP] CPU model pre-warm disabled; models will load lazily")
+    else:
+        try:
+            import numpy as np
+            from pipelines.schp_service import parse as parse_schp
+            dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+            parse_schp(dummy)
+            logger.info("[STARTUP] SCHP model pre-warmed in CPU RAM")
+        except Exception as exc:
+            logger.warning("[STARTUP] SCHP pre-warm skipped: %s", exc)
+
+        try:
+            from pipelines.photo_restoration import _get_insight_app
+            _get_insight_app()
+            logger.info("[STARTUP] InsightFace buffalo_l pre-warmed in CPU RAM")
+        except Exception as exc:
+            logger.warning("[STARTUP] InsightFace pre-warm skipped: %s", exc)
     cleanup_task = asyncio.create_task(_cleanup_loop())
     worker_task = asyncio.create_task(_queue_worker_loop())
     yield
@@ -453,7 +593,19 @@ app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 @app.get("/")
 async def serve_frontend():
-    return FileResponse("index.html")
+    # The UI is a single local HTML document that changes frequently during
+    # development. Chrome can otherwise keep a stale/empty renderer document
+    # across a server restart while health polling continues successfully.
+    # Always serve the current file and force revalidation of the page itself;
+    # generated images remain independently cacheable under /outputs.
+    return FileResponse(
+        "index.html",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 app.include_router(api_router, prefix="/api")

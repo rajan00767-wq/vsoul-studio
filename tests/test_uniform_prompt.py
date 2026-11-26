@@ -64,6 +64,65 @@ class UniformPromptTests(unittest.TestCase):
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "hair_geometry", "exec"), namespace)
         return namespace["_has_visible_tied_hair_geometry"]
 
+    def concrete_hair_review_gate(self):
+        helper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_hair_review_has_concrete_change")
+        namespace = {}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "hair_review", "exec"), namespace)
+        return namespace[helper.name]
+
+    def grounded_direct_light_gate(self):
+        helper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_has_grounded_direct_light")
+        namespace = {"Any": Any, "Dict": Dict}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "light_gate", "exec"), namespace)
+        return namespace[helper.name]
+
+    def test_hair_review_requires_output_reference_and_explicit_change(self):
+        concrete = self.concrete_hair_review_gate()
+        self.assertTrue(concrete(
+            "Image 2 changed from short source hair to visibly longer swept hair."
+        ))
+        self.assertTrue(concrete(
+            "The generated portrait is missing the flower visible in image 1."
+        ))
+        self.assertTrue(concrete(
+            "The hairstyle in Image 2 changed from a loose ponytail to two braids."
+        ))
+        self.assertFalse(concrete(
+            "Image 1 has natural hair with a middle parting; no crown detail is visible."
+        ))
+        self.assertFalse(concrete(
+            "The source hairline, parting, flower and clip count were inspected."
+        ))
+        self.assertFalse(concrete(
+            "The hairstyle in Image 2 has been changed from braids to a ponytail."
+        ))
+        self.assertTrue(concrete(
+            "Image 2 is missing the viewer-left tied section and has one section instead of two."
+        ))
+
+    def test_contradictory_vl_sunlight_flag_does_not_force_head_regeneration(self):
+        grounded = self.grounded_direct_light_gate()
+        self.assertFalse(grounded({
+            "direct_sunlight_present": True,
+            "sunlight_type": "none",
+            "sunlight_evidence": "none",
+            "measured_sunlight_severity": "normal",
+        }))
+        self.assertTrue(grounded({
+            "direct_sunlight_present": True,
+            "sunlight_type": "hard directional sunlight",
+            "sunlight_evidence": "bright crown patch and paired facial shadow",
+            "measured_sunlight_severity": "normal",
+        }))
+        self.assertTrue(grounded({
+            "direct_sunlight_present": True,
+            "sunlight_type": "none",
+            "sunlight_evidence": "none",
+            "measured_sunlight_severity": "extreme",
+        }))
+
     def garment_palette_measurer(self):
         helper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
                       and n.name == "_measure_garment_palette")
@@ -281,11 +340,15 @@ class UniformPromptTests(unittest.TestCase):
 
     def test_uniform_identity_prepass_is_adaptive_for_harsh_low_detail_inputs(self):
         source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        # The prepass stays opt-in. Measured on job 58682ecb its restored head
+        # scored ArcFace 0.26 against the upload and was discarded after a
+        # full extra 4-step pass, so it is an experiment, not a quality
+        # response to a soft upload.
         self.assertIn('"VSOUL_ENABLE_UNIFORM_IDENTITY_PREPASS", "0"', source)
         self.assertNotIn('"VSOUL_DISABLE_UNIFORM_IDENTITY_PREPASS", "0"', source)
         self.assertIn("identity_prepass_would_help = bool(", source)
         self.assertIn("identity_prepass_enabled and identity_prepass_would_help", source)
-        self.assertIn("uniform-identity-prepass-v3", source)
+        self.assertIn("uniform-identity-prepass-v5-hair-geometry", source)
         self.assertIn("minimum_similarity=.65", source)
         self.assertIn(
             "validated_4_step_current_upload_identity_prepass_then_4_step_uniform_edit",
@@ -443,12 +506,13 @@ class UniformPromptTests(unittest.TestCase):
             source.index("qwen_identity_review = check_uniform_identity"):
             source.index("Finalizing the Qwen studio portrait", source.index("qwen_identity_review = check_uniform_identity"))
         ]
-        self.assertIn(".45 <= float(similarity) < .70", output)
+        self.assertIn(".45 <= float(similarity) < .75", output)
         self.assertIn("_lock_uniform_identity", output)
-        self.assertIn("minimum_similarity=.70", output)
+        self.assertIn("minimum_similarity=.75", output)
+        self.assertIn("maximum_geometry_rmse=.035", output)
         self.assertIn("(.12, .20, .32, .44, .58, .68, .72)", output)
         self.assertIn("relit_geometry_match", output)
-        self.assertIn("float(similarity) >= .63", output)
+        self.assertIn("float(similarity) >= .56", output)
         self.assertIn("float(geometry_rmse) <= min(.033", output)
         self.assertNotIn("toned_relit_geometry_match", output)
         self.assertNotIn("match_source_skin_chroma", output)
@@ -642,10 +706,22 @@ class UniformPromptTests(unittest.TestCase):
 
     def test_enhancement_identity_floor_rejects_borderline_regenerations(self):
         source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
-        self.assertIn("MIN_PORTRAIT_IDENTITY_SIMILARITY = 0.70", source)
+        self.assertIn("MIN_PORTRAIT_IDENTITY_SIMILARITY = 0.78", source)
         self.assertIn("MAX_PORTRAIT_LANDMARK_RMSE = 0.045", source)
         self.assertIn("landmark_2d_106", source)
         self.assertIn("and geometry_ok", source)
+
+    def test_static_enhancement_prompt_locks_face_landmarks_and_real_marks(self):
+        source = (ROOT / "gradio_app.py").read_text(encoding="utf-8")
+        prompt = source[
+            source.index("def build_static_enhancement_prompt("):
+            source.index("def upscale_qwen_result", source.index("def build_static_enhancement_prompt("))
+        ]
+        self.assertIn("local restoration of IMAGE 1", prompt)
+        self.assertIn("do not generate or redesign the person", prompt)
+        self.assertIn("source pixel geometry and natural asymmetry", prompt)
+        self.assertIn("real marks, accessories, jewelry and clothing", prompt)
+        self.assertIn("without inventing detail", prompt)
 
     def test_adaptive_uniform_steps_scale_with_observed_risk(self):
         select = self.uniform_step_selector()
@@ -932,7 +1008,12 @@ class UniformPromptTests(unittest.TestCase):
         source = ast.get_source_segment(
             (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"), self.route,
         )
-        generation_section = source[source.index("identity_instruction ="):source.index("generated_prompt =")]
+        # This section used to end at the first "generated_prompt =", which was
+        # a duplicate prompt block that no branch ever used. With that block
+        # removed the delimiter must be the real start of prompt assembly.
+        generation_section = source[
+            source.index("identity_instruction ="):source.index("neck_collar_lock = (")
+        ]
         self.assertNotIn("hair_accessories", generation_section)
         self.assertIn('raw_hair_observations.get("hair_accessory_details")', generation_section)
         self.assertIn('("earring", "hoop", "stud")', generation_section)
@@ -1004,7 +1085,8 @@ class UniformPromptTests(unittest.TestCase):
         )
         self.assertIn("generation_cfg_scale = 1.0", source)
         pipeline_source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
-        self.assertIn("central_arm_fraction > 0.015", pipeline_source)
+        self.assertIn("central_arm_fraction > 0.08", pipeline_source)
+        self.assertIn("int(width * .30):int(width * .70)", pipeline_source)
         prompt = (ROOT / "pipelines/uniform_composite.py").read_text(encoding="utf-8")
         self.assertIn("Keep hands, wrists, props and lower arms outside", prompt)
         self.assertIn("Render the complete uniform seamlessly", prompt)
@@ -1014,15 +1096,94 @@ class UniformPromptTests(unittest.TestCase):
         self.assertIn("from pipelines.uniform_review import review_uniform", source)
         self.assertIn("original_person_pil, uniform_validation_reference", source)
         self.assertIn('advisory_failures = [', source)
-        advisory = source[source.index("advisory_failures = ["):source.index("blocking_failures = [")]
-        blocking = source[source.index("blocking_failures = ["):source.index("if confirmed_badge:")]
+        # The list formerly called blocking_failures is now quality_warnings:
+        # nothing ever acted on it, so the name was a lie. Its contents and
+        # the advisory/warning split are unchanged, which is what this test
+        # actually cares about.
+        advisory = source[source.index("advisory_failures = ["):source.index("quality_warnings = [")]
+        blocking = source[source.index("quality_warnings = ["):source.index("if confirmed_badge:")]
         self.assertIn('hair_changed_unconfirmed', advisory)
         self.assertIn('concrete_hair_failure', blocking)
         self.assertIn('blocking_failures.append("identity_changed")', source)
         self.assertIn('"harsh_hair_glare"', blocking)
         self.assertNotIn('blocking_failures.append("reference_drift")', source)
         self.assertIn('visual_review["delivery_blocked"]', source)
-        self.assertIn('"VSOUL_ENABLE_POST_VL_REVIEW", "0"', source)
+        # The reviewer now runs for every delivery, not only static_test /
+        # extreme sun / tied hair: run 0b0a60e2 shipped a different child with
+        # "review_skipped": true. The env var is an opt-out, not an opt-in.
+        self.assertIn('"VSOUL_ENABLE_POST_VL_REVIEW", "1"', source)
+        self.assertIn('not in {"0", "false", "no"}', source)
+
+    def test_dynamic_route_does_not_mechanically_paste_source_head(self):
+        source = ast.get_source_segment(
+            (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"),
+            self.route,
+        )
+        self.assertIn("Qwen genuine decode accepted directly without head paste", source)
+        self.assertNotIn("self._lock_uniform_source_head(", source)
+
+    def test_identity_head_is_diagnostic_not_a_generation_reference(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("identity_head_reference = build_person_identity_guide", source)
+        self.assertIn("identity_head_reference.save", source)
+        self.assertNotIn("identity_conditioning_reference", source)
+
+    def test_vl_hue_wording_does_not_override_measured_garment_gate(self):
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        start = source.index("concrete_uniform_failure = bool(")
+        end = source.index("if visual_review.get(\"uniform_mismatch\")", start)
+        gate = source[start:end]
+        self.assertNotIn('"fabric hue"', gate)
+        self.assertNotIn('"check spacing"', gate)
+        self.assertIn('"wrong pattern"', gate)
+        self.assertIn('"retained"', gate)
+
+    def test_hair_style_name_alone_does_not_override_measured_geometry(self):
+        from pipelines.qwen_edit_pipeline import _hair_review_has_concrete_change
+
+        self.assertFalse(_hair_review_has_concrete_change(
+            "The generated image changed from a loose ponytail to a braided hairstyle."
+        ))
+        self.assertTrue(_hair_review_has_concrete_change(
+            "The generated image is missing the viewer-left tied section."
+        ))
+        self.assertTrue(_hair_review_has_concrete_change(
+            "The output portrait moved the ribbon to the wrong side."
+        ))
+
+    def test_short_hair_is_not_reinterpreted_as_two_tied_sections(self):
+        source = ast.get_source_segment(
+            (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"),
+            self.route,
+        )
+        self.assertIn(
+            "if not tied_accessory_corroborated and not visible_tied_hair_geometry:",
+            source,
+        )
+        self.assertNotIn(
+            "if not tied_accessory_corroborated and not visible_tied_hair_geometry and measured_tied_count == 0:",
+            source,
+        )
+
+    def test_facial_speckles_are_repaired_before_identity_review(self):
+        source = ast.get_source_segment(
+            (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"),
+            self.route,
+        )
+        repair_at = source.index(
+            "identity_locked = self._repair_generated_face_chromatic_speckles("
+        )
+        review_at = source.index("identity_review = check_uniform_identity", repair_at)
+        self.assertLess(repair_at, review_at)
+
+    def test_measured_backdrop_overrides_unsupported_visual_flag(self):
+        source = ast.get_source_segment(
+            (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"),
+            self.route,
+        )
+        self.assertIn("measured_background_match = self._has_selected_solid_background", source)
+        self.assertIn("and not measured_background_match", source)
+        self.assertIn('advisory_failures.append("background_mismatch_unconfirmed")', source)
 
     def test_uniform_sunlight_is_repaired_in_qwen_not_baked_into_conditioning(self):
         source = ast.get_source_segment(
@@ -1509,9 +1670,22 @@ class UniformPromptTests(unittest.TestCase):
         self.assertIn("preserve_foreground_rgb=True", source)
 
     def test_custom_prompt_cannot_replace_uniform_instructions(self):
-        assignment = next(n for n in self.route.body if isinstance(n, ast.Assign)
-                          and any(isinstance(t, ast.Name) and t.id == "generated_prompt" for t in n.targets))
-        self.assertIsInstance(assignment.value, ast.JoinedStr)
+        # Every generated_prompt assignment must be an in-repo literal, or the
+        # token-budget trimmer applied to one. Anything else (a parameter, a
+        # dict lookup, a caller-supplied string) would let a request body
+        # replace the uniform contract. The route-level assignment used to be
+        # the literal itself; it is now the trimmer call that wraps it, with
+        # the literals inside the prompt-mode branches.
+        assignments = [n for n in ast.walk(self.route) if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "generated_prompt"
+                               for t in n.targets)]
+        self.assertTrue(assignments)
+        for node in assignments:
+            if isinstance(node.value, ast.JoinedStr):
+                continue
+            self.assertIsInstance(node.value, ast.Call)
+            self.assertEqual(node.value.func.id, "fit_prompt_to_token_budget")
+            self.assertEqual(node.value.args[0].id, "generated_prompt")
 
     def test_raw_candidate_returns_before_identity_fallback(self):
         tree = ast.parse((ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8"))
@@ -1827,10 +2001,185 @@ class UniformPromptTests(unittest.TestCase):
         self.assertIn("central_torso_dark_fraction", source)
         self.assertIn("dark_panel_divergence", source)
         self.assertIn("Qwen invented a dark central garment panel absent from the template", source)
+        self.assertIn("target_layout_wins", source)
+        self.assertIn("target_spatial_similarity >= .18", source)
+        self.assertIn("target_spatial_similarity", source)
+        self.assertIn(">= source_spatial_similarity + .10", source)
+
+    def test_measured_collar_tip_count_overrides_vl_collar_label(self):
+        """A free-tip count must beat the VL's collar name when they disagree.
+
+        Run 0b0a60e2's template was an obvious two-point pointed collar, but
+        the VL labelled it "crossover overlap band collar without free points"
+        and that label reached the prompt as a generation fact.
+        """
+        analyzer = (ROOT / "pipelines/uniform_vl_analyzer.py").read_text(encoding="utf-8")
+        # The model must count before it names, and the key must be requested
+        # and reset alongside the other garment fields.
+        self.assertIn("COLLAR, STEP 1 of 2", analyzer)
+        self.assertIn("COLLAR, STEP 2 of 2", analyzer)
+        self.assertIn("collar_free_tip_count, shirt_collar", analyzer)
+        self.assertIn('"collar_free_tip_count", "shirt_collar"', analyzer)
+        # A changed VL prompt with an unchanged cache version silently replays
+        # the old wrong reading for every already-seen upload.
+        self.assertNotIn('VL_CACHE_VERSION = "content-v32', analyzer)
+
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        start = source.index('collar_type = str(vl_plan.get("shirt_collar")')
+        block = source[start:source.index("uniform_facts_str", start)]
+        self.assertIn('vl_plan.get("collar_free_tip_count")', block)
+        self.assertIn("collar_tips == 2", block)
+        self.assertIn("folded pointed collar with two free triangular tips", block)
+        self.assertIn("UNIFORM_VL_COLLAR", block)
+
+    def test_pattern_repeat_is_measured_and_stated_in_prompt(self):
+        """A check's size must reach Qwen as a count, not as "medium".
+
+        On run fbf83870 the delivered plaid measured 2.18x the template's
+        check size: the prompt carried shirt_pattern_scale "medium", which is
+        a category and constrains nothing.
+        """
+        import numpy as np
+        from PIL import Image
+        from pipelines.qwen_edit_pipeline import QwenEditPipeline
+
+        # A synthetic 24px check on a 480px canvas: the body window is the
+        # central 40%, so the measurement must recover ~24px regardless.
+        size = 480
+        period = 24
+        cell = np.indices((size, size)).sum(axis=0) // (period // 2)
+        checks = np.where(cell % 2 == 0, 235, 40).astype(np.uint8)
+        template = Image.fromarray(np.dstack([checks] * 3))
+        measured = QwenEditPipeline._measure_pattern_repeat_px(template)
+        self.assertIsNotNone(measured)
+        self.assertAlmostEqual(measured, period, delta=4)
+
+        # A plain fabric has no repeat to state; the caller must omit the
+        # instruction rather than assert a wrong number.
+        plain = Image.new("RGB", (size, size), (200, 200, 200))
+        self.assertIsNone(QwenEditPipeline._measure_pattern_repeat_px(plain))
+
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("PATTERN SCALE: the repeating check measures about", source)
+        self.assertIn("UNIFORM_PATTERN_SCALE", source)
+        # The count must use the same window the measurement used, or it
+        # describes a span the viewer never sees.
+        self.assertIn("chest_span_px = template_pil.width * .40", source)
+        # And it must actually reach the dynamic prompt.
+        contract = source[
+            source.index("uniform_fit_contract = ("):
+            source.index("lighting_correction =", source.index("uniform_fit_contract = ("))
+        ]
+        self.assertIn("pattern_repeat_instruction", contract)
+
+    def test_source_complexion_is_restored_after_decode(self):
+        """The decode bleaches skin; the correction must undo it, and only it.
+
+        Traced on run 0b0a60e2: every tensor entering Qwen carried the source
+        complexion (208,143,108) and the decode emerged at (244,194,165), a
+        deltaE of 45. Lightness is 94% of that error, so a chroma-only
+        correction is not enough (it reached only 42). The correction must
+        also leave backdrop, hair and garment untouched, which an earlier
+        plain-ellipse mask did not: it painted a dark oval halo.
+
+        This runs on the real delivered frame, because InsightFace does not
+        detect a drawn oval and a synthetic fixture would skip silently.
+        """
+        import numpy as np
+        import cv2
+        from PIL import Image
+        from pipelines.qwen_edit_pipeline import QwenEditPipeline
+
+        fixture = ROOT / "outputs" / "qwen_uniform_0b0a60e2_uniform.png"
+        if not fixture.exists():
+            self.skipTest("regression fixture 0b0a60e2 not retained")
+
+        def delta_e(first, second):
+            to_lab = lambda c: cv2.cvtColor(
+                np.uint8([[c]]), cv2.COLOR_RGB2LAB,
+            )[0, 0].astype(float)
+            return float(np.sqrt(((to_lab(first) - to_lab(second)) ** 2).sum()))
+
+        def cheek_rgb(image):
+            from pipelines.photo_restoration import _get_insight_app
+            array = np.asarray(image.convert("RGB"))
+            faces = _get_insight_app().get(
+                cv2.cvtColor(array, cv2.COLOR_RGB2BGR),
+            )
+            face = max(
+                faces,
+                key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+            )
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            w, h = x2 - x1, y2 - y1
+            cy, half = y1 + int(h * .55), max(2, int(h * .06))
+            patches = [
+                array[cy - half:cy + half, x1 + int(w * .12):x1 + int(w * .28)],
+                array[cy - half:cy + half, x2 - int(w * .28):x2 - int(w * .12)],
+            ]
+            return np.median(
+                np.vstack([p.reshape(-1, 3) for p in patches if p.size]), axis=0,
+            )
+
+        source_skin = (208, 143, 108)
+        delivered = Image.open(fixture)
+        before = delta_e(cheek_rgb(delivered), source_skin)
+        self.assertGreater(before, 30.0, "fixture should show the bleaching defect")
+
+        restored, info = QwenEditPipeline._restore_source_skin_tone(
+            delivered, source_skin,
+        )
+        self.assertTrue(info.get("applied"), info.get("reason"))
+        after = delta_e(cheek_rgb(restored), source_skin)
+        self.assertLess(after, 10.0, f"complexion still off: deltaE {after:.1f}")
+
+        # All three channels must move: chroma alone only reached 42.
+        self.assertLess(info["shift_l"], 0.0, "a bleached face must be darkened")
+
+        # Backdrop is not skin and must come back byte-exact.
+        original = np.asarray(delivered.convert("RGB"))
+        output = np.asarray(restored.convert("RGB"))
+        corner_delta = int(
+            np.abs(original[:30, :30].astype(int) - output[:30, :30].astype(int)).max()
+        )
+        self.assertEqual(corner_delta, 0, "background must not be recoloured")
+
+    def test_insufficient_source_detail_is_measured_and_reported(self):
+        """An upload that cannot reach the delivered frame must say so.
+
+        Facial detail cannot exceed the source. Measured on job 58682ecb (a
+        390x508 print with a 214px face), every generative restorer bought
+        sharpness with identity - Qwen prepass 0.26, GFPGAN 0.819, CodeFormer
+        0.817, against 0.977 for simply holding the real head. So the
+        pipeline keeps the real face and reports the ceiling instead.
+        """
+        source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
+        # Scale-honest: ``repair_recommended`` is resolution-dependent and
+        # called a clean 3500px upload blurrier than a 390px print, so the
+        # measurement is a face-pixel budget against the delivered frame.
+        self.assertIn("delivered_face_width_px = 260.0", source)
+        self.assertIn("source_face_detail_budget = source_face_width_px", source)
+        self.assertIn("source_detail_sufficient = bool(source_face_detail_budget >= 1.0)", source)
+        self.assertIn("UNIFORM_SOURCE_QUALITY", source)
+        # It has to reach the audit, or only the server operator ever sees it.
+        self.assertIn('"source_detail_sufficient": source_detail_sufficient', source)
+        self.assertIn('"source_face_detail_budget"', source)
+
+        # And reach the person who uploaded the photo, via the job record.
+        worker = (ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertIn("source_quality_notes", worker)
+        self.assertIn("source_detail_sufficient", worker)
+        self.assertIn("torso_evidence_sufficient", worker)
 
     def test_isolated_encoder_disables_autograd(self):
         source = (ROOT / "pipelines/qwen_edit_pipeline.py").read_text(encoding="utf-8")
-        self.assertIn("with torch.inference_mode():\n    for prompt in prompts:", source)
+        # The loop now carries a per-prompt text-only flag so the negative can
+        # be encoded without the conditioning images; autograd must stay off.
+        self.assertIn(
+            "with torch.inference_mode():\n"
+            "    for prompt, text_only in zip(prompts, text_only_flags):",
+            source,
+        )
         self.assertIn('\"encoding\": \"utf-8\"', source)
         self.assertIn('\"errors\": \"replace\"', source)
 

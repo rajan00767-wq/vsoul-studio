@@ -13,7 +13,11 @@ def restore_uniform_hair_accessories(image, aligned_source, labels, aligned_sour
         raise ValueError("Head restoration inputs must have matching dimensions")
 
     generated_hair = (labels == 2).astype(np.uint8)
-    source_hair = (aligned_source_labels == 2).astype(np.uint8)
+    source_hair = cv2.erode(
+        (aligned_source_labels == 2).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
     # Qwen now receives the original portrait as its primary image, so it
     # already carries the intended hair silhouette. A full source-hair paste
     # can import matte errors, outdoor shadow, or background pixels around
@@ -59,6 +63,12 @@ def restore_uniform_hair_accessories(image, aligned_source, labels, aligned_sour
     restore_mask[-2:, :] = False
     restore_mask[:, :2] = False
     restore_mask[:, -2:] = False
+    # SCHP leaks the hair label onto pale shirt/wall pixels beside long strands.
+    # Those are not hair or accessories; copying them imports torn source
+    # clothing/background fragments. Drop pale, low-saturation pixels.
+    source_hsv = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2HSV)
+    pale = (source_hsv[:, :, 2] > 140) & (source_hsv[:, :, 1] < 70)
+    restore_mask &= ~pale
     metadata = {"hair_restore_pixels": int(np.count_nonzero(restore_mask)), "applied": False}
     if np.count_nonzero(restore_mask) < labels.size * .015:
         return image.convert("RGB"), metadata
@@ -83,7 +93,10 @@ def restore_uniform_hair_accessories(image, aligned_source, labels, aligned_sour
     # Clips, ribbons and flowers need stronger recovery than ordinary strands.
     hair_median = np.median(source_lab[restore_mask], axis=0)
     color_distance = np.linalg.norm(source_lab - hair_median[None, None, :], axis=2)
-    accessory_candidates = restore_mask & (source_luma > 95) & (color_distance > 24)
+    accessory_candidates = (
+        restore_mask & (source_luma > 95) & (color_distance > 24)
+        & (source_hsv[:, :, 1] >= 70)
+    )
     accessory_candidates = cv2.morphologyEx(
         accessory_candidates.astype(np.uint8), cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),

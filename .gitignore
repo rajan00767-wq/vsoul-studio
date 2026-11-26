@@ -9,7 +9,15 @@ __pycache__/
 models/
 uploads/
 outputs/
-scratch/cache/
+scratch/
+backups/
+overnight_test_results/
+test_startup.err
+debug_cutout.png
+.qwen/
+_diag_*.py
+_run_*.py
+scratch_*.py
 external/
 third_party/
 Ultralytics/

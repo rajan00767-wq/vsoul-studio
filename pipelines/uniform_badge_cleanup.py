@@ -115,15 +115,18 @@ def _brown_patches(rgb, hue=None, allow_bottom_edge=False):
             1, -1,
         )
         patches.append((expanded, float(np.median(hsv[:, :, 0][component]))))
-    # A generated badge may be cropped by the lower passport edge. Retain
-    # compact lower-chest brown panels before morphology, which otherwise can
-    # merge them into a nearby red plaid stripe.
+    # A generated badge may be cropped by the lower passport edge. Retain a
+    # raw component only when it actually reaches that edge.  The former code
+    # admitted every lower-chest raw component; on plaid shirts a thin red
+    # thread then joined the real badge to several extra rows and expanded the
+    # repair into a conspicuous rectangular pocket patch.
     raw_count, raw_labels, raw_stats, _ = cv2.connectedComponentsWithStats(raw_selected, 8)
     for i in range(1, raw_count):
         x, y, bw, bh, area = raw_stats[i]
         area_fraction = area / float(h * w)
         if not (
             y >= int(h * .38)
+            and y + bh >= h - 5
             and .0015 < area_fraction < .03
             and .50 < bw / max(bh, 1) < 2.2
         ):
@@ -355,6 +358,7 @@ def remove_template_badges(
     repair_mode: str = "auto",
     reference_bbox=None,
     reference_bbox_size=None,
+    reference_bbox_order: str = "xy",
 ):
     """Return corrected RGB and count; leave unsupported badge types untouched.
 
@@ -373,7 +377,11 @@ def remove_template_badges(
     # it back to this exact template size before repairing only those pixels.
     if image_is_reference and reference_bbox and reference_bbox_size:
         try:
-            bx1, by1, bx2, by2 = (float(value) for value in reference_bbox)
+            coordinates = tuple(float(value) for value in reference_bbox)
+            if str(reference_bbox_order).strip().lower() == "yx":
+                by1, bx1, by2, bx2 = coordinates
+            else:
+                bx1, by1, bx2, by2 = coordinates
             ref_width, ref_height = (float(value) for value in reference_bbox_size)
             x1 = int(round(bx1 * rgb.shape[1] / max(ref_width, 1.0)))
             y1 = int(round(by1 * rgb.shape[0] / max(ref_height, 1.0)))
@@ -402,10 +410,24 @@ def remove_template_badges(
             mask.fill(0)
             count = 0
 
-    candidates = [] if count else (
-        _patches(reference, allow_bottom_edge=True)
-        + _brown_patches(reference, allow_bottom_edge=True)
-    )
+    if count:
+        candidates = []
+    else:
+        brown_candidates = _brown_patches(reference, allow_bottom_edge=True)
+        vivid_candidates = _patches(reference, allow_bottom_edge=True)
+        # Dark rectangular school crests are much more specific than generic
+        # saturated regions.  When one is present, do not also treat a red
+        # cuff/plaid intersection as a second badge.  Keep all similarly sized
+        # dominant panels so genuinely repeated crests remain supported.
+        if brown_candidates:
+            candidate_areas = [int(np.count_nonzero(item[0])) for item in brown_candidates]
+            largest_area = max(candidate_areas)
+            candidates = [
+                item for item, area in zip(brown_candidates, candidate_areas)
+                if area >= largest_area * .35
+            ]
+        else:
+            candidates = vivid_candidates
     for reference_patch, hue in candidates:
         reference_x, reference_y = _normalized_center(reference_patch)
         # Badges sit on the torso/chest, including the lower outer corner of a

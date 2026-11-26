@@ -73,6 +73,22 @@ class UniformBadgeTests(unittest.TestCase):
             1.0,
         )
 
+    def test_dominant_brown_badge_does_not_expand_into_smaller_plaid_patch(self):
+        rgb = np.full((500, 400, 3), (235, 235, 235), np.uint8)
+        rgb[150:490, 35:365] = (42, 52, 88)
+        rgb[150:490:22, 35:365] = (228, 232, 240)
+        rgb[150:490, 35:365:25] = (225, 228, 236)
+        # Real crest panel and a much smaller dark-red plaid intersection.
+        rgb[245:320, 265:330] = (88, 39, 31)
+        rgb[266:282, 280:315] = (225, 190, 92)
+        rgb[350:372, 72:92] = (91, 41, 32)
+        small_patch = rgb[345:378, 66:98].copy()
+        result, count = remove_template_badges(
+            Image.fromarray(rgb), Image.fromarray(rgb), repair_mode="texture",
+        )
+        self.assertEqual(count, 1)
+        np.testing.assert_array_equal(np.asarray(result)[345:378, 66:98], small_patch)
+
     def test_dark_badge_is_removed_from_middle_of_full_shirt_template(self):
         rgb = np.full((500, 400, 3), (235, 235, 235), np.uint8)
         rgb[180:, ::24] = (30, 45, 90)
@@ -124,6 +140,29 @@ class UniformBadgeTests(unittest.TestCase):
             axis=2,
         ) < 18.0)
         self.assertLess(white_fraction, .08)
+
+    def test_vl_yx_badge_bbox_maps_to_the_actual_lower_right_badge(self):
+        rgb = np.full((500, 400, 3), (248, 248, 248), np.uint8)
+        rgb[130:490, 45:355] = (40, 50, 88)
+        # Actual badge in original pixels: x=258..322, y=255..325. The VL
+        # contract reports the same box as [ymin, xmin, ymax, xmax].
+        rgb[255:325, 258:322] = (86, 38, 31)
+        rgb[275:290, 272:307] = (226, 190, 92)
+        original_badge = rgb[260:320, 263:317].copy()
+        result, count = remove_template_badges(
+            Image.fromarray(rgb),
+            Image.fromarray(rgb),
+            repair_mode="texture",
+            reference_bbox=(255, 258, 325, 322),
+            reference_bbox_size=(400, 500),
+            reference_bbox_order="yx",
+        )
+        self.assertEqual(count, 1)
+        repaired = np.asarray(result)[260:320, 263:317]
+        self.assertGreater(
+            float(np.mean(np.abs(repaired.astype(float) - original_badge.astype(float)))),
+            1.0,
+        )
 
     def test_generated_backdrop_colour_block_is_removed_inside_uniform(self):
         background = (4, 126, 246)

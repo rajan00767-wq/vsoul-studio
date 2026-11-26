@@ -86,8 +86,12 @@ class SCHPImageProcessor(BaseImageProcessor):
             pil = pil.convert("RGB")
 
             # --- resize → tensor → normalise ---
+            # FIX 12: SCHP LIP-20 checkpoint was trained on BGR images using
+            # BGR mean [0.406, 0.456, 0.485] and std [0.225, 0.224, 0.229].
+            # Convert PIL RGB tensor to BGR channel order before normalisation.
             pil = pil.resize((w, h), resample=Image.Resampling.BILINEAR)
-            t = TF.to_tensor(pil)  # float32 in [0, 1], shape (3, H, W)
+            t = TF.to_tensor(pil)  # shape (3, H, W) in RGB channel order
+            t = t[[2, 1, 0], :, :]  # Convert RGB -> BGR channel order
             t = TF.normalize(t, mean=mean, std=std)
             tensors.append(t)
 

@@ -868,6 +868,18 @@ def build_dynamic_identity_prompt(
     return base_prompt
 
 
+def build_static_enhancement_prompt(bg_desc: str) -> str:
+    """Build the short universal enhancement experiment prompt."""
+    return (
+        "Perform a local restoration of IMAGE 1; do not generate or redesign the person. "
+        "Keep the existing face, expression, teeth, current age, complexion, head, hair, real marks, accessories, jewelry and clothing unchanged in shape and position. "
+        "Preserve the source pixel geometry and natural asymmetry; do not redraw, beautify, symmetrize, de-age or recompose any facial feature or hairstyle. "
+        "Improve only genuine photographic clarity and neutralize noise, blur, color cast, harsh sunlight, glare and hard shadows without inventing detail. "
+        f"Replace only the background with one flat {bg_desc} field. Return the same person in an upper-chest passport crop with complete crown, hair and accessories inside frame. "
+        "No new object, second person, painting, CGI, beauty filter, pasted face, halo or scenery."
+    )
+
+
 def upscale_qwen_result(image_bgr: np.ndarray, factor: int) -> np.ndarray:
     """Use the cached Real-ESRGAN model for Qwen output, with Lanczos as a safe fallback."""
     if factor <= 1:
@@ -1631,6 +1643,7 @@ def process_single_enhance(
     qwen_prompt: str,
     progress=None,
     qwen_steps: int = 20,
+    prompt_mode: str = "dynamic",
 ):
     """Processes one uploaded photo with Indian passport dimensions."""
     progress = _as_progress(progress)
@@ -1644,6 +1657,9 @@ def process_single_enhance(
 
     image_source = image
     image = _open_upload(image, convert_rgb=True)
+    normalized_prompt_mode = str(prompt_mode or "dynamic").strip().lower()
+    if normalized_prompt_mode != "static_test":
+        normalized_prompt_mode = "dynamic"
     t0 = time.time()
     progress(0.05, desc="✨ Starting Studio Restoration...")
 
@@ -1706,18 +1722,30 @@ def process_single_enhance(
                 frame_bg_bgr = (255, 255, 255)
             qwen_bg_desc = f"solid {selected_hex.upper()} RGB{selected_rgb}"
 
-            progress(0.10, desc="Analyzing portrait framing and clothing details...")
-            from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
-            vl_brief = uniform_vl_analyzer.analyze_portrait(image)
-            try:
-                from pipelines.schp_service import parse as parse_body_parts
-                from pipelines.uniform_composite import measure_source_person_colors
-                source_labels = parse_body_parts(np.array(image.convert("RGB")))["labels"]
-                measured_colors = measure_source_person_colors(image, source_labels)
-                vl_brief["measured_skin_rgb"] = measured_colors.get("skin_rgb")
-                vl_brief["measured_hair_rgb"] = measured_colors.get("hair_rgb")
-            except Exception as color_error:
-                logger.warning("[QWEN_ENHANCE] Source color measurement unavailable: %s", color_error)
+            if normalized_prompt_mode == "static_test":
+                # The static experiment deliberately uses one universal prompt.
+                # Loading Qwen-VL and SCHP here added about a minute without
+                # changing that prompt, so retain only the fast measured gates
+                # (face count, crop geometry and harsh-light detection) below.
+                progress(0.10, desc="Measuring portrait framing...")
+                vl_brief = {"source": "static_prompt_fast_path"}
+                logger.info(
+                    "[QWEN_ENHANCE] Static prompt fast path: skipped redundant "
+                    "Qwen-VL and SCHP analysis"
+                )
+            else:
+                progress(0.10, desc="Analyzing portrait framing and clothing details...")
+                from pipelines.uniform_vl_analyzer import uniform_vl_analyzer
+                vl_brief = uniform_vl_analyzer.analyze_portrait(image)
+                try:
+                    from pipelines.schp_service import parse as parse_body_parts
+                    from pipelines.uniform_composite import measure_source_person_colors
+                    source_labels = parse_body_parts(np.array(image.convert("RGB")))["labels"]
+                    measured_colors = measure_source_person_colors(image, source_labels)
+                    vl_brief["measured_skin_rgb"] = measured_colors.get("skin_rgb")
+                    vl_brief["measured_hair_rgb"] = measured_colors.get("hair_rgb")
+                except Exception as color_error:
+                    logger.warning("[QWEN_ENHANCE] Source color measurement unavailable: %s", color_error)
             source_gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
             source_h, source_w = source_gray.shape[:2]
             face_detail_region = source_gray[
@@ -1876,7 +1904,17 @@ def process_single_enhance(
                 qwen_source.size, source_w, source_h,
             )
 
-            prompt = build_dynamic_identity_prompt(image, qwen_bg_desc, qwen_prompt, vl_brief)
+            if normalized_prompt_mode == "static_test":
+                prompt = build_static_enhancement_prompt(qwen_bg_desc)
+                logger.info(
+                    "[QWEN_ENHANCE] Using Simple Static Prompt test mode (%d words)",
+                    len(prompt.split()),
+                )
+            else:
+                normalized_prompt_mode = "dynamic"
+                prompt = build_dynamic_identity_prompt(
+                    image, qwen_bg_desc, qwen_prompt, vl_brief,
+                )
             logger.info("[QWEN_ENHANCE] Restoration prompt: %s", prompt)
             # Keep identity sampling stable for the same portrait regardless
             # of the selected backdrop colour.
@@ -1907,6 +1945,18 @@ def process_single_enhance(
                 enhancement_seed,
             )
 
+            static_generation_edge = 1024
+            generation_edge = (
+                static_generation_edge
+                if normalized_prompt_mode == "static_test"
+                else 1216
+            )
+            if normalized_prompt_mode == "static_test":
+                logger.info(
+                    "[QWEN_ENHANCE] Static prompt fast path: using %dpx "
+                    "passport generation canvas",
+                    generation_edge,
+                )
             res_path = gusuq_pipeline.edit_image(
                 # Qwen produces the most natural portrait when it sees the
                 # original photograph directly; an imperfect matte guide
@@ -1935,8 +1985,8 @@ def process_single_enhance(
                 # Qwen needs a sufficiently large latent canvas to reconstruct
                 # fine hair, facial detail, and fabric from small phone photos.
                 # This is not a post-generation upscaler.
-                max_generation_dimension=1216,
-                minimum_generation_dimension=1216,
+                max_generation_dimension=generation_edge,
+                minimum_generation_dimension=generation_edge,
                 keep_generation_resolution=True,
                 # A second Qwen face pass re-generated the face instead of
                 # restoring it, so the full-portrait edit remains the only
@@ -1986,7 +2036,9 @@ def process_single_enhance(
                 from pipelines.uniform_review import check_uniform_identity
 
                 qwen_identity_review = check_uniform_identity(
-                    image.convert("RGB"), qwen_pil, minimum_similarity=0.70,
+                    image.convert("RGB"), qwen_pil,
+                    minimum_similarity=0.75,
+                    maximum_geometry_rmse=0.035,
                 )
                 qwen_accepted = bool(qwen_identity_review.get("accepted"))
                 logger.info(
@@ -2018,7 +2070,9 @@ def process_single_enhance(
                         )
                     )
                     neutral_review = check_uniform_identity(
-                        validation_source, qwen_pil, minimum_similarity=.70,
+                        validation_source, qwen_pil,
+                        minimum_similarity=.75,
+                        maximum_geometry_rmse=.035,
                     )
                     raw_similarity = qwen_identity_review.get("similarity")
                     raw_geometry = qwen_identity_review.get("geometry_rmse")
@@ -2061,7 +2115,7 @@ def process_single_enhance(
                 # comparison that improves dense geometry may use the bounded
                 # 0.53/0.035 fallback. All are available only when sunlight
                 # was independently confirmed. Ordinary portraits retain the
-                # strict 0.70 identity gate, and no source-face overlay is used.
+                # strict 0.75 identity gate, and no source-face overlay is used.
                 relit_geometry_match = (
                     direct_sunlight_confirmed
                     and isinstance(similarity, (int, float))
@@ -2106,7 +2160,7 @@ def process_single_enhance(
                     not qwen_accepted
                     and isinstance(similarity, (int, float))
                     and isinstance(geometry_rmse, (int, float))
-                    and .45 <= float(similarity) < .70
+                    and .45 <= float(similarity) < .75
                     and float(geometry_rmse) <= float(geometry_limit)
                 )
                 if repairable:
@@ -2121,7 +2175,8 @@ def process_single_enhance(
                         )
                         repaired_review = check_uniform_identity(
                             image.convert("RGB"), repaired_portrait,
-                            minimum_similarity=.70,
+                            minimum_similarity=.75,
+                            maximum_geometry_rmse=.035,
                         )
                         logger.info(
                             "[QWEN_ENHANCE_IDENTITY_REPAIR] raw=%s strength=%.2f "

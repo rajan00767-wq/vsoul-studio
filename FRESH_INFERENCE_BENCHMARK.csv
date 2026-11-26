@@ -1,0 +1,6 @@
+Case ID,Source Portrait,Uniform Reference,Fresh Inference,Cache Hit,Total Latency (s),Cold Start / Load (s),Normalization & Cues (s),Identity & Pose (s),Diffusion (4-step) (s),Compositing (s),Passport Framing (s),Validation (s),Peak VRAM Alloc (MB),Peak VRAM Reserved (MB),nvidia-smi VRAM (MB),CUDA OOM,Quality Status
+TC01_CurlyHair_RedCollar,curly_hair.png,REF001_red_collar.png,True,False,722.76,0.0,5.46,0.0,346.65,0.0,0.56,1.52,5824.0,6780.0,6120.0,NO,PASS
+TC02_Braids_NavyCollar,braids.png,REF002_navy_collar.png,True,False,870.55,0.0,2.37,0.0,427.26,0.0,0.59,1.46,5824.0,6780.0,6120.0,NO,PASS
+TC03_MaroonBows_Tie,maroon_bows.png,REF003_tie.png,True,False,771.79,0.0,2.61,0.0,377.29,0.0,0.69,1.41,5824.0,6780.0,6120.0,NO,PASS
+TC04_GlassesBindi_Vest,glasses_bindi.png,REF004_vest.png,True,False,375.18,0.0,6.18,0.0,336.76,0.0,0.65,0.94,7015.4,7822.0,4834.0,NO,PASS
+TC05_CasualShirt_RedCollar,casual_shirt.png,REF001_red_collar.png,True,False,395.29,0.0,2.55,0.0,367.55,0.0,0.84,1.23,7024.7,7806.0,4768.0,NO,PASS

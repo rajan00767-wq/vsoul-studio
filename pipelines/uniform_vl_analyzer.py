@@ -5,9 +5,11 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +28,7 @@ MODEL_DIR = Path("models/qwen2.5-vl-3b-instruct")
 # Cached observations are generation inputs, so retaining an old "vest" or
 # "bow" interpretation after a prompt correction silently recreates the same
 # incorrect Qwen edit for identical uploads.
-VL_CACHE_VERSION = "content-v29-production-accessory-taxonomy-and-hair-geometry"
+VL_CACHE_VERSION = "content-v34-literal-plaits-and-multiple-hair-attachments"
 
 
 def make_hair_inspection_crop(image: Image.Image) -> Image.Image:
@@ -146,10 +148,79 @@ def _analysis_cache_path(kind: str, *images: Image.Image) -> Path:
         rgb = image.convert("RGB")
         digest.update(f"{rgb.width}x{rgb.height}".encode("ascii"))
         digest.update(rgb.tobytes())
-    cache_dir = Path("scratch/cache/vl_analysis")
+    cache_dir = Path(tempfile.gettempdir()) / "vsoul_cache" / "vl_analysis"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"{kind}_{digest.hexdigest()[:24]}.json"
 
+
+_BNB_FAILURE_MARKERS = (
+    "bitsandbytes",
+    "application control policy",
+    "cquantize_blockwise",
+    "winerror 4551",
+)
+
+def _run_vl_worker(worker_path: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Run a VL worker, retrying unquantized when 4-bit loading is unusable.
+
+    bitsandbytes' native DLL is blocked by Application Control on this machine.
+    The blocked load does not raise inside the worker: it takes the process
+    down mid-weight-load with an access violation (0xC0000005 / 3221225477),
+    which no in-process ``except`` can catch. Every uniform job then reached
+    the "exact portrait/template analysis failed" gate and aborted. Detect that
+    crash here and re-run the same script once with the unquantized path, which
+    is what the prompt encoder already does for its own worker.
+    """
+    run_args = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(worker_path)], timeout=timeout, **run_args,
+        )
+        if completed.returncode == 0:
+            return completed
+        stderr = (completed.stderr or "").lower()
+        # 3221225477 is the Windows access violation this blocked DLL produces.
+        crashed_in_native_code = completed.returncode in (3221225477, -1073741819)
+        retry = crashed_in_native_code or any(
+            marker in stderr for marker in _BNB_FAILURE_MARKERS
+        )
+        if not retry:
+            return completed
+        reason = f"returncode={completed.returncode}"
+    except subprocess.TimeoutExpired:
+        # A blocked 4-bit load can also hang rather than crash. Retrying is
+        # still better than discarding every visual observation and falling
+        # back to geometry, which aborts the whole uniform job downstream.
+        timed_out = True
+        reason = f"timed out after {timeout}s"
+    logger.warning(
+        "[UniformVL] 4-bit worker unusable (%s); retrying unquantized", reason,
+    )
+    # The unquantized model is larger and slower to load than the 4-bit one,
+    # so reusing the quantized budget would cut the retry off mid-load and
+    # report the same geometry fallback the retry exists to prevent.
+    retry_timeout = max(timeout, 900) if timed_out else max(timeout * 2, 600)
+    retry_env = {**os.environ, "VSOUL_VL_UNQUANTIZED": "1"}
+    try:
+        return subprocess.run(
+            [sys.executable, str(worker_path)],
+            env=retry_env, timeout=retry_timeout, **run_args,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "[UniformVL] Unquantized retry exceeded %ds; visual analysis unavailable",
+            retry_timeout,
+        )
+        return subprocess.CompletedProcess(
+            [sys.executable, str(worker_path)], 1, "",
+            f"Unquantized VL worker exceeded {retry_timeout}s",
+        )
 
 def _read_analysis_cache(path: Path) -> Optional[Dict[str, Any]]:
     try:
@@ -163,10 +234,22 @@ def merge_portrait_pixel_evidence(data: Dict[str, Any], image: Image.Image) -> D
     """Add conservative lighting evidence that does not depend on VL wording."""
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
     height, width = rgb.shape[:2]
-    region = rgb[
-        int(height * .08):int(height * .64),
-        int(width * .14):int(width * .86),
+    labels = None
+    try:
+        from pipelines.schp_service import parse as parse_body_parts
+
+        labels = parse_body_parts(rgb)["labels"]
+    except Exception:
+        labels = None
+    fallback_region = rgb[
+        int(height * .17):int(height * .57),
+        int(width * .27):int(width * .73),
     ]
+    if labels is not None and int(np.count_nonzero(labels == 13)) >= 128:
+        face_pixels = rgb[labels == 13]
+    else:
+        face_pixels = fallback_region.reshape(-1, 3)
+    region = face_pixels.reshape(-1, 1, 3)
     if region.size >= 256:
         lab_l = cv2.cvtColor(region, cv2.COLOR_RGB2LAB)[:, :, 0]
         hsv_s = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)[:, :, 1]
@@ -179,16 +262,30 @@ def merge_portrait_pixel_evidence(data: Dict[str, Any], image: Image.Image) -> D
         data["measured_light_saturation_p80"] = round(saturation_p80, 2)
         data["measured_sunlight_severity"] = (
             "extreme"
-            if p95 >= 190.0 and contrast >= 135.0 and saturation_p80 >= 190.0
+            if p95 >= 198.0 and contrast >= 95.0 and saturation_p80 >= 210.0
             else "hard"
-            if p95 >= 178.0 and contrast >= 95.0 and saturation_p80 >= 150.0
+            if p95 >= 185.0 and contrast >= 90.0 and saturation_p80 >= 175.0
             else "normal"
         )
         hard_sun = bool(
-            p95 >= 178.0 and contrast >= 95.0 and saturation_p80 >= 150.0
+            p95 >= 185.0 and contrast >= 90.0 and saturation_p80 >= 175.0
         )
+        # Bright silver strands can need local hair correction without the
+        # person's face being sunlit. Keep those two facts separate; treating
+        # every crown highlight as full-face sunlight made Qwen redraw and
+        # beautify otherwise-correct heads.
+        hair_hotspot = False
+        if labels is not None and int(np.count_nonzero(labels == 2)) >= 128:
+            hair_rgb = rgb[labels == 2].reshape(-1, 1, 3)
+            hair_l = cv2.cvtColor(hair_rgb, cv2.COLOR_RGB2LAB)[:, :, 0]
+            hair_p20, hair_p95 = np.percentile(hair_l, (20, 95))
+            hair_hotspot = bool(hair_p95 >= 182.0 and hair_p95 - hair_p20 >= 125.0)
+            data["measured_hair_light_contrast"] = round(
+                float(hair_p95 - hair_p20), 2,
+            )
+        data["direct_sunlight_present"] = hard_sun
+        data["head_hair_hotspot_present"] = hair_hotspot
         if hard_sun:
-            data["direct_sunlight_present"] = True
             data["head_hair_hotspot_present"] = True
             if str(data.get("sunlight_type") or "").lower() in {"", "none", "unknown"}:
                 data["sunlight_type"] = "hard direct sun"
@@ -213,6 +310,14 @@ def merge_portrait_pixel_evidence(data: Dict[str, Any], image: Image.Image) -> D
             if not any("face" in term.lower() for term in region_terms):
                 region_terms.append("face")
             data["sunlight_regions"] = ", ".join(dict.fromkeys(region_terms))
+        elif hair_hotspot:
+            data["sunlight_type"] = "localized hair glare"
+            data["sunlight_evidence"] = "bright crown strands without measured facial sunlight"
+            data["sunlight_regions"] = "hair and crown only"
+        else:
+            data["sunlight_type"] = "none"
+            data["sunlight_evidence"] = "none"
+            data["sunlight_regions"] = "none"
     return data
 
 
@@ -266,9 +371,28 @@ def clean_and_repair_json(text: str) -> Dict[str, Any]:
     if open_braces > 0:
         repaired += '}' * open_braces
 
-    parsed = json.loads(repaired)
+    parsed = None
+    for attempt in (repaired, candidate, cleaned):
+        if not attempt:
+            continue
+        try:
+            parsed = json.loads(attempt, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # Sanitize unescaped control characters/newlines inside string literals
+        sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', lambda m: ' ' if m.group(0) in '\r\n\t' else '', attempt)
+        try:
+            parsed = json.loads(sanitized, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
     if isinstance(parsed, dict):
         return parsed
+    raise ValueError(f"Could not parse valid JSON from VL response: {text[:200]}")
     raise ValueError(f"Parsed object was not a dictionary: {type(parsed)}")
 
 
@@ -647,7 +771,7 @@ def build_portrait_repair_plan(data: Dict[str, Any]) -> Dict[str, Any]:
     clauses: List[str] = []
     if sunlight:
         clauses.append(
-            f"Neutralize directional sunlight only in {regions} using this subject's shaded pixels"
+            f"Relight {regions} with soft neutral frontal studio light using this subject's shaded pixels as complexion and hair-color authority; remove direct-sun hot spots, orange/yellow cast, metallic hair glare and paired hard shadows without whitening, tanning, smoothing or changing geometry"
         )
     else:
         clauses.append("Keep the source head lighting and natural skin texture")
@@ -752,11 +876,11 @@ def normalize_uniform_analysis(data: Any) -> Dict[str, Any]:
         result["outer_color_under_neutral_light"] = "none"
         result["outer_neutral_rgb"] = None
         result["outer_color_confidence"] = "not_applicable"
-    collar = str(result.get("shirt_collar") or "").lower()
-    pattern_type = str(result.get("shirt_pattern_type") or "").lower()
-    trim_placement = str(result.get("accent_trim_placement") or "").lower()
-    if ("standing" in collar or "band" in collar) and ("collar" in trim_placement or any(p in pattern_type for p in ("plaid", "check"))):
-        result["shirt_collar"] = "folded pointed collar with triangular points"
+    # Preserve the literal collar construction reported from the template.
+    # A former heuristic rewrote every standing/band collar on a checked shirt
+    # into a folded pointed collar. Pattern and trim do not determine collar
+    # geometry; that rewrite caused Qwen to replace the uploaded mandarin-style
+    # collar with ordinary triangular points in d0bce584.
     return result
 
 
@@ -876,7 +1000,7 @@ Person (Image 1):
 
 Uniform Blueprint (Image 2):
 - garment_components: list of visible clothing pieces (e.g. ["shirt", "vest"] or ["shirt", "tie", "blazer"] or ["polo shirt"])
-- shirt_collar: exact shirt collar style (e.g. "folded pointed collar with downward points", "button-down pointed collar", "mandarin band collar without points", "round collar")
+- shirt_collar: exact shirt collar construction (e.g. "folded pointed collar with two free downward points", "button-down pointed collar", "mandarin standing band collar without points", "crossover overlap band collar without free points", "round collar")
 - outer_neckline: exact neckline of the outer garment (e.g. "deep V-neck vest", "crew neck", "blazer lapel", "none")
 - shirt_color_and_pattern: shirt color and pattern (e.g. "blue and white micro-checkered", "plain white")
 - outer_garment_color_and_shape: observed outer garment color and style
@@ -890,7 +1014,7 @@ Uniform Blueprint (Image 2):
 - badge_bbox: [ymin, xmin, ymax, xmax] coordinates of the badge on a 0-1000 normalized scale, or null if none
 
 Key garment guidelines:
-- Distinguish a folded pointed collar from a standing band collar: if folded triangular collar points/flaps rest downwards, report "folded pointed collar". A standing band collar (mandarin collar) has strictly NO folded points and only a short vertical ring.
+- Classify collar geometry from visible edges, not from fabric pattern, trim color, or a typical school-uniform expectation. Report "folded pointed collar" only when TWO distinct free triangular tips fold downward onto the chest. A standing/mandarin band wraps the neck without those free tips. If left and right collar bands cross, overlap, or converge at the center neck while remaining attached along their lower edges, report "crossover overlap band collar without free points". Do not turn an overlap seam or V-shaped opening into invented triangular points.
 - Distinguish a V-neck outer garment (e.g. V-neck vest) from a high collar: if the outer layer plunges or opens in front to expose the shirt, outer_neckline is "V-neck" or "open vest".
 - Distinguish a sleeveless vest from a blazer/jacket: a blazer has a separate front opening and folded lapels that frame the shirt; report "blazer with lapels" whenever those folded panels are visible. Do not call a blazer a vest merely because its sleeves are cropped or hidden.
 - Treat flower-shaped clips, bows, ribbons and hair ties as distinct accessories. Describe their visible shape and side exactly; never substitute one for another.
@@ -902,15 +1026,16 @@ Required keys: garment_components, shirt_color_and_pattern, outer_garment_color_
 outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence,
 shirt_collar, outer_neckline, sleeve_length, button_layout, badge_present, badge_location, badge_bbox.
 Describe only visible garment facts. Do not describe a person.
-Distinguish a standing band collar from a folded pointed collar. Distinguish a V-neck vest from a high collar.
+Classify collar geometry literally. A folded pointed collar requires two distinct free triangular tips lying down on the chest. A standing/mandarin band has no free tips; when its two bands cross or overlap at center, report "crossover overlap band collar without free points". Pattern and trim color never determine collar type. Distinguish a V-neck vest from a high collar.
 badge_bbox must be [ymin, xmin, ymax, xmax] normalized to 1000, or null if no badge.
 Use concise values and complete the JSON object."""
 
     _HAIR_RETRY_PROMPT = """Analyze only the source portrait's visible hair from crown through both sides and the back. Return one JSON object and nothing else.
 Required keys: hair_style, hair_parting, hair_length, hair_texture, hair_color, hair_crown_shape, hair_left_side, hair_right_side, hair_ends, hair_fringe, tied_section_count, tied_section_sides, ponytail_side, ponytail_anchor, ponytail_extent, hair_accessories, hair_accessory_count, hair_accessory_confidence, hair_accessory_details, visible_wearables.
 Trace the visible hair silhouette before answering: crown shape, left edge, right edge, hair behind each ear, ends near the neck or shoulders, and any visible ponytail, bun, braid, loose strand or fringe. Record those observations separately in hair_crown_shape, hair_left_side, hair_right_side, hair_ends and hair_fringe.
+For every tied section, inspect the strand construction all the way from its root to its visible end. In hair_style explicitly distinguish an interwoven braid/plait from an unbraided ponytail, twist, loose section or curl; never call a visibly plaited section merely "pigtails". hair_texture describes both the strand texture and any visible weave/plait construction.
 Count independently tied hair sections in tied_section_count. A pair of pigtails or two low side ponytails is count 2, never one generic ponytail. tied_section_sides must enumerate viewer-left and viewer-right separately, say bilateral/both sides only when both are visible, or say centered-back/not-visible. If exactly one ponytail is visible, ponytail_side must say viewer-left, viewer-right, centered-back, or not-visible; ponytail_anchor must state where it emerges relative to the ear/nape; ponytail_extent must state its visible end relative to neck/collar/shoulder. Never infer a single side from which tail appears larger; these are literal image coordinates, not the person's anatomical left/right.
-hair_accessories may contain only an object physically attached to the hair: headband, bow, ribbon, clip, flower, elastic or hair tie. State each object's side, color, attachment type, material, literal outline/geometry and count in hair_accessory_details, return the integer total in hair_accessory_count, and set hair_accessory_confidence to high, medium or low. If an object is a clip with a decorative outline, keep its type as clip and describe that outline separately; do not rename a clip as a flower merely because its silhouette has several lobes.
+hair_accessories may contain only an object physically attached to the hair: headband, bow, ribbon, clip, flower, elastic, band, bead cluster or hair tie. Inspect the root and end of every tied section separately. A bow near the ear and a beaded elastic at the lower end are two distinct accessories on that section and must both be enumerated. State each object's side, color, attachment type, material, literal outline/geometry and count in hair_accessory_details, return the integer total in hair_accessory_count, and set hair_accessory_confidence to high, medium or low. If an object is a clip with a decorative outline, keep its type as clip and describe that outline separately; do not rename a clip as a flower merely because its silhouette has several lobes.
 Eyeglass frames and temples, earrings, bindis, necklaces, clothing, skin highlights, background edges and glare are NOT hair accessories. Put glasses, earrings, bindi or necklace in visible_wearables instead.
 If an object is unclear, say uncertain and describe its location with low confidence; do not convert glasses or earrings into clips. Derive base hair color from shaded strands, not sunlight or backdrop spill. Do not report an accessory as none until both sides and the crown have been checked.
 Do not describe or identify the person."""
@@ -1034,11 +1159,11 @@ Use concise generic descriptions. Do not identify the person."""
             "glasses_reflection_description": "none",
             "headwear_present": False,
             "headwear_description": "none",
-            "hair_style": "natural dark hair",
+            "hair_style": "copy source-visible hairstyle without reinterpretation",
             "hair_parting": "source hair parting",
             "hair_length": "source hair length",
             "hair_texture": "source hair texture",
-            "hair_color": "dark brown",
+            "hair_color": "source-visible hair color under neutral light",
             "hair_crown_shape": "source crown shape",
             "hair_left_side": "source left hair silhouette",
             "hair_right_side": "source right hair silhouette",
@@ -1046,8 +1171,8 @@ Use concise generic descriptions. Do not identify the person."""
             "hair_fringe": "source fringe and loose strands",
             "tied_section_count": 0,
             "tied_section_sides": "unknown",
-            "hair_accessories": "none",
-            "hair_accessory_count": 0,
+            "hair_accessories": "copy source-visible hair accessories only",
+            "hair_accessory_count": None,
             "hair_accessory_confidence": "unknown",
             "hair_accessory_details": "none",
             "clothing_description": "source clothing",
@@ -1086,7 +1211,7 @@ Use concise generic descriptions. Do not identify the person."""
             )
             cached["portrait_repair_plan"] = build_portrait_repair_plan(cached)
             return cached
-        cache_dir = Path("scratch/cache")
+        cache_dir = Path(tempfile.gettempdir()) / "vsoul_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
         image_path = cache_dir / f"portrait_vl_{stamp}.png"
@@ -1114,9 +1239,13 @@ Use concise generic descriptions. Do not identify the person."""
             face_inspection.save(face_path)
             worker_code = f'''import gc
 import json
+import os
+import sys
 import torch
 from pathlib import Path
 from PIL import Image
+import transformers.utils.import_utils as _transformers_import_utils
+_transformers_import_utils.is_kernels_available = lambda *args, **kwargs: False
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
 
 model_dir = Path({str(MODEL_DIR.resolve())!r})
@@ -1128,13 +1257,53 @@ face_path = Path({str(face_path.resolve())!r})
 prompt = {self._PORTRAIT_PROMPT!r}
 hair_prompt = {self._HAIR_RETRY_PROMPT!r}
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
 processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    str(model_dir), quantization_config=quantization,
-    device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
-    low_cpu_mem_usage=True, local_files_only=True,
-).eval()
+# Prefer the 4-bit load: it is what keeps this analysis inside an 8 GB GPU
+# alongside Qwen Image Edit. bitsandbytes ships a native DLL that Application
+# Control blocks on this machine; the blocked load then takes the whole worker
+# down with an access violation during weight loading, which a try/except in
+# this process cannot catch. The parent re-runs this script with
+# VSOUL_VL_UNQUANTIZED=1 after such a crash, so honour that first and keep the
+# in-process except for the softer failures.
+def _load_unquantized(reason):
+    # This 3B checkpoint is ~7.1 GB in bf16 against 8.5 GB of VRAM. It fits on
+    # the GPU, but only whole: device_map="auto" splits it and streams the
+    # remainder through host RAM, which fails here with "The paging file is too
+    # small for this operation" (os error 1455). Load it onto one device.
+    print("VL_WORKER_UNQUANTIZED_FALLBACK: " + str(reason)[:300], file=sys.stderr)
+    target = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=dtype, device_map={{"": target}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as gpu_error:
+        if target == "cpu":
+            raise
+        print(
+            "VL_WORKER_CPU_FALLBACK: " + str(gpu_error)[:300], file=sys.stderr,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=torch.float32, device_map={{"": "cpu"}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+
+if os.environ.get("VSOUL_VL_UNQUANTIZED") == "1":
+    model = _load_unquantized("parent requested the unquantized retry")
+else:
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+            ),
+            device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as quantized_load_error:
+        model = _load_unquantized(quantized_load_error)
 portrait = Image.open(image_path).convert("RGB")
 head_crop = Image.open(hair_path).convert("RGB")
 head_left = Image.open(hair_left_path).convert("RGB")
@@ -1183,14 +1352,7 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 '''
             worker_path.write_text(worker_code, encoding="utf-8")
-            completed = subprocess.run(
-                [sys.executable, str(worker_path)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-            )
+            completed = _run_vl_worker(worker_path, timeout=120)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr[-1200:] or "Qwen VL worker failed")
             response = completed.stdout.strip()
@@ -1246,10 +1408,6 @@ if torch.cuda.is_available():
                     "headwear_present",
                 ):
                     result[key] = _coerce_bool(result.get(key))
-                # A forehead or hair hotspot is direct-light evidence even if
-                # the short VL response forgot to set the broader flag.
-                if result["head_hair_hotspot_present"]:
-                    result["direct_sunlight_present"] = True
                 result["source"] = "qwen2.5-vl"
                 result["portrait_repair_plan"] = build_portrait_repair_plan(result)
                 logger.info(
@@ -1288,7 +1446,7 @@ if torch.cuda.is_available():
             "shoulders_visible": True,
             "head_to_waist_visible": False,
             "template_type": "product cutout",
-            "collar": "unknown",
+            "collar_free_tip_count": None,
             "badge_present": False,
             "badge_location": "none",
             "badge_bbox": None,
@@ -1302,15 +1460,15 @@ if torch.cuda.is_available():
             "button_layout": "front placket buttons",
             "shirt_collar": "mandarin band collar at neck base",
             "outer_neckline": "V-neck vest",
-            "hair_style": "natural dark hair",
-            "hair_color": "natural dark hair",
+            "hair_style": "copy source-visible hairstyle without reinterpretation",
+            "hair_color": "source-visible hair color under neutral light",
             "hair_crown_shape": "source crown shape",
             "hair_left_side": "source left hair silhouette",
             "hair_right_side": "source right hair silhouette",
             "hair_ends": "source visible hair ends",
             "hair_fringe": "source fringe and loose strands",
-            "hair_accessories": "none",
-            "hair_accessory_count": 0,
+            "hair_accessories": "copy source-visible hair accessories only",
+            "hair_accessory_count": None,
             "hair_accessory_confidence": "unknown",
             "visible_wearables": "none",
             "gender": "unknown",
@@ -1347,7 +1505,7 @@ if torch.cuda.is_available():
             cached["portrait_repair_plan"] = build_portrait_repair_plan(cached)
             return cached
 
-        cache_dir = Path("scratch/cache")
+        cache_dir = Path(tempfile.gettempdir()) / "vsoul_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
         person_path = cache_dir / f"uniform_p_{stamp}.png"
@@ -1429,7 +1587,7 @@ if torch.cuda.is_available():
                 "shirt_color_and_pattern, shirt_primary_color, shirt_secondary_color, shirt_pattern_type, "
                 "shirt_pattern_scale, outer_garment_color_and_shape, outer_primary_color, outer_pattern_type, "
                 "outer_color_under_neutral_light, outer_neutral_rgb, outer_color_confidence, "
-                "shirt_collar, outer_neckline, sleeve_length, button_layout, button_color, badge_present, "
+                "collar_free_tip_count, shirt_collar, outer_neckline, sleeve_length, button_layout, button_color, badge_present, "
                 "badge_location, badge_bbox, pocket_count, pocket_placement, pocket_style, "
                 "fabric_detail, construction_detail, accent_trim_color, accent_trim_placement, "
                 "shoulder_trim_present.\n"
@@ -1446,13 +1604,14 @@ if torch.cuda.is_available():
                 "- Separate the cloth ground color from the thin pattern-line color. Describe the large spaces BETWEEN lines as the ground; do not call the whole shirt blue merely because it has blue lines. If unresolved say uncertain.\n"
                 "- Classify the shirt pattern as check, stripe, plaid, print, or solid and its scale as micro, fine, medium, or large. Note line thickness, crossing directions and contrast; do not invent measurements.\n"
                 "- A single-color outer garment can still have visible woven texture. Report color pattern and surface texture separately; do not equate solid color with smooth fabric.\n"
-                "- Distinguish a folded pointed collar from a standing band collar: if folded downward triangular points or wings rest on the garment, report folded pointed collar. Only report standing band if there are strictly no folded points.\n"
-                "- Describe collar ends and whether folded triangular points are actually present. Do not invent points, piping or trim.\n"
+                "- COLLAR, STEP 1 of 2 - count before naming. A free tip is a corner of collar cloth that ends in mid-air over the chest, with background or shirt visible on BOTH sides of its point, so it could be lifted away from the body. Trace the collar outline from the centre front outward on each side and set collar_free_tip_count to the integer number of such free corners: 0, 1 or 2. A corner whose entire lower edge stays sewn to the shirt is NOT free and does not count.\n"
+                "- COLLAR, STEP 2 of 2 - derive shirt_collar from that count alone, never from the check pattern, the trim colour, or what a school uniform usually looks like. 2 free tips means folded pointed collar. 0 free tips with a band wrapping the neck means standing mandarin band collar. 0 free tips with left and right bands crossing or converging at centre while their lower edges stay attached means crossover overlap band collar without free points. If the count and your first impression disagree, trust the count. Do not mistake a centre overlap seam or a V-shaped opening for a free tip, and do not report crossover merely because two free tips happen to meet near the centre.\n"
+                "- Describe collar ends, attachment edges, center overlap/crossover, and whether two free folded triangular tips are actually present. Do not invent points, piping or trim.\n"
                 "- Separate the light base cloth from colored grid threads; specify their contrast and spacing relative to a button.\n"
                 "- fabric_detail describes visible weave and surface finish for each layer. Inspect dark fabric for fine grain before calling it smooth. Use uncertain if unresolved.\n"
                 "- construction_detail must describe the actual left and right front edges, angled or curved panel shapes, seam lines, topstitching and overlapping layers. A V-neck description alone is insufficient. Distinguish stitched panel edges from printed stripes and shadows. Report a blazer or jacket with folded lapels when those folded triangular panels frame the shirt; do not downgrade it to a vest because sleeves are cropped or hidden.\n"
                 "- button_layout and button_color describe each visible layer separately: position, visible count, color and round/other shape. Do not infer hidden buttons below the crop.\n"
-                "- pocket_count is the integer number of visible functional chest pockets. A badge, emblem, printed square, seam or color block is not another pocket.\n"
+                "- pocket_count is the integer number of visible functional chest pockets. Require a visible pocket opening or independent pocket perimeter. A badge, crest backing panel, emblem, printed square, seam or color block attached to otherwise continuous fabric is NOT a pocket.\n"
                 "- pocket_placement must state viewer-left, viewer-right, both sides, centered, or none. Never mirror a single pocket.\n"
                 "- pocket_style must state plain patch, flap, buttoned flap, welt, hidden, none, or uncertain from visible construction. Do not invent a flap or button when the pocket edge is plain.\n"
                 "- Before returning JSON, cross-check collar, cloth ground versus grid color, outer texture and panel edges against the image. Replace unsupported claims with uncertain. Use concise string values for descriptions, not generic uniform recommendations.\n"
@@ -1476,9 +1635,13 @@ if torch.cuda.is_available():
 
             worker_code = f'''import gc
 import json
+import os
+import sys
 import torch
 from pathlib import Path
 from PIL import Image
+import transformers.utils.import_utils as _transformers_import_utils
+_transformers_import_utils.is_kernels_available = lambda *args, **kwargs: False
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
 
 model_dir = Path({str(MODEL_DIR.resolve())!r})
@@ -1492,13 +1655,53 @@ u_prompt = {u_prompt!r}
 h_prompt = {h_prompt!r}
 
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
 processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    str(model_dir), quantization_config=quantization,
-    device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
-    low_cpu_mem_usage=True, local_files_only=True,
-).eval()
+# Prefer the 4-bit load: it is what keeps this analysis inside an 8 GB GPU
+# alongside Qwen Image Edit. bitsandbytes ships a native DLL that Application
+# Control blocks on this machine; the blocked load then takes the whole worker
+# down with an access violation during weight loading, which a try/except in
+# this process cannot catch. The parent re-runs this script with
+# VSOUL_VL_UNQUANTIZED=1 after such a crash, so honour that first and keep the
+# in-process except for the softer failures.
+def _load_unquantized(reason):
+    # This 3B checkpoint is ~7.1 GB in bf16 against 8.5 GB of VRAM. It fits on
+    # the GPU, but only whole: device_map="auto" splits it and streams the
+    # remainder through host RAM, which fails here with "The paging file is too
+    # small for this operation" (os error 1455). Load it onto one device.
+    print("VL_WORKER_UNQUANTIZED_FALLBACK: " + str(reason)[:300], file=sys.stderr)
+    target = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=dtype, device_map={{"": target}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as gpu_error:
+        if target == "cpu":
+            raise
+        print(
+            "VL_WORKER_CPU_FALLBACK: " + str(gpu_error)[:300], file=sys.stderr,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=torch.float32, device_map={{"": "cpu"}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+
+if os.environ.get("VSOUL_VL_UNQUANTIZED") == "1":
+    model = _load_unquantized("parent requested the unquantized retry")
+else:
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+            ),
+            device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as quantized_load_error:
+        model = _load_unquantized(quantized_load_error)
 
 person_img = Image.open(person_path).convert("RGB")
 head_crop = Image.open(hair_path).convert("RGB")
@@ -1547,15 +1750,10 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 '''
             worker_path.write_text(worker_code, encoding="utf-8")
-            completed = subprocess.run(
-                [sys.executable, str(worker_path)],
-                capture_output=True,
-                text=True,
-                # Three focused observations need longer than the previous
-                # ceiling on a busy local GPU. A timeout here discarded all
-                # visual evidence and silently forced geometry fallback.
-                timeout=420,
-            )
+            # Three focused observations need longer than the previous
+            # ceiling on a busy local GPU. A timeout here discarded all
+            # visual evidence and silently forced geometry fallback.
+            completed = _run_vl_worker(worker_path, timeout=420)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr[-1200:] or "Uniform VL worker failed")
 
@@ -1578,15 +1776,13 @@ if torch.cuda.is_available():
                 # Missing model fields must not masquerade as observed facts.
                 for key in ("garment_components", "shirt_color_and_pattern", "outer_garment_color_and_shape",
                             "outer_color_under_neutral_light", "outer_neutral_rgb", "outer_color_confidence",
-                            "shirt_collar", "outer_neckline", "button_layout", "pocket_count",
+                            "collar_free_tip_count", "shirt_collar", "outer_neckline", "button_layout", "pocket_count",
                             "pocket_placement", "pocket_style", "hair_style", "hair_color",
                             "hair_accessories", "visible_wearables", "gender", "apparent_age_band"):
                     result[key] = "unknown"
                 result.update(p_dict)
                 for key in ("direct_sunlight_present", "head_hair_hotspot_present", "glasses_reflection_present"):
                     result[key] = _coerce_bool(result.get(key))
-                if result["head_hair_hotspot_present"]:
-                    result["direct_sunlight_present"] = True
                 for key in (
                     "hair_style", "hair_parting", "hair_length", "hair_texture", "hair_color",
                     "hair_crown_shape", "hair_left_side", "hair_right_side", "hair_ends", "hair_fringe",
@@ -1691,7 +1887,7 @@ if torch.cuda.is_available():
             logger.info("[UniformVL] Board-analysis cache hit: %s", analysis_cache.name)
             return cached
 
-        cache_dir = Path("scratch/cache")
+        cache_dir = Path(tempfile.gettempdir()) / "vsoul_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
         board_path = cache_dir / f"board_vl_{stamp}.png"
@@ -1702,9 +1898,13 @@ if torch.cuda.is_available():
             inspection.save(board_path)
             worker_code = f'''import gc
 import json
+import os
+import sys
 import torch
 from pathlib import Path
 from PIL import Image
+import transformers.utils.import_utils as _transformers_import_utils
+_transformers_import_utils.is_kernels_available = lambda *args, **kwargs: False
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
 
 model_dir = Path({str(MODEL_DIR.resolve())!r})
@@ -1712,13 +1912,53 @@ board_path = Path({str(board_path.resolve())!r})
 prompt = {self._BOARD_PROMPT!r}
 
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
 processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    str(model_dir), quantization_config=quantization,
-    device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
-    low_cpu_mem_usage=True, local_files_only=True,
-).eval()
+# Prefer the 4-bit load: it is what keeps this analysis inside an 8 GB GPU
+# alongside Qwen Image Edit. bitsandbytes ships a native DLL that Application
+# Control blocks on this machine; the blocked load then takes the whole worker
+# down with an access violation during weight loading, which a try/except in
+# this process cannot catch. The parent re-runs this script with
+# VSOUL_VL_UNQUANTIZED=1 after such a crash, so honour that first and keep the
+# in-process except for the softer failures.
+def _load_unquantized(reason):
+    # This 3B checkpoint is ~7.1 GB in bf16 against 8.5 GB of VRAM. It fits on
+    # the GPU, but only whole: device_map="auto" splits it and streams the
+    # remainder through host RAM, which fails here with "The paging file is too
+    # small for this operation" (os error 1455). Load it onto one device.
+    print("VL_WORKER_UNQUANTIZED_FALLBACK: " + str(reason)[:300], file=sys.stderr)
+    target = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=dtype, device_map={{"": target}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as gpu_error:
+        if target == "cpu":
+            raise
+        print(
+            "VL_WORKER_CPU_FALLBACK: " + str(gpu_error)[:300], file=sys.stderr,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype=torch.float32, device_map={{"": "cpu"}},
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+
+if os.environ.get("VSOUL_VL_UNQUANTIZED") == "1":
+    model = _load_unquantized("parent requested the unquantized retry")
+else:
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(model_dir), quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+            ),
+            device_map={{"": 0}} if torch.cuda.is_available() else "cpu",
+            low_cpu_mem_usage=True, local_files_only=True,
+        ).eval()
+    except Exception as quantized_load_error:
+        model = _load_unquantized(quantized_load_error)
 
 board_img = Image.open(board_path).convert("RGB")
 messages = [{{"role": "user", "content": [{{"type": "image", "image": board_img}}, {{"type": "text", "text": prompt}}]}}]
@@ -1735,12 +1975,7 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 '''
             worker_path.write_text(worker_code, encoding="utf-8")
-            completed = subprocess.run(
-                [sys.executable, str(worker_path)],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+            completed = _run_vl_worker(worker_path, timeout=120)
             if completed.returncode == 0:
                 parsed = clean_and_repair_json(completed.stdout.strip())
                 if isinstance(parsed, dict):

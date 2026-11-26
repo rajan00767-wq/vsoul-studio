@@ -18,6 +18,7 @@ NEEDED = [
     "qwen_image_edit/scheduler",
     "qwen_image_edit/qwen-image-edit-2511-Q4_K_M.gguf",
     "loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+    "loras/Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
     "qwen2.5-vl-3b-instruct",
     "birefnet-hr-matting/config.json",
     "birefnet-hr-matting/model.safetensors",
@@ -25,6 +26,12 @@ NEEDED = [
     "schp-lip-20/preprocessor_config.json",
     "schp-lip-20/model.safetensors",
     "realesrgan/RealESRGAN_x4plus.pth",
+    "insightface/models/buffalo_l/2d106det.onnx",
+    "insightface/models/buffalo_l/det_10g.onnx",
+    "insightface/models/buffalo_l/1k3d68.onnx",
+    "insightface/models/buffalo_l/genderage.onnx",
+    "insightface/models/buffalo_l/w600k_r50.onnx",
+    "insightface/inswapper_128.onnx",
 ]
 
 
@@ -49,10 +56,18 @@ def fetch_missing() -> None:
         )
 
     if not (DEST / "loras" / "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors").is_file():
-        print("[FETCH] Lightning LoRA")
+        print("[FETCH] 4-step Lightning LoRA")
         hf_hub_download(
             "lightx2v/Qwen-Image-Edit-2511-Lightning",
             "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+            local_dir=str(DEST / "loras"),
+        )
+
+    if not (DEST / "loras" / "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors").is_file():
+        print("[FETCH] 8-step Lightning LoRA")
+        hf_hub_download(
+            "lightx2v/Qwen-Image-Edit-2511-Lightning",
+            "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
             local_dir=str(DEST / "loras"),
         )
 
@@ -112,6 +127,51 @@ def fetch_missing() -> None:
             "Qwen/Qwen2.5-VL-3B-Instruct",
             local_dir=str(vl_dir),
         )
+
+    buffalo_dir = DEST / "insightface" / "models" / "buffalo_l"
+    buffalo_files = (
+        "2d106det.onnx",
+        "det_10g.onnx",
+        "1k3d68.onnx",
+        "genderage.onnx",
+        "w600k_r50.onnx",
+    )
+    if any(not (buffalo_dir / f).is_file() for f in buffalo_files):
+        print("[FETCH] InsightFace buffalo_l pack")
+        buffalo_dir.mkdir(parents=True, exist_ok=True)
+        import urllib.request
+        import zipfile
+
+        zip_url = "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l.zip"
+        temp_zip = DEST / "insightface" / "buffalo_l.zip"
+        try:
+            urllib.request.urlretrieve(zip_url, temp_zip)
+            with zipfile.ZipFile(temp_zip, "r") as z:
+                z.extractall(buffalo_dir)
+            temp_zip.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[WARN] Failed to download buffalo_l from HF: {e}")
+            github_url = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+            try:
+                urllib.request.urlretrieve(github_url, temp_zip)
+                with zipfile.ZipFile(temp_zip, "r") as z:
+                    z.extractall(buffalo_dir)
+                temp_zip.unlink(missing_ok=True)
+            except Exception as e2:
+                print(f"[ERROR] Failed to download buffalo_l: {e2}")
+
+    inswapper = DEST / "insightface" / "inswapper_128.onnx"
+    if not inswapper.is_file():
+        print("[FETCH] InsightFace inswapper_128.onnx")
+        inswapper.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            hf_hub_download(
+                "ezioruan/inswapper_128.onnx",
+                "inswapper_128.onnx",
+                local_dir=str(DEST / "insightface"),
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to download inswapper_128 via HF hub: {e}")
 
 
 def report() -> int:

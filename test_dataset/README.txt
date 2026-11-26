@@ -1,0 +1,1 @@
+One source per test range T001-T050 (10 ranges), four uniform references, seven extra portraits. T031-T050 samples are cropped from the synthetic overview collage and are lower resolution; use real authorized photos for final validation. Test range labels are suggested grouping, not a verified mapping to your runner. Keep source and reference separate.

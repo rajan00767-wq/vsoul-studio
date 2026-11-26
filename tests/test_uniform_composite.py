@@ -2,6 +2,7 @@ import unittest
 import numpy as np
 from PIL import Image
 from pipelines.uniform_composite import (
+    _measure_garment_neck_opening,
     build_neutral_body_fit_guide, build_person_backdrop_guide, build_person_identity_guide, build_rough_composite, describe_fabric_color, describe_hair_correction,
     describe_lighting_correction, refinement_prompt,
     ensure_garment_cutout, garment_on_selected_background, opaque_garment_cutout,
@@ -93,6 +94,16 @@ class CompositeTests(unittest.TestCase):
         self.assertEqual(cleaned.getpixel((38, 65))[3], 255)
         self.assertEqual(cleaned.getpixel((102, 65))[3], 255)
 
+    def test_colored_front_collar_at_garment_top_is_not_stripped(self):
+        garment = np.zeros((180, 140, 4), dtype=np.uint8)
+        # Red folded collar forming the top edge of the shirt
+        garment[20:50, 40:100] = (220, 25, 35, 255)
+        # Shirt body below
+        garment[50:170, 10:130] = (70, 72, 76, 255)
+        cleaned, removed = hide_product_rear_collar(Image.fromarray(garment, "RGBA"))
+        self.assertEqual(removed, 0)
+        self.assertEqual(cleaned.getpixel((70, 30))[3], 255)
+
     def test_rough_fit_preserves_face_edge_when_parser_misses_it(self):
         pixels = np.full((140, 100, 3), (225, 225, 225), dtype=np.uint8)
         pixels[20:70, 30:70] = (166, 104, 76)
@@ -138,20 +149,29 @@ class CompositeTests(unittest.TestCase):
         labels = self.labels.copy()
         labels[70:, :] = 0
         labels[73:, 5:95] = 5
+        # Give the fixture a real shirt under the chin: the neck measurement
+        # reads pixel colour, so a flat skin-coloured torso would be reported as
+        # an unreasonably long bare neck.
+        person = self.person.copy()
+        person.paste((40, 60, 110), (0, 74, 100, 140))
         _, measured = build_rough_composite(
-            self.person, self.garment, labels,
+            person, self.garment, labels,
             (30, 20, 70, 70), (4, 126, 246),
         )
         _, adjusted = build_rough_composite(
-            self.person, self.garment, labels,
+            person, self.garment, labels,
             (30, 20, 70, 70), (4, 126, 246),
             minimum_neck_gap_ratio=.10,
         )
-        self.assertAlmostEqual(measured["source_neck_gap_ratio"], .06, places=2)
+        # The seat follows this portrait's own visible neck, not a fixed value.
+        self.assertAlmostEqual(measured["neck_seat_ratio"], .07, places=2)
+        self.assertAlmostEqual(measured["source_neck_gap_ratio"], .07, places=2)
         self.assertAlmostEqual(adjusted["measured_source_neck_gap_ratio"], .06, places=2)
         self.assertAlmostEqual(adjusted["source_neck_gap_ratio"], .10, places=2)
-        self.assertEqual(
-            adjusted["garment_box"][1] - measured["garment_box"][1], 2,
+        # A caller asking for a longer neck may only move the collar downward;
+        # it must never rise back into the jaw.
+        self.assertGreaterEqual(
+            adjusted["garment_box"][1], measured["garment_box"][1],
         )
 
     def test_rough_fit_keeps_lens_reflection_and_nearby_missed_hair(self):
@@ -288,8 +308,12 @@ class CompositeTests(unittest.TestCase):
             places=2,
         )
         # The rear collar meets the lower jaw/neck transition without rising
-        # into the cheeks or leaving an empty wedge for Qwen to reproduce.
-        self.assertEqual(meta["garment_box"], [5, 75, 95, 140])
+        # into the cheeks or leaving an empty wedge for Qwen to reproduce. The
+        # seat is this portrait's measured neck column: the fixture is flat
+        # skin below the chin, so the measurement reaches its 20%-face-height
+        # cap instead of the old fixed chin-level placement.
+        self.assertEqual(meta["garment_box"], [5, 80, 95, 140])
+        self.assertAlmostEqual(meta["neck_seat_ratio"], .20, places=2)
         self.assertEqual(meta["source_canvas_size"], [100, 140])
         self.assertEqual(meta["expanded_canvas_size"], list(result.size))
 
@@ -530,6 +554,118 @@ class CompositeTests(unittest.TestCase):
         labels = np.full((20, 20), 2, dtype=np.uint8)
         self.assertTrue(source_hair_is_dark(Image.fromarray(pixels), labels))
 
+
+    def edge_clipped_labels(self):
+        """Shoulders that taper in frame, then run off both edges lower down."""
+        labels = np.zeros((140, 100), dtype=np.uint8)
+        labels[20:70, 30:70] = 13
+        # A few in-frame shoulder rows: the real body is about 60px wide.
+        labels[72:80, 20:80] = 5
+        # Most of the measured band reaches both image edges, so an unguarded
+        # 85th percentile is pinned at the full canvas width instead.
+        labels[80:, 0:100] = 5
+        return labels
+
+    def test_body_width_ignores_rows_that_run_off_the_canvas(self):
+        _, meta = build_rough_composite(
+            self.person, self.garment, self.edge_clipped_labels(),
+            (30, 20, 70, 70), (4, 126, 246),
+        )
+        # Counting the clipped rows reports the full 100px canvas and scales
+        # the garment edge to edge, erasing the shoulder slope entirely.
+        self.assertLess(meta["source_body_width_px"], 100.0)
+        self.assertLessEqual(meta["source_body_width_px"], 62.0)
+        box = meta["garment_box"]
+        self.assertGreater(box[0], 0)
+        self.assertLess(box[2], self.person.width)
+
+    def test_shoulders_cropped_on_one_side_keep_their_real_width(self):
+        """A clipped row still proves the body is at least that wide.
+
+        Discarding every edge-touching row collapsed the measurement onto the
+        narrow neck/upper-chest rows: measured 838px against a true 943px body,
+        so the fitted shirt sat ~180px inside the real shoulder line.
+        """
+        labels = np.zeros((140, 100), dtype=np.uint8)
+        labels[20:70, 30:70] = 13
+        # Upper chest well inside the frame. Deliberately wider than 1.35 face
+        # widths so the separate too-narrow safety net stays quiet and only the
+        # clipped-row floor can supply the real shoulder width.
+        labels[72:88, 21:79] = 5
+        # Shoulders that overhang the left edge only.
+        labels[88:, 0:92] = 5
+        _, meta = build_rough_composite(
+            self.person, self.garment, labels, (30, 20, 70, 70), (4, 126, 246),
+        )
+        self.assertGreaterEqual(
+            meta["source_body_width_px"], 90.0,
+            "clipped shoulder rows were discarded, shirt fitted too narrow",
+        )
+        self.assertLess(meta["source_body_width_px"], 100.0)
+
+    def test_fully_clipped_body_still_places_a_garment(self):
+        # Every clothing row touches both edges: a tightly cropped upload.
+        labels = np.zeros((140, 100), dtype=np.uint8)
+        labels[20:70, 30:70] = 13
+        labels[80:, :] = 5
+        _, meta = build_rough_composite(
+            self.person, self.garment, labels, (30, 20, 70, 70), (4, 126, 246),
+        )
+        self.assertGreater(meta["source_body_width_px"], 0.0)
+        self.assertTrue(meta["not_final"])
+
+    def test_closely_cropped_upload_extends_torso_to_canvas_bottom(self):
+        # Source upload where clothing ends well above the canvas bottom (e.g. row 110 in 140px canvas).
+        # In a passport frame, the uniform torso must extend down to the bottom of the canvas.
+        labels = np.zeros((140, 100), dtype=np.uint8)
+        labels[20:70, 30:70] = 13
+        labels[80:110, 20:80] = 5  # clothing stops at row 109
+        _, meta = build_rough_composite(
+            self.person, self.garment, labels, (30, 20, 70, 70), (4, 126, 246),
+        )
+        box = meta["garment_box"]
+        self.assertEqual(box[3], 140)
+        self.assertGreater(meta["source_body_to_face_width"], 1.35)
+
+    def test_neck_survives_when_the_parser_has_no_neck_class(self):
+        """LIP-20 has no neck label, so neck skin arrives as label 0.
+
+        Label 13 (Face) stops at the jaw and everything below it comes back as
+        0 (Background), which build_rough_composite paints with the backdrop.
+        Only the colour scan recovers it. When that scan stopped short of the
+        collar the guide showed Qwen a floating head over a white wedge, and
+        Qwen rebuilt the neck and neckline to match.
+        """
+        person = Image.new("RGB", (100, 140), (30, 30, 30))
+        # Face, then a real skin-coloured neck the parser calls background.
+        person.paste((176, 112, 79), (35, 20, 65, 95))
+        garment = Image.new("RGBA", (100, 80), (10, 20, 40, 0))
+        garment.paste((10, 20, 40, 255), (10, 10, 90, 80))
+        labels = np.zeros((140, 100), dtype=np.uint8)
+        labels[20:70, 35:65] = 13
+        labels[95:, 5:95] = 5
+        result, _ = build_rough_composite(
+            person, garment, labels, (35, 20, 65, 70), (255, 255, 255),
+        )
+        pixels = np.asarray(result.convert("RGB")).astype(int)
+        # Walk the centre column from the jaw down to the first garment pixel.
+        # Every row in between must be skin, never the flat backdrop: that wedge
+        # is what makes the head read as floating above the collar.
+        garment = (10, 20, 40)
+        jaw_to_collar = []
+        for y in range(70, pixels.shape[0]):
+            centre = pixels[y, 45:55].mean(0)
+            if max(abs(centre - np.asarray(garment))) <= 12:
+                break
+            jaw_to_collar.append((y, centre))
+        self.assertTrue(jaw_to_collar, "collar started at the jaw, no neck at all")
+        backdrop_rows = [
+            y for y, centre in jaw_to_collar if abs(centre.mean() - 255) <= 6
+        ]
+        self.assertEqual(
+            backdrop_rows, [],
+            f"backdrop wedge left between jaw and collar at rows {backdrop_rows}",
+        )
 
 if __name__ == "__main__":
     unittest.main()
