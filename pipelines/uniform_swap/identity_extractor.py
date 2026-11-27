@@ -64,12 +64,23 @@ class IdentityExtractor:
         all_garment = schp_cloth | bisenet_cloth
 
         # Hair proximity zone: accessories sit directly on or touching the hair/braid silhouette
-        # CRITICAL: Must exclude clothing and hoodie fabric so garments are NEVER classified as accessories!
         hair_dil = cv2.dilate(hair_mask.astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)
         corner_bg = np.concatenate([rgb[:30, :30], rgb[:30, -30:]])
         is_light_bg = float(np.mean(corner_bg)) > 180.0
         is_ambient_bg = ((rgb[:, :, 0] > 195) & (rgb[:, :, 1] > 195) & (rgb[:, :, 2] > 195)) if is_light_bg else np.zeros((h, w), dtype=bool)
-        acc_corridor = hair_dil & ~face_mask & ~neck_mask & ~all_garment & ~is_ambient_bg
+
+        # Distinguish garment fabric from accessories resting on the torso:
+        # Measure garment core color (away from hair)
+        g_core = all_garment & ~hair_dil
+        if np.sum(g_core) > 500:
+            g_med = np.median(rgb[g_core], axis=0)
+            g_diff = np.linalg.norm(rgb.astype(float) - g_med[None, None, :], axis=2)
+            # Pixels contrasting with the garment fabric by delta > 35 or not on garment
+            valid_acc_zone = ~all_garment | (g_diff > 35.0)
+        else:
+            valid_acc_zone = ~all_garment
+
+        acc_corridor = hair_dil & ~face_mask & ~neck_mask & valid_acc_zone & ~is_ambient_bg
 
         # 1. Semantic parsing indicators
         # SCHP LIP-20: label 4 (sunglasses/accessories), label 18 (scarf/accessory)
@@ -86,16 +97,18 @@ class IdentityExtractor:
 
         if np.any(hair_mask):
             hair_h = float(np.median(hue[hair_mask]))
+            hair_sat = float(np.median(sat[hair_mask]))
             hair_v = float(np.median(val[hair_mask]))
         else:
-            hair_h, hair_v = 0.0, 0.0
+            hair_h, hair_sat, hair_v = 0.0, 0.0, 0.0
 
         color_diff = np.abs(hue.astype(float) - hair_h)
         color_diff = np.minimum(color_diff, 180.0 - color_diff)
 
-        # Colored accessories (blue, red, green, pink, yellow ribbons/bows):
-        # Must have significant hue deviation from the natural hair or high saturation
-        chromatic_cand = (color_diff > 25.0) & (sat >= 60) & (val >= 45) & acc_corridor
+        # Colored accessories (blue, red, green, pink, yellow, maroon ribbons/bows):
+        # Must have significant hue deviation (> 14 deg) from natural hair OR higher saturation (> 35 above hair)
+        is_chromatic_diff = (color_diff > 14.0) | ((sat.astype(float) - hair_sat) > 35.0)
+        chromatic_cand = is_chromatic_diff & (sat >= 50) & (val >= 40) & acc_corridor
         # Bright light accessories (white/pearlescent barrettes, clips, ribbons):
         # Must be located within genuine hair boundary and distinct from ambient backdrop
         bright_cand = (val >= 210) & ((val - hair_v) > 65.0) & hair_mask & ~is_ambient_bg
@@ -103,9 +116,9 @@ class IdentityExtractor:
         # Foreground check via BiRefNet alpha
         if birefnet_alpha is not None:
             fg = (birefnet_alpha > 120)
-            candidate_map = (sem_acc | chromatic_cand | bright_cand) & fg & ~all_garment
+            candidate_map = (sem_acc | chromatic_cand | bright_cand) & fg & valid_acc_zone
         else:
-            candidate_map = (sem_acc | chromatic_cand | bright_cand) & ~all_garment
+            candidate_map = (sem_acc | chromatic_cand | bright_cand) & valid_acc_zone
 
         # Connected component analysis for object completeness
         num_c, labels, stats, centroids = cv2.connectedComponentsWithStats(candidate_map.astype(np.uint8))
@@ -167,18 +180,14 @@ class IdentityExtractor:
             }
 
             # Distinguish genuine hair accessories from chest badges / garment details:
-            # Hair bows, ribbons, clips, and headbands are located near the head (ears/temples/jawline/crown)
-            if touches_hair and (is_crown or (is_lateral and is_near_head)):
+            # Hair bows, ribbons, clips, and braid accessories touch hair and are located at crown or lateral braids
+            if touches_hair and (is_crown or is_lateral):
                 accessory_mask |= closed_comp
                 accessory_objects.append(obj_entry)
-            elif cy > chin_y + fh * 0.28 and np.any(closed_comp & schp_cloth):
-                # An emblem, patch, or school badge on the chest / torso garment
+            elif not touches_hair and cy > chin_y + fh * 0.28 and np.any(closed_comp & schp_cloth):
+                # An emblem, patch, or school badge on the chest / torso garment away from hair
                 badge_mask |= closed_comp
                 badge_objects.append(obj_entry)
-            elif touches_hair and is_lateral and area <= 800 and not np.any(closed_comp & schp_cloth):
-                # Small braid tie / hairband at the lower tip of a braid
-                accessory_mask |= closed_comp
-                accessory_objects.append(obj_entry)
 
         logger.info(
             "[IDENTITY_EXTRACTOR] Semantic hair accessory extraction: found %d hair accessory object(s) (%d px), %d garment badge(s) (%d px)",
@@ -246,10 +255,16 @@ class IdentityExtractor:
         elif bisenet_neck is None:
             bisenet_neck = np.zeros((h, w), dtype=bool)
 
+        # Anatomical neck corridor: natural throat contour between chin and clavicular notch.
+        # Uses an anatomical parabolic/elliptical curve to prevent horizontal chest seam artifacts.
+        y_grid = np.arange(h)[:, None]
+        x_grid = np.arange(w)[None, :]
+        dx_norm = np.clip(np.abs(x_grid - fcx) / max(1.0, fw * 0.38), 0.0, 1.0)
+        neck_bottom_curve = chin_y + fh * (0.26 - 0.12 * (dx_norm ** 2))
         neck_corridor = (
-            (np.arange(h)[:, None] >= chin_y - fh * 0.02)
-            & (np.arange(h)[:, None] <= chin_y + fh * 0.45)
-            & (np.abs(np.arange(w)[None, :] - fcx) <= fw * 0.45)
+            (y_grid >= chin_y - fh * 0.02)
+            & (y_grid <= neck_bottom_curve)
+            & (dx_norm < 1.0)
         )
         cand_neck = (bisenet_neck | (schp_labels == 10)) & neck_corridor & ~orig_face_mask & ~orig_ears_mask
         num_n, n_labels, _, _ = cv2.connectedComponentsWithStats(cand_neck.astype(np.uint8))

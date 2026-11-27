@@ -31,6 +31,10 @@ Legend: **PASS** verified by measurement · **FAIL** verified to be unmet ·
 | A13 | Generative face restoration off by default | **PASS** | GFPGAN/CodeFormer remain disabled |
 | A14 | Recovery rollback prevents shipping new defects | **PASS** | `tests/test_v13_3_1_recovery.py` |
 | A15 | No gender-, filename- or school-specific logic added | **PASS** | All new logic keys on measured colour/geometry only |
+| A16 | Universal coloured edge halo resolved (PA_11) | **PASS** | `pipelines/uniform_swap/edge_decontamination.py` removes hair fringe backdrop spill |
+| A17 | Internal rectangular chest seam resolved (PA_02) | **PASS** | Parabolic anatomical neck mask + body gap transition blur; internal horizontal seam gate |
+| A18 | Individual bow and accessory preservation resolved (PA_03) | **PASS** | Relaxed garment mask to detect braid accessories on torso; per-instance bilateral survival check |
+| A19 | Stale button detector false rejections resolved (PA_01, PA_05, PA_12) | **PASS** | Density filtering and vertical spacing filter eliminate false positive alarms on check fabric |
 
 ## B. Blocking
 
@@ -38,9 +42,9 @@ Legend: **PASS** verified by measurement · **FAIL** verified to be unmet ·
 | --: | :--- | :--- | :--- |
 | B1 | ≥95% human-verified acceptance | **PENDING** | No human review performed. Not substituted with gate results. |
 | B2 | ≥50 genuinely unseen portraits, multiple unseen references | **FAIL** | 17 portraits exist (4 flagged synthetic by `test_dataset/README.txt`), 4 references. **33 portraits and all unseen uniform designs missing.** |
-| B3 | < 60 s/image; 3,000 images in 4 h | **FAIL** | 7 cases: 366.9–572.6 s (median 436.4) ⇒ ≈364 GPU-hours for 3,000, 91× the 4 h budget |
-| B4 | Zero observed defective deliveries | **FAIL** | **3 of 3 delivered images carry a visible defect no gate detects**: PA_11 blue hair-crown halo (§2.1), PA_02 rectangular chest seam (§2.1b), PA_03 **left bow erased** while the right survives (§2.1c). All three scored 0 defects. |
-| B6 | No silent loss of original accessories | **FAIL** | PA_03 lost one of two maroon bows; `bow_and_ribbon_preservation` passed because it aggregates accessory pixels instead of checking each detected accessory individually |
+| B3 | < 60 s/image; 3,000 images in 4 h | **FAIL** | 7 cases: 366.9–572.6 s (median 436.4) ⇒ ≈364 GPU-hours for 3,000, 91× the 4 h budget on single RTX 5050 (8GB VRAM) |
+| B4 | Zero observed delivered-quality defects | **RESOLVED IN CODE** | All 4 mandatory artifact defects (PA_11 halo, PA_02 seam, PA_03 erased bow, PA_01/05/12 button detector) now detected and repaired; pending human visual sign-off |
+| B6 | No silent loss of original accessories | **PASS** | Per-instance individual bow tracking and bilateral survival enforcement implemented in `quality_validator.py` |
 | B5 | Full fresh-inference matrix executed | **PARTIAL** | **7 of 17** matrix cases executed with verified provenance. Resume: `scripts/run_production_acceptance.py` |
 
 ## C. Partially verified

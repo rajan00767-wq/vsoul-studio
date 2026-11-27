@@ -641,6 +641,56 @@ class UniformSwapOrchestrator:
             repair_actions = ["bypassed_rgb_restoration_off"]
             incompatible_geometry_rejected = False
 
+        # ── 7b. Coloured edge decontamination (V13.3.2 §5) ──
+        # PA_11 was delivered with a blue fringe along the hair crown. Measured
+        # on its artifacts: the raw Qwen output had 0 backdrop-coloured pixels
+        # and the assembled foreground had 841, all within 25px of the subject
+        # edge and exactly the source photo's backdrop blue (0,129,253). The
+        # spill is source backdrop carried through matting, so it is removed
+        # here, after compositing, using the measured source backdrop colour.
+        edge_decon_info: Dict[str, Any] = {}
+        try:
+            from pipelines.uniform_swap.edge_decontamination import (
+                decontaminate_edges, detect_colored_edge_halo, estimate_source_background_color,
+            )
+
+            _rgba_src = comp_res.get("composite_rgba") if 'comp_res' in locals() and comp_res else None
+            if _rgba_src is None and final_img.mode == "RGBA":
+                _rgba_src = final_img
+            if _rgba_src is not None:
+                _arr = np.asarray(_rgba_src.convert("RGBA"))
+                _src_bg, _bg_conf = estimate_source_background_color(
+                    np.asarray(Image.open(person_image_input).convert("RGB"))
+                    if isinstance(person_image_input, (str, Path)) else normalized_rgb
+                )
+                _hair_m = id_layer.get("original_hair_mask") if 'id_layer' in locals() and id_layer else None
+                _det = detect_colored_edge_halo(
+                    _arr[:, :, :3], _arr[:, :, 3], _src_bg,
+                    output_background_rgb=config.background_color,
+                    hair_mask=_hair_m,
+                )
+                edge_decon_info = {"detection": {k: v for k, v in _det.items() if k != "mask"},
+                                   "source_background_rgb": _src_bg,
+                                   "source_background_confidence": _bg_conf}
+                if _det["status"] == "FAIL" and _bg_conf >= 0.40:
+                    _frgb, _falpha, _info = decontaminate_edges(
+                        _arr[:, :, :3], _arr[:, :, 3], _src_bg, _det["mask"], hair_mask=_hair_m)
+                    _fixed = Image.fromarray(np.dstack([_frgb, _falpha]), "RGBA")
+                    if 'comp_res' in locals() and comp_res:
+                        comp_res["composite_rgba"] = _fixed
+                    _bg = np.array(config.background_color, dtype=np.float32)
+                    _a = (_falpha.astype(np.float32) / 255.0)[:, :, None]
+                    final_img = Image.fromarray(
+                        np.clip(_frgb.astype(np.float32) * _a + _bg * (1 - _a), 0, 255).astype(np.uint8))
+                    repair_actions.extend(_info.get("actions", []))
+                    edge_decon_info["repair"] = {k: v for k, v in _info.items()}
+                    logger.info("[ORCHESTRATOR] Coloured edge decontamination applied: %s",
+                                _info.get("actions"))
+        except Exception as e:  # never let a cosmetic repair break delivery
+            logger.warning("[ORCHESTRATOR] Edge decontamination skipped: %s", e)
+            edge_decon_info = {"error": str(e)}
+        record_stage("edge_decontamination", 0.0, edge_decon_info)
+
         # Save separate diagnostic files (Section 7 & 9)
         final_candidate_path = deb_path_dir / f"{job_id}_final_candidate.png"
         final_img.save(final_candidate_path)

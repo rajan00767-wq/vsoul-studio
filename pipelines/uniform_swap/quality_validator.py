@@ -403,6 +403,11 @@ class QualityValidator:
                     s_ratio = s_h / max(1.0, s_w)
                     aspect_delta = float(abs(c_ratio / max(1e-4, s_ratio) - 1.0))
 
+            if cand_box is None and identity_layer and identity_layer.get("face_bbox") is not None:
+                cand_box = np.array(identity_layer["face_bbox"], dtype=float)
+            if src_box is None and identity_layer and identity_layer.get("face_bbox") is not None:
+                src_box = np.array(identity_layer["face_bbox"], dtype=float)
+
         except Exception as exc:
             logger.warning("[QUALITY_VALIDATOR] InsightFace validation error: %s", exc)
             defects.append(f"insightface_error: {str(exc)}")
@@ -687,9 +692,27 @@ class QualityValidator:
                 diff = np.abs(cand_rgb[src_acc].astype(float) - src_rgb[src_acc].astype(float))
                 color_match = np.mean(diff, axis=1) < 40.0
                 retained_bow_px = int(np.sum(color_match))
+
+                # Check bilateral preservation: if source had both left and right accessories,
+                # both sides must be preserved individually so one retained bow cannot mask an erased bow
+                c_fcx_val = (cand_box[0] + cand_box[2]) * 0.5 if cand_box is not None else w * 0.5
+                left_acc = src_acc & (np.arange(w)[None, :] < c_fcx_val)
+                right_acc = src_acc & (np.arange(w)[None, :] >= c_fcx_val)
+                left_src_px = int(np.sum(left_acc))
+                right_src_px = int(np.sum(right_acc))
+                left_ret_px = int(np.sum(color_match[left_acc[src_acc]])) if left_src_px > 0 else 0
+                right_ret_px = int(np.sum(color_match[right_acc[src_acc]])) if right_src_px > 0 else 0
+
+                bilateral_fail = False
+                if left_src_px >= 100 and left_ret_px < int(0.40 * left_src_px):
+                    bilateral_fail = True
+                if right_src_px >= 100 and right_ret_px < int(0.40 * right_src_px):
+                    bilateral_fail = True
             else:
                 retained_bow_px = 1000
-            if retained_bow_px > 100:
+                bilateral_fail = False
+
+            if retained_bow_px > 100 and not bilateral_fail:
                 checks["bow_and_ribbon_preservation"] = {"status": "PASS", "score": retained_bow_px, "threshold": 100, "details": "Original accessories preserved"}
             else:
                 checks["bow_and_ribbon_preservation"] = {"status": "FAIL", "score": retained_bow_px, "threshold": 100, "details": "Missing original hair accessories"}
@@ -1390,9 +1413,32 @@ class QualityValidator:
             if straight_r:
                 has_rect_cut = True
 
+        # Internal rectangular seam check: detect straight horizontal step edges across the chest (V13.3.2)
+        has_internal_seam = False
+        if cand_box is not None:
+            c_chin_y_val = int(cand_box[3])
+            c_fh_val = float(cand_box[3] - cand_box[1])
+            c_fw_val = float(cand_box[2] - cand_box[0])
+            c_mid_x_val = int((cand_box[0] + cand_box[2]) / 2)
+            c_y1_val = int(c_chin_y_val + 0.18 * c_fh_val)
+            c_y2_val = min(h - 30, int(c_chin_y_val + 1.35 * c_fh_val))
+            c_x1_val = max(10, int(c_mid_x_val - 0.35 * c_fw_val))
+            c_x2_val = min(w - 10, int(c_mid_x_val + 0.35 * c_fw_val))
+            if c_y2_val > c_y1_val + 30 and c_x2_val > c_x1_val + 40:
+                gray_c_val = cv2.cvtColor(cand_rgb[c_y1_val:c_y2_val, c_x1_val:c_x2_val], cv2.COLOR_RGB2GRAY)
+                step_y_val = np.abs(gray_c_val[2:, :].astype(float) - gray_c_val[:-2, :].astype(float))
+                min_seam_span_val = int(0.30 * (c_x2_val - c_x1_val))
+                for ry_val in range(step_y_val.shape[0]):
+                    row_s_val = step_y_val[ry_val] > 35.0
+                    if np.any(row_s_val):
+                        runs_val = np.diff(np.where(np.concatenate(([row_s_val[0]], row_s_val[:-1] != row_s_val[1:], [True])))[0])[::2]
+                        if len(runs_val) > 0 and max(runs_val) >= min_seam_span_val and np.mean(step_y_val[ry_val, row_s_val]) > 45.0:
+                            has_internal_seam = True
+                            break
+
         bg_clean_status = checks.get("background_cleanliness", {}).get("status", "PASS")
-        if has_rect_cut or (bg_clean_status == "FAIL" and has_edge_stripes):
-            checks["rectangular_garment_boundary"] = {"status": "FAIL", "score": 1, "threshold": 0, "details": "Rectangular unsegmented crop boundary detected"}
+        if has_rect_cut or has_internal_seam or (bg_clean_status == "FAIL" and has_edge_stripes):
+            checks["rectangular_garment_boundary"] = {"status": "FAIL", "score": 1, "threshold": 0, "details": "Rectangular unsegmented crop boundary or internal chest seam detected"}
             defects.append("rectangular_garment_boundary")
         else:
             checks["rectangular_garment_boundary"] = {"status": "PASS", "score": 0, "threshold": 0, "details": "Natural anatomical shoulder contour"}
@@ -1501,8 +1547,38 @@ class QualityValidator:
             total_halo_px = white_px_head + white_px_garment
             if total_halo_px > 500:
                 has_white_halo = True
-        if has_white_halo or has_edge_stripes:
-            checks["white_edge_halo"] = {"status": "FAIL", "score": 1, "threshold": 0, "details": "White halo along subject boundary"}
+
+        # Check colored edge contamination (e.g. blue/green studio backdrop spill along hair silhouette)
+        has_colored_halo = False
+        try:
+            from pipelines.uniform_swap.edge_decontamination import (
+                detect_colored_edge_halo, estimate_source_background_color,
+            )
+            src_bg_col, bg_conf = estimate_source_background_color(src_rgb) if src_rgb is not None else (None, 0.0)
+            if src_bg_col is not None and bg_conf >= 0.40:
+                fg_alpha_arr = None
+                if identity_layer and identity_layer.get("full_person_alpha") is not None:
+                    fg_alpha_arr = identity_layer["full_person_alpha"]
+                elif isinstance(candidate_image, Image.Image) and candidate_image.mode == "RGBA":
+                    fg_alpha_arr = np.asarray(candidate_image)[:, :, 3]
+                elif isinstance(candidate_image, np.ndarray) and candidate_image.ndim == 3 and candidate_image.shape[2] == 4:
+                    fg_alpha_arr = candidate_image[:, :, 3]
+                if fg_alpha_arr is not None:
+                    hair_m_col = identity_layer.get("original_hair_mask") if identity_layer else None
+                    out_bg_tuple = (int(target_bg_arr[0]), int(target_bg_arr[1]), int(target_bg_arr[2])) if hasattr(target_bg_arr, '__len__') and len(target_bg_arr) >= 3 else (255, 255, 255)
+                    col_det = detect_colored_edge_halo(
+                        cand_rgb, fg_alpha_arr, src_bg_col,
+                        output_background_rgb=out_bg_tuple,
+                        hair_mask=hair_m_col,
+                    )
+                    if col_det.get("status") == "FAIL":
+                        has_colored_halo = True
+                        checks["colored_edge_halo"] = col_det
+        except Exception:
+            pass
+
+        if has_white_halo or has_colored_halo or has_edge_stripes:
+            checks["white_edge_halo"] = {"status": "FAIL", "score": 1, "threshold": 0, "details": "Edge halo or colored backdrop spill along subject boundary"}
             defects.append("white_edge_halo")
         else:
             checks["white_edge_halo"] = {"status": "PASS", "score": 0, "threshold": 0, "details": "Zero white edge halo"}

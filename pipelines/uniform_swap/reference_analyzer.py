@@ -171,12 +171,20 @@ def measure_button_blobs(
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
+    # If the placket strip has high component density (e.g. check/gingham/patterned fabric),
+    # increase the minimum area threshold to prevent small check weave intersections (20-50 px)
+    # from being misidentified as buttons. Genuine placket buttons are substantially larger.
+    effective_min_area = max(min_area, 60.0) if n > 12 else min_area
+
     strip_w = strip_rgb.shape[1]
-    cands: List[Tuple[np.ndarray, float]] = []
+    strip_h = strip_rgb.shape[0]
+    min_y_sep = max(20.0, 0.08 * strip_h)
+
+    cands: List[Tuple[np.ndarray, float, float]] = []
     for i in range(1, n):
         area = float(stats[i, cv2.CC_STAT_AREA])
         bw, bh = float(stats[i, cv2.CC_STAT_WIDTH]), float(stats[i, cv2.CC_STAT_HEIGHT])
-        if not (min_area <= area <= max_area) or bw < 2 or bh < 2:
+        if not (effective_min_area <= area <= max_area) or bw < 2 or bh < 2:
             continue
         if not (0.45 <= bw / bh <= 2.2):
             continue
@@ -184,32 +192,40 @@ def measure_button_blobs(
         # placket on most garments, so without this the check fabric either
         # side of a navy placket supplies "blobs" that outvote the buttons.
         cx = float(stats[i, cv2.CC_STAT_LEFT]) + bw * 0.5
-        if abs(cx - strip_w * 0.5) > strip_w * 0.25:
+        if abs(cx - strip_w * 0.5) > strip_w * 0.35:
             continue
         if area / (bw * bh) < 0.40:
             continue  # a button is a filled disc, not a thin pattern fragment
         # Sample the blob's INTERIOR, not the component itself. The local
         # contrast image responds at the button's rim, so averaging the
         # component returns the rim - a blend of button and surrounding cloth.
-        # Measured on the clean baseline, two genuinely black buttons came back
-        # as (119,109,134) and (136,137,167) that way, i.e. not black at all.
         bx, by = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        cy = by + bh * 0.5
         ix0, iy0 = bx + int(bw * 0.3), by + int(bh * 0.3)
         ix1, iy1 = bx + int(np.ceil(bw * 0.7)), by + int(np.ceil(bh * 0.7))
         core = strip_lab[max(0, iy0):max(iy0 + 1, iy1), max(0, ix0):max(ix0 + 1, ix1)]
         if core.size == 0:
             continue
-        cands.append((np.median(core.reshape(-1, 3), axis=0), area))
+        blob_col = np.median(core.reshape(-1, 3), axis=0)
+        cands.append((blob_col, area, cy))
 
     if len(cands) < 2:
         return None, len(cands)
 
-    # Keep the largest blobs, then the colour they agree on. Pattern fragments
-    # that survive the size and solidity filters disagree with each other and
-    # with the buttons, so they drop out of the agreeing group.
+    # Keep the largest blobs, then enforce vertical button separation:
+    # Placket buttons are arranged in a vertical column separated along the placket,
+    # so blobs sitting at the same vertical height (pattern elements in a row) are filtered.
     cands.sort(key=lambda c: -c[1])
     top = cands[:max(2, min(6, len(cands)))]
-    labs = [c[0] for c in top]
+    filtered: List[Tuple[np.ndarray, float, float]] = []
+    for c in top:
+        if not any(abs(c[2] - f[2]) < min_y_sep for f in filtered):
+            filtered.append(c)
+
+    if len(filtered) < 2:
+        return None, len(filtered)
+
+    labs = [c[0] for c in filtered]
     best_group: List[np.ndarray] = []
     for anchor in labs:
         group = [l for l in labs if float(np.linalg.norm(l - anchor)) < 30.0]

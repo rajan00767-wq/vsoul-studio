@@ -255,6 +255,11 @@ class UniformCompositor:
             garment_alpha[body_gap] = 255
             # Inpaint garment fabric texture onto missing shoulder areas
             cleaned_garment_rgb = cv2.inpaint(cleaned_garment_rgb, body_gap.astype(np.uint8), inpaintRadius=9, flags=cv2.INPAINT_TELEA)
+            # Smooth inpaint boundary to eliminate sharp step edges
+            seam_band = cv2.dilate(body_gap.astype(np.uint8), np.ones((7, 7), np.uint8)) ^ cv2.erode(body_gap.astype(np.uint8), np.ones((7, 7), np.uint8))
+            if np.any(seam_band):
+                blurred_seam = cv2.GaussianBlur(cleaned_garment_rgb, (9, 9), 2.0)
+                cleaned_garment_rgb[seam_band > 0] = blurred_seam[seam_band > 0]
             repair_actions.append(f"extended_garment_to_authentic_shoulders ({int(np.sum(body_gap))} px)")
 
         # Fill internal holes inside candidate garment alpha
