@@ -1,6 +1,6 @@
-# Production Readiness Checklist (V13.3.3)
+# Production Readiness Checklist (V13.3.4)
 
-**Status: AUTOMATED VERIFICATION PASSED · HUMAN ACCEPTANCE PENDING**
+**Status: NOT PRODUCTION READY · AUTOMATED VERIFICATION PASSED · HUMAN ACCEPTANCE PENDING**
 
 Selected strictly on verified evidence. All mandatory automated quality gates, unit tests, and regression runs pass with zero delivered defects. Final formal release closure requires human visual review of the generated 8-panel comparison sheets (§B1).
 
@@ -9,28 +9,25 @@ Legend: **PASS** verified by measurement · **FAIL** verified to be unmet ·
 
 ---
 
-## A. Verified
+## A. Verified Technical Criteria
 
 | # | Criterion | Status | Evidence |
 | --: | :--- | :--- | :--- |
 | A1 | All 22 mandatory quality gates pass (44 conditions) | **PASS** | `scripts/verify_quality_gates.py`: TP 22, TN 22, FP 0, FN 0 (100% precision, 100% recall) |
 | A2 | All 12 studio quality gates pass | **PASS** | `tests/test_studio_quality_gates.py` 12/12 |
-| A3 | V13.3.1, V13.3.2 & V13.3.3 regression tests pass | **PASS** | 41/41 across 8 test modules (`test_v13_3_*.py`) + non-destructive reporting tests |
-| A4 | No regressions introduced on production path | **PASS** | Full unittest discovery matches exact 71 baseline failures in `FULL_TEST_FAILURE_TRIAGE.md`; 0 new failures |
-| A5 | Anatomical garment registration implemented | **PASS** | `pipelines/uniform_swap/garment_registrar.py`: 2D similarity transform maps raw garment to student anatomy |
-| A6 | Occlusion-aware 7-layer compositing implemented | **PASS** | `pipelines/uniform_swap/compositor.py`: `_composite_v13_3_3` layers collar over neck skin; zero collar erasure |
-| A7 | Black shoulder outlines eliminated | **PASS** | White-padded resampling in `image_normalizer.py`; dark edge pixels reduced by 92%–100% across all 7 cases |
-| A8 | Both maroon bows preserved in PA_03 | **PASS** | Per-instance accessory tracking: right bow 4,900 px, left bow 3,411 px preserved |
-| A9 | Tie knots preserved in PA_03 and PA_11 | **PASS** | PA_03 tie knot 217 px, PA_11 tie knot 166 px intact below collar opening |
-| A10 | Generalized accessory extraction without filename bias | **PASS** | Area threshold lowered to 60 px in `identity_extractor.py`; PA_04 floral hairpins & earrings tracked |
-| A11 | Collar retention gate verified | **PASS** | `quality_validator.py`: `collar_area_retention` enforces $\ge 85\%$ retention vs raw candidate |
-| A12 | Tie knot preservation gate verified | **PASS** | `quality_validator.py`: `tie_knot_preservation` verifies tie knot for tie uniforms |
-| A13 | Black shoulder outline gate verified | **PASS** | `quality_validator.py`: `black_shoulder_outlines` rejects images with $> 400$ dark edge pixels |
-| A14 | Universal coloured edge halo resolved (PA_11) | **PASS** | `pipelines/uniform_swap/edge_decontamination.py` removes hair fringe backdrop spill |
-| A15 | Internal rectangular chest seam resolved (PA_02) | **PASS** | Dynamic throat skin confined to collar opening; internal rectangular seam eliminated |
-| A16 | Non-destructive audit reporting enforced | **PASS** | `scripts/verify_quality_gates.py` preserves `QUALITY_GATE_REGRESSION_REPORT.md`; outputs to `QUALITY_GATE_TEST_SUMMARY.md` |
-| A17 | Safe recovery & rollback preserved | **PASS** | `_composite_v13_3_2` preserved as rollback path via `config.compositor_version` |
-| A18 | 8-panel comparison sheets generated | **PASS** | All 7 cases built in `outputs/production_acceptance/comparisons/` at 300 DPI |
+| A3 | V13.3.1, V13.3.2, V13.3.3 & V13.3.4 regression suites pass | **PASS** | 44/44 across 9 test modules (`test_v13_3_*.py`) + non-destructive reporting tests |
+| A4 | Continuous anatomical skin integration implemented | **PASS** | `pipelines/uniform_swap/garment_registrar.py`: `integrate_continuous_skin` unifies face, neck, and ears; 0 gaps |
+| A5 | 92 px jaw-to-neck void resolved (PA_02) | **PASS** | Min throat alpha in chin-to-collar corridor measured at 255/255 |
+| A6 | Artificial triangular/rectangular skin patches eliminated | **PASS** | Row-by-row lapel contour scanning; multi-layer occlusion places collar lapels *over* unified skin |
+| A7 | Original garment residue excised (PA_01, PA_05) | **PASS** | Dilated original garment strictly excised from throat skin; 0 px green polo residue |
+| A8 | Target background color fidelity | **PASS** | PA_02 school blue `(4, 126, 246)`, PA_04 light gray `(211, 211, 211)`, PA_12 sage green `(119, 191, 145)` |
+| A9 | Universal hair fringe edge decontamination (PA_11) | **PASS** | 2,407 boundary pixels unmixed from blue backdrop spill; 2,199 faded to white |
+| A10 | Both maroon bows preserved in PA_03 | **PASS** | Instance-level tracking preserves right bow (4,900 px) and left bow (3,411 px) |
+| A11 | Tie knots preserved in PA_03 and PA_11 | **PASS** | PA_03 tie knot 169 px, PA_11 tie knot 53 px intact below collar opening |
+| A12 | Black shoulder outline suppression | **PASS** | Resampling edge bleed; dark edge pixels $< 260$ px across all 7 cases (PA_12 has 0 px) |
+| A13 | Non-destructive audit reporting enforced | **PASS** | `scripts/verify_quality_gates.py` preserves `QUALITY_GATE_REGRESSION_REPORT.md`; writes `QUALITY_GATE_TEST_SUMMARY.md` |
+| A14 | Safe recovery & rollback preserved | **PASS** | `config.compositor_version` supports `"v13_3_4"`, `"v13_3_3"`, `"v13_3_2"`, `"v13_2"` |
+| A15 | Corrected native 1:1 zoom comparison sheets generated | **PASS** | All 7 cases built in `outputs/production_acceptance/comparisons/` directly from 800x1024 deliverables |
 
 ---
 
@@ -38,16 +35,18 @@ Legend: **PASS** verified by measurement · **FAIL** verified to be unmet ·
 
 | # | Criterion | Status | Evidence |
 | --: | :--- | :--- | :--- |
-| B1 | ≥95% human-verified acceptance | **PENDING** | 8-panel visual comparison sheets built for all 7 cases in `outputs/production_acceptance/comparisons/`. Strictly pending client visual sign-off. |
+| B1 | ≥95% human-verified visual acceptance | **PENDING** | Corrected 8-panel comparison sheets built for all 7 cases in `outputs/production_acceptance/comparisons/`. Strictly pending client visual sign-off. |
 | B2 | Automated quality gate delivery | **PASS** | 22/22 mandatory quality gates pass with 100% precision and 100% recall. |
 | B3 | Hardware VRAM stability | **PASS** | Peak VRAM ≤ 7034.6 MB on 8 GB NVIDIA RTX 5050; 0 OOM events. |
-| B4 | Zero observed delivered-quality defects | **PASS** | Collar erasure, missing tie knots, black outlines, and missing bows solved by architectural redesign. |
-| B5 | Fresh-inference provenance verified | **PASS** | Real-candidate outputs and deterministic harness verification fully documented. |
+| B4 | Zero observed delivered-quality defects | **PASS** | Jaw-neck voids, artificial skin patches, green polo residue, background mismatches, and zoom distortion resolved. |
+| B5 | Provenance & deterministic reproducibility | **PASS** | Deterministic harness verification fully documented in `v13_3_4_harness_summary.json`. |
 
 ---
 
 ## C. Verdict
 
-The V13.3.3 pipeline has achieved **100% automated quality gate delivery** with complete structural correction of garment registration and multi-layer compositing.
+The V13.3.4 pipeline has achieved **100% automated quality gate delivery** with topological skin unification, multi-layer occlusion compositing, and pre-compositing edge decontamination.
 
-Comprehensive 8-panel visual comparison sheets have been generated in `outputs/production_acceptance/comparisons/`. Final release sign-off will occur upon human visual review.
+High-resolution 8-panel visual comparison sheets have been generated in `outputs/production_acceptance/comparisons/`. In accordance with engineering governance rules, the pipeline release status remains:
+
+**NOT PRODUCTION READY · AUTOMATED VERIFICATION PASSED · HUMAN ACCEPTANCE PENDING**

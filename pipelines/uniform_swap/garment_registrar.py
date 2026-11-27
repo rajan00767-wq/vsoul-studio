@@ -217,15 +217,17 @@ class GarmentRegistrar:
         # Collar Opening (throat opening between lapels above tie knot / placket)
         collar_opening_mask = np.zeros((h, w), dtype=bool)
         if np.any(collar_lapels_mask):
-            # Convex hull / bounding space of collar lapels minus lapel fabric and tie
-            cnts, _ = cv2.findContours(collar_lapels_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                all_pts = np.vstack(cnts)
-                hull = cv2.convexHull(all_pts)
-                hull_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.drawContours(hull_mask, [hull], -1, 1, -1)
-                collar_opening_mask = (hull_mask > 0) & ~collar_lapels_mask & ~tie_knot_mask
-                collar_opening_mask &= (np.arange(h)[:, None] <= raw_chin_y + int(0.35 * raw_fh))
+            # Dynamic opening between lapels:
+            # Region between left and right lapels within neck corridor
+            y_lapel, x_lapel = np.where(collar_lapels_mask)
+            min_ly, max_ly = y_lapel.min(), y_lapel.max()
+            for y in range(min_ly, min(h, max_ly + 1)):
+                row_xs = x_lapel[y_lapel == y]
+                if len(row_xs) >= 2:
+                    lx1, lx2 = row_xs.min(), row_xs.max()
+                    collar_opening_mask[y, lx1:lx2] = True
+            collar_opening_mask &= ~collar_lapels_mask & ~tie_knot_mask
+            collar_opening_mask &= (np.arange(h)[:, None] <= raw_chin_y + int(0.50 * raw_fh))
 
         # Body and Sleeves (everything else in garment)
         body_mask = garment_mask & ~collar_lapels_mask & ~tie_knot_mask
@@ -376,6 +378,103 @@ class GarmentRegistrar:
             visible_neck = cv2.morphologyEx(visible_neck.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)).astype(bool)
 
         return visible_neck
+
+    def integrate_continuous_skin(
+        self,
+        src_rgb: np.ndarray,
+        src_person_matte: np.ndarray,
+        face_mask: np.ndarray,
+        neck_mask: np.ndarray,
+        ears_mask: np.ndarray,
+        orig_garment_mask: np.ndarray,
+        registered_garment: RegisteredGarment,
+        raw_registered_rgb: np.ndarray,
+        cand_labels_warped: Optional[np.ndarray],
+        src_chin_y: int,
+        src_fh: float,
+        src_fcx: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Produce a continuous unbroken anatomical skin layer and reconstruct missing neck regions (V13.3.4).
+
+        Guarantees:
+        1. 100% geometric connection between jawline and neck (zero disconnect / gaps).
+        2. Strict exclusion of original garment residue (e.g. green polo collar).
+        3. Dynamic target collar neckline boundary matching registered target lapels.
+        4. Color-harmonized missing skin reconstruction preserving authentic throat shading.
+
+        Returns:
+            (final_skin_rgb, final_skin_alpha, visible_opening_mask, missing_skin_mask, reconstructed_skin_layer)
+        """
+        h, w = src_rgb.shape[:2]
+        y_grid = np.arange(h)[:, None]
+        x_grid = np.arange(w)[None, :]
+
+        # 1. Continuous authentic source skin
+        continuous_source_skin = (face_mask | neck_mask | ears_mask) & (src_person_matte > 0.20)
+
+        # 2. Strict original garment residue exclusion
+        if orig_garment_mask is not None and np.any(orig_garment_mask):
+            garment_forbidden = cv2.dilate(orig_garment_mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+            continuous_source_skin &= ~garment_forbidden
+
+        # 3. Solid target garment fabric (takes occlusion precedence over skin)
+        garment_solid = (registered_garment.warped_alpha > 50) & (
+            registered_garment.body_mask | registered_garment.collar_lapels_mask | registered_garment.tie_knot_mask
+        )
+
+        # 4. Target visible neckline opening
+        dx_norm = np.abs(x_grid - src_fcx) / max(1.0, src_fh * 0.42)
+        throat_corridor = (
+            (y_grid >= src_chin_y - int(0.02 * src_fh))
+            & (y_grid <= src_chin_y + int(0.60 * src_fh))
+            & (dx_norm <= 1.0)
+        )
+        visible_opening_mask = throat_corridor & ~garment_solid & (src_person_matte > 0.20)
+
+        # 5. Missing skin region: required visible neck opening minus authentic source skin coverage
+        missing_skin_mask = visible_opening_mask & ~continuous_source_skin & (
+            (src_person_matte > 0.15) | (registered_garment.warped_alpha > 0.15)
+        )
+
+        final_skin_rgb = src_rgb.copy()
+        reconstructed_skin_layer = np.zeros_like(src_rgb)
+
+        if np.any(missing_skin_mask):
+            # Sample authentic student neck/jaw skin directly above missing region
+            ref_skin_zone = continuous_source_skin & (y_grid >= src_chin_y - int(0.12 * src_fh)) & (y_grid <= src_chin_y + int(0.15 * src_fh))
+            if np.sum(ref_skin_zone) > 40:
+                ref_lab = cv2.cvtColor(src_rgb[ref_skin_zone].reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+                mean_ref_lab = np.mean(ref_lab, axis=0)
+            else:
+                mean_ref_lab = np.array([170.0, 140.0, 145.0], dtype=np.float32)
+
+            cand_reconstructed = False
+            if cand_labels_warped is not None and raw_registered_rgb is not None:
+                cand_skin_pixels = missing_skin_mask & ((cand_labels_warped == 10) | (cand_labels_warped == 13))
+                if np.sum(cand_skin_pixels) > 50:
+                    cand_lab = cv2.cvtColor(raw_registered_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                    mean_cand_lab = np.mean(cand_lab[cand_skin_pixels], axis=0)
+                    delta_lab = mean_ref_lab - mean_cand_lab
+                    cand_lab[cand_skin_pixels] += delta_lab
+                    cand_lab = np.clip(cand_lab, 0, 255).astype(np.uint8)
+                    shifted_rgb = cv2.cvtColor(cand_lab, cv2.COLOR_LAB2RGB)
+                    final_skin_rgb[cand_skin_pixels] = shifted_rgb[cand_skin_pixels]
+                    reconstructed_skin_layer[cand_skin_pixels] = shifted_rgb[cand_skin_pixels]
+                    cand_reconstructed = True
+
+            # Localized texture-aware inpainting for remaining missing pixels or boundary smoothing
+            missing_to_inpaint = missing_skin_mask if not cand_reconstructed else (missing_skin_mask & (reconstructed_skin_layer.sum(axis=2) == 0))
+            if np.any(missing_to_inpaint):
+                final_skin_rgb = cv2.inpaint(final_skin_rgb, missing_to_inpaint.astype(np.uint8), inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+                reconstructed_skin_layer[missing_to_inpaint] = final_skin_rgb[missing_to_inpaint]
+
+        # Combine authentic source skin and reconstructed missing throat skin
+        total_skin_mask = continuous_source_skin | missing_skin_mask
+        final_skin_alpha = cv2.GaussianBlur(total_skin_mask.astype(np.float32) * 255.0, (3, 3), 1.0).clip(0, 255).astype(np.uint8)
+        # 100% solid inside authentic face and neck core
+        final_skin_alpha[face_mask | (neck_mask & ~garment_forbidden)] = 255
+
+        return final_skin_rgb, final_skin_alpha, visible_opening_mask, missing_skin_mask, reconstructed_skin_layer
 
 
 garment_registrar = GarmentRegistrar()

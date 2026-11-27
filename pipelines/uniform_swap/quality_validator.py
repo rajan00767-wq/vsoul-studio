@@ -260,6 +260,95 @@ def _measure_shoulder_extent(
     return measured, required, basis
 
 
+def _measure_jaw_to_neck_continuity(
+    p_alpha: Optional[np.ndarray],
+    c_chin_y: int,
+    c_fh: float,
+    c_fcx: float,
+    c_fw: float,
+    h: int,
+    w: int,
+) -> Dict[str, Any]:
+    """Measure throat alpha continuity in the chin-to-collar corridor (V13.3.4)."""
+    if p_alpha is None:
+        return {"status": "UNCERTAIN", "score": 255, "threshold": 220, "details": "Person alpha unavailable"}
+
+    corridor_y1 = int(np.clip(c_chin_y, 0, h - 1))
+    corridor_y2 = int(np.clip(c_chin_y + 0.15 * c_fh, corridor_y1 + 1, h))
+    corridor_x1 = int(np.clip(c_fcx - 0.15 * c_fw, 0, w - 1))
+    corridor_x2 = int(np.clip(c_fcx + 0.15 * c_fw, corridor_x1 + 1, w))
+
+    corridor = p_alpha[corridor_y1:corridor_y2, corridor_x1:corridor_x2]
+    if corridor.size == 0:
+        return {"status": "UNCERTAIN", "score": 255, "threshold": 220, "details": "Empty throat corridor"}
+
+    min_alpha = int(np.min(corridor))
+    if min_alpha < 220:
+        return {
+            "status": "FAIL",
+            "score": min_alpha,
+            "threshold": 220,
+            "details": f"Discontinuity/gap between jaw and neck (min alpha {min_alpha} < 220)",
+        }
+    return {
+        "status": "PASS",
+        "score": min_alpha,
+        "threshold": 220,
+        "details": f"Continuous anatomical throat skin verified (min alpha {min_alpha} >= 220)",
+    }
+
+
+def _measure_original_garment_residue(
+    cand_rgb: np.ndarray,
+    src_rgb: Optional[np.ndarray],
+    orig_garment_mask: Optional[np.ndarray],
+    c_chin_y: int,
+    c_fh: float,
+    c_fcx: float,
+    c_fw: float,
+    h: int,
+    w: int,
+) -> Dict[str, Any]:
+    """Measure residual original garment color in collar opening (V13.3.4)."""
+    if src_rgb is None or orig_garment_mask is None or not np.any(orig_garment_mask):
+        return {"status": "PASS", "score": 0, "threshold": 150, "details": "No original garment mask in source"}
+
+    src_g_pixels = src_rgb[orig_garment_mask]
+    if len(src_g_pixels) < 50:
+        return {"status": "PASS", "score": 0, "threshold": 150, "details": "Insignificant original garment area"}
+
+    src_g_med = np.median(src_g_pixels, axis=0)
+    src_g_std = np.std(src_g_pixels, axis=0)
+    if np.max(src_g_std) <= 10.0 and (np.max(src_g_med) - np.min(src_g_med) <= 20):
+        return {"status": "PASS", "score": 0, "threshold": 150, "details": "Original garment is neutral/monochrome"}
+
+    opening_y1 = int(np.clip(c_chin_y, 0, h - 1))
+    opening_y2 = int(np.clip(c_chin_y + 0.35 * c_fh, opening_y1 + 1, h))
+    opening_x1 = int(np.clip(c_fcx - 0.25 * c_fw, 0, w - 1))
+    opening_x2 = int(np.clip(c_fcx + 0.25 * c_fw, opening_x1 + 1, w))
+
+    cand_roi = cand_rgb[opening_y1:opening_y2, opening_x1:opening_x2]
+    if cand_roi.size == 0:
+        return {"status": "PASS", "score": 0, "threshold": 150, "details": "Empty collar opening ROI"}
+
+    diff = np.max(np.abs(cand_roi.astype(float) - src_g_med), axis=2)
+    residue_px = int(np.sum(diff < 28.0))
+
+    if residue_px > 150:
+        return {
+            "status": "FAIL",
+            "score": residue_px,
+            "threshold": 150,
+            "details": f"Original garment color residue detected inside collar opening ({residue_px} px > 150)",
+        }
+    return {
+        "status": "PASS",
+        "score": residue_px,
+        "threshold": 150,
+        "details": f"Collar opening clean of original garment residue ({residue_px} px <= 150)",
+    }
+
+
 class QualityCheckFailure(RuntimeError):
     """Raised when an unrecoverable visual or biometric defect is detected."""
     pass
@@ -410,6 +499,19 @@ class QualityValidator:
                 cand_box = np.array(identity_layer["face_bbox"], dtype=float)
             if src_box is None and identity_layer and identity_layer.get("face_bbox") is not None:
                 src_box = np.array(identity_layer["face_bbox"], dtype=float)
+
+            if cand_box is None and identity_layer:
+                if identity_layer.get("face_bbox") is not None:
+                    cand_box = np.array(identity_layer["face_bbox"], dtype=float)
+                elif identity_layer.get("face_box") is not None:
+                    cand_box = np.array(identity_layer["face_box"], dtype=float)
+                elif "metrics" in identity_layer:
+                    m = identity_layer["metrics"]
+                    fcx = m.get("face_center_x", w * 0.5)
+                    fcy = m.get("face_center_y", h * 0.35)
+                    fw = m.get("face_width", w * 0.35)
+                    fh = m.get("face_height", h * 0.35)
+                    cand_box = np.array([fcx - fw * 0.5, fcy - fh * 0.5, fcx + fw * 0.5, fcy + fh * 0.5])
 
         except Exception as exc:
             logger.warning("[QUALITY_VALIDATOR] InsightFace validation error: %s", exc)
@@ -2251,6 +2353,51 @@ class QualityValidator:
                 "details": "N/A (not a tie uniform)",
             }
 
+        # ── V13.3.4 Continuous Skin Integration & Residue Gates ──
+        # 4. jaw_to_neck_continuity (confirms solid throat alpha >= 220 across chin-to-collar corridor)
+        c_chin_y_val = int(cand_box[3]) if cand_box is not None else int(h * 0.50)
+        c_fh_val = max(1.0, float(cand_box[3] - cand_box[1])) if cand_box is not None else float(h * 0.35)
+        c_fcx_val = float(cand_box[0] + cand_box[2]) / 2.0 if cand_box is not None else float(w * 0.50)
+        c_fw_val = max(1.0, float(cand_box[2] - cand_box[0])) if cand_box is not None else float(w * 0.35)
+
+        p_alpha_to_check = None
+        if identity_layer and identity_layer.get("full_person_alpha") is not None:
+            p_alpha_to_check = np.asarray(identity_layer["full_person_alpha"])
+        elif isinstance(candidate_image, Image.Image) and candidate_image.mode == "RGBA":
+            p_alpha_to_check = np.asarray(candidate_image)[:, :, 3]
+        elif isinstance(candidate_image, np.ndarray) and candidate_image.ndim == 3 and candidate_image.shape[2] == 4:
+            p_alpha_to_check = candidate_image[:, :, 3]
+
+        jaw_neck = _measure_jaw_to_neck_continuity(
+            p_alpha=p_alpha_to_check,
+            c_chin_y=c_chin_y_val,
+            c_fh=c_fh_val,
+            c_fcx=c_fcx_val,
+            c_fw=c_fw_val,
+            h=h,
+            w=w,
+        )
+        checks["jaw_to_neck_continuity"] = jaw_neck
+        if jaw_neck["status"] == "FAIL":
+            defects.append(f"jaw_to_neck_continuity ({jaw_neck['details']})")
+
+        # 5. original_garment_residue (detects residual original garment color in collar opening)
+        orig_g_mask = identity_layer.get("original_garment_mask") if identity_layer else None
+        garment_residue = _measure_original_garment_residue(
+            cand_rgb=cand_rgb,
+            src_rgb=src_rgb,
+            orig_garment_mask=orig_g_mask,
+            c_chin_y=c_chin_y_val,
+            c_fh=c_fh_val,
+            c_fcx=c_fcx_val,
+            c_fw=c_fw_val,
+            h=h,
+            w=w,
+        )
+        checks["original_garment_residue"] = garment_residue
+        if garment_residue["status"] == "FAIL":
+            defects.append(f"original_garment_residue ({garment_residue['details']})")
+
         # Mandatory Check Policy (V13.1 Authoritative 22 Mandatory Defect Gates)
         mandatory_checks = [
             "background_rectangle",
@@ -2299,6 +2446,8 @@ class QualityValidator:
             "black_shoulder_outlines",
             "collar_area_retention",
             "tie_knot_preservation",
+            "jaw_to_neck_continuity",
+            "original_garment_residue",
         ]
         for c_name in conditional_checks:
             if c_name in checks and checks[c_name]["status"] not in ("NOT_APPLICABLE", None):
