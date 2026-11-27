@@ -850,7 +850,10 @@ def produce_passport_crop(
                     draw.rectangle([(px0, py0), (px1, py1)], outline=(0, 255, 255), width=2)
             # Draw accessory bounds in yellow
             for (bx1, by1, bx2, by2) in acc_bounds_list:
-                draw.rectangle([(bx1, by1), (bx2, by2)], outline=(255, 255, 0), width=2)
+                ax0, ay0 = min(bx1, bx2), min(by1, by2)
+                ax1, ay1 = max(bx1, bx2), max(by1, by2)
+                if ax1 >= ax0 and ay1 >= ay0:
+                    draw.rectangle([(ax0, ay0), (ax1, ay1)], outline=(255, 255, 0), width=2)
             vis_p = deb_dir_path / f"{job_id}_19_crop_rectangle_vis.png"
             vis_img.save(vis_p)
             vis_img.save(deb_dir_path / "19_crop_rectangle_vis.png")

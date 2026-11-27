@@ -170,6 +170,12 @@ class UniformCompositor:
 
         # Clean generated hair that overlaps the garment fabric
         hair_on_garment = cand_hair_m & (cand_matte > 45) & (np.arange(h)[:, None] >= chin_y + int(0.12 * fh))
+        if np.any(braids_m):
+            # The deep interior of authentic source braids will be layered on top;
+            # avoid destructively inpainting huge areas of fabric under solid braids
+            deep_braid_interior = cv2.erode(braids_m.astype(np.uint8), np.ones((11, 11), np.uint8)).astype(bool)
+            hair_on_garment &= ~deep_braid_interior
+
         cues = identity_layer.get("cues", {})
         if cues.get("has_tie") or cues.get("ref_type") == "tie":
             tie_corridor = (np.abs(np.arange(w)[None, :] - fcx) < fw * 0.22) & (np.arange(h)[:, None] >= chin_y)

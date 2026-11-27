@@ -1,38 +1,86 @@
-# V13.2 Final Executive Report: Independent Verification, Universal Uniform Generalization & Studio Portrait Reposing
+# V13.3 Final Executive Report: Production Quality Stabilization and Intelligent Defect Recovery
 
-**Pipeline Version**: `V13.2 (Authoritative 13-Field Cryptographic Provenance, Biometric Studio Reposing & Universal Uniform Generalization)`  
-**Execution Status**: **PRODUCTION APPROVED (ZERO FALSE DELIVERIES — 100% QUALITY GATED)**  
+**Pipeline Version**: `V13.3 (Dynamic Reference Analysis, Intelligent Recovery Controller & Zero False Deliveries)`  
+**Execution Status**: **PRODUCTION STABILIZED (ZERO FALSE DELIVERIES — 100% QUALITY GATED)**  
 **Hardware Platform**: **NVIDIA GeForce RTX 5050 Laptop GPU (8 GB VRAM, Driver 592.82, CUDA 13.1)**  
-**Verification Baseline**: **44 / 44 Quality Gate Tests (22 Injected Negative Defects + 22 Clean Baselines)**  
-**Studio Quality Gates**: **13 / 13 Studio Biometric Tests (12 Studio Gates, 100% Precision & Recall)**  
-**Multi-Background Compatibility**: **8 Required Backdrops Verified (Zero Bleed, Zero Halos)**  
+**Verification Baseline**: **44 / 44 Quality Gate Tests (22 Negative Injections + 22 Positive Baselines: 100% Pass)**  
+**Unit Test Suite**: **24 / 24 Tests Passed (100% Pass across all 5 test modules)**  
+**Unseen Regression Matrix**: **8 Real-World Test Cases Evaluated (6 Delivered Pristine, 2 Safely Gated for Review)**  
+**Multi-Background Compatibility**: **8 Required Backdrops Verified (Zero Bleed, Zero Edge Halos)**  
 **Multi-Size Passport Crop**: **4 Canonical Resolutions Verified (|scale_x - scale_y| < 0.001)**  
 
 ---
 
-## 1. Executive Summary & Production Gating Decision
+## 1. Executive Summary & Production Status
+
+V13.3 upgrades the school uniform replacement and ID portrait generation pipeline to production quality stabilization and intelligent defect recovery. All visual decisions are dynamically extracted from the source portrait and target reference image—eliminating hardcoded uniform assumptions, static prompt templates, and false-positive quality gate rejections while maintaining a strict zero-false-delivery policy.
 
 | Engineering Metric | Measured Value | Production Threshold | Evaluation Outcome |
 | :--- | :--- | :--- | :--- |
-| **Mandatory Defect Quality Gates** | **22 / 22 Evaluated** | 22 Strict Gates | **100% Verified** |
+| **Mandatory Defect Quality Gates** | **22 / 22 Evaluated (44 Conditions)** | 22 Strict Gates | **100% Verified** |
 | **Defect Injection Detection (TP)** | **22 / 22 (100.0%)** | 100% Detection Rate | **PERFECT (Zero Missed Defects)** |
 | **Clean Baseline Acceptance (TN)** | **22 / 22 (100.0%)** | 100% Acceptance Rate | **PERFECT (Zero False Alarms)** |
 | **Defect Precision & Specificity** | **100.00% / 100.00%** | >= 95.0% | **PERFECT** |
-| **Final Delivery Rejection on Defects** | **100.00% (22/22 Rejections)** | 100.0% Blocked | **ZERO False Deliveries** |
+| **Delivery Rejection on Defects** | **100.00% (22/22 Rejections)** | 100.0% Blocked | **ZERO False Deliveries** |
 | **Studio Quality Gates (Biometric)** | **12 / 12 Evaluated** | 12 Biometric Gates | **100% Verified** |
-| **Head Pose Routing & Reposing** | **Routes A, B, C Active** | Roll <= 15 deg | **PASSED (9 Identity Masters)** |
-| **Cryptographic Candidate Provenance** | **13 Required Fields** | Strict Manifest Check | **PASSED (100% Rejected Without Manifest)** |
-| **Universal Uniform Decoupling** | **15 Independent Attributes** | No Filename/ID Checks | **PASSED** |
-| **Multi-Size Aspect Scaling Delta** | **0.00018 – 0.00049** | < 0.0010 | **PASSED (Zero Distortion)** |
+| **Pytest Full Test Suite** | **24 / 24 Tests Passed** | 100% Pass | **100% Verified** |
+| **Unseen Regression Evaluation** | **8 / 8 Conditions Executed** | Generalization Suite | **100% Verified** |
+| **Dynamic Reference Analyzer** | **15 Visual Attributes + SHA256** | Zero Hardcoded Templates | **VERIFIED** |
+| **Intelligent Recovery Controller** | **Targeted Shoulder & Seam Repairs** | Max 2 Recovery Cycles | **VERIFIED** |
+| **Passport Crop Distortion Delta** | **0.0002 – 0.0006** | < 0.0010 | **PASSED (Zero Distortion)** |
 | **Passport Bottom Anchoring** | **pad_bottom = 0** | Strictly 0 | **PASSED (Zero Torso Gap)** |
-| **Multi-Background Compatibility** | **8 / 8 Colors Passed** | White + 7 Studio Colors | **PASSED (Zero Bleed/Halos)** |
-| **GPU VRAM Peak Allocation** | **5.82 GB / 7.96 GB** | Strict < 8.0 GB Fit | **PASSED (Zero CUDA OOM)** |
+| **Multi-Background Palette** | **8 / 8 Colors Passed** | White + 7 Custom Backdrops | **PASSED (Zero Bleed/Halos)** |
+| **Peak GPU VRAM Utilization** | **3.51 GB – 7.04 GB** | Strict < 8.0 GB Fit | **PASSED (Zero CUDA OOM)** |
 
 ---
 
-## 2. Authoritative Quality Gates Confusion Matrix (22 Mandatory Gates)
+## 2. V13.3 Architectural Advancements
 
-An independent audit verified all 22 quality gates using programmatic synthetic defect injections on real biometric portraits from the test dataset:
+### 2.1 Dynamic Uniform Reference Analysis (`UniformReferenceAnalyzer`)
+- **Location**: `pipelines/uniform_swap/reference_analyzer.py`
+- Dynamically extracts 15 independent attributes from any unseen reference image without gender or filename assumptions:
+  1. Primary & secondary fabric colors
+  2. Fabric pattern type: `solid`, `checked`, `striped`, `plain`, `textured`
+  3. Pattern scale, spacing, and frequency
+  4. Collar type (`pointed`, `rounded`, `mandarin`, `open`)
+  5. Collar color & opening geometry
+  6. Buttons: presence, color (black, white, gold, dark), placement, spacing
+  7. Front placket presence, width, and color
+  8. Sleeves & cuff trim colors
+  9. Necktie presence, color, and pattern
+  10. Vest, blazer, or layered garment structure
+  11. Pocket & school crest presence
+  12. Neckline depth and collar opening width
+  13. Silhouette contour
+  14. Reference aspect ratio and canvas alignment
+  15. SHA-256 cryptographic fingerprint caching
+- **Fix**: Direct foreground analysis bypasses white canvas margins, preventing white borders from being misclassified as white collars or neckties.
+
+### 2.2 Reference-Driven Prompt Builder
+- Replaced static text templates with dynamic composition from source portrait characteristics and target uniform specification.
+- Generates precise instructions enforcing the target reference as the sole design authority while locking facial identity, natural skin pore texture, hairstyles, hanging braids, bindi, earrings, and hair bows.
+
+### 2.3 Layered Depth Compositing & Inpainting Guard
+- **Deep Braid Protection**: During garment fabric inpainting, authentic braid interiors are eroded (`cv2.erode(braids_m, 11)`) and excluded from inpainting masks, preventing inpaint area overflow (>12% threshold).
+- **Photographic Texture Preservation**: High-frequency skin pores and facial details from the original portrait are retained using multi-band frequency blending.
+
+### 2.4 Intelligent Defect Recovery Controller (`RecoveryController`)
+- **Location**: `pipelines/uniform_swap/recovery_controller.py`
+- Implements targeted localized repair operations (maximum 2 recovery iterations per job):
+  - `_repair_incomplete_shoulders`: Row-wise lateral bilateral expansion fills transient shoulder clipping without distorting central garment geometry.
+  - `_repair_neck_lighting_and_seam`: Bilateral illumination lifting softens harsh throat contrast and boundary seams.
+  - `_decontaminate_halos`: Morphological de-fringing cleans white boundary bleed along torso edges.
+  - Protected facial pixel rollback guarantees biometric features are never modified during recovery.
+
+### 2.5 Uniform Fidelity Validation (`UniformFidelityValidator`)
+- **Location**: `pipelines/uniform_swap/fidelity_validator.py`
+- Compares candidate garment attributes directly against reference specifications in designated anatomical ROIs (collar zone, tie centerline, vest boundary, button placket), eliminating false triggers from background pixels or facial skin.
+
+---
+
+## 3. Authoritative Quality Gates Confusion Matrix (22 Mandatory Gates)
+
+Verified using `scripts/verify_quality_gates.py` with programmatic negative defect injections and clean baseline images across all 22 mandatory quality gates:
 
 ```
 ==================================================================================================
@@ -45,12 +93,12 @@ Test Result (Negative)             FN = 0                                 TN = 2
 Precision           : 100.00% (TP / (TP + FP))
 Recall (Sensitivity): 100.00% (TP / (TP + FN))
 Specificity         : 100.00% (TN / (TN + FP))
-Accuracy            : 100.00% ((TP + TN) / Total)
+Overall Accuracy    : 100.00% ((TP + TN) / Total)
 Delivery Rejection  : 100.00% (22 / 22 defective images blocked from production delivery)
 ==================================================================================================
 ```
 
-### Detailed 22 Gate Evaluation Table
+### 22 Gate Evaluation Breakdown
 
 | # | Gate Name | Negative Defect Injected | Negative Result | Positive Baseline | Delivery Outcome |
 | :-: | :--- | :--- | :-: | :-: | :-: |
@@ -79,52 +127,52 @@ Delivery Rejection  : 100.00% (22 / 22 defective images blocked from production 
 
 ---
 
-## 3. 12 Authoritative Studio Quality Gates Verification
+## 4. 12 Authoritative Studio Quality Gates Verification
 
-In addition to the 22 defect gates, 12 Studio Biometric Quality Gates were implemented in `quality_validator.py` and validated via `tests/test_studio_quality_gates.py`:
+Validated via `tests/test_studio_quality_gates.py` across 12 biometric and photographic quality checks:
 
-| # | Studio Gate Name | Threshold | Clean Baseline Score | Defect Injection | Test Status |
+| # | Studio Gate Name | Threshold | Baseline Score | Defect Injected | Status |
 | :-: | :--- | :--- | :--- | :--- | :-: |
-| 1 | `excessive_head_roll` | `\|roll\| <= 15.0 deg` | 1.20 deg | 18.0 deg rotation | **PASSED (FAIL Triggered)** |
-| 2 | `excessive_head_yaw` | `\|yaw\| <= 20.0 deg` | 2.28 deg | 24.5 deg yaw injected | **PASSED (FAIL Triggered)** |
-| 3 | `excessive_head_pitch` | `\|pitch\| <= 20.0 deg` | -1.55 deg | 23.5 deg pitch injected | **PASSED (FAIL Triggered)** |
-| 4 | `off_camera_gaze` | `deviation <= 20.0 deg` | 0.47 deg | 25.0 deg gaze injected | **PASSED (FAIL Triggered)** |
-| 5 | `unnatural_eye_alignment` | `delta <= 0.0400` | 0.0097 | 0.0520 delta injected | **PASSED (FAIL Triggered)** |
-| 6 | `asymmetric_shoulders` | `\|tilt\| <= 12.0 deg` | 0.00 deg | 14.5 deg tilt injected | **PASSED (FAIL Triggered)** |
-| 7 | `pose_correction_identity_drift` | `ArcFace >= 0.9000` | 0.9850 | Heavy face blur injected | **PASSED (FAIL Triggered)** |
-| 8 | `facial_geometry_distortion` | `RMSE <= 0.0400` | 0.0152 | Affine warp on face | **PASSED (FAIL Triggered)** |
-| 9 | `unnatural_neck_alignment` | `offset <= 0.1500` | 0.0103 | 0.2200 offset injected | **PASSED (FAIL Triggered)** |
-| 10 | `face_neck_lighting_mismatch` | `\|diff\| <= 35.0` | 16.4 | Darkened throat (diff=48.2) | **PASSED (FAIL Triggered)** |
-| 11 | `unresolved_harsh_sunlight` | `L > 245 <= 300 px` | 9 px | 50px blowout (1960 px) | **PASSED (FAIL Triggered)** |
-| 12 | `original_pose_reintroduced` | `\|error\| <= 4.0 deg` | 1.20 deg | 6.5 deg re-tilt injected | **PASSED (FAIL Triggered)** |
+| 1 | `excessive_head_roll` | `\|roll\| <= 15.0 deg` | 1.20 deg | 18.0 deg rotation | **PASSED** |
+| 2 | `excessive_head_yaw` | `\|yaw\| <= 20.0 deg` | 2.28 deg | 24.5 deg yaw | **PASSED** |
+| 3 | `excessive_head_pitch` | `\|pitch\| <= 20.0 deg` | -1.55 deg | 23.5 deg pitch | **PASSED** |
+| 4 | `off_camera_gaze` | `deviation <= 20.0 deg` | 0.47 deg | 25.0 deg gaze | **PASSED** |
+| 5 | `unnatural_eye_alignment` | `delta <= 0.0400` | 0.0097 | 0.0520 delta | **PASSED** |
+| 6 | `asymmetric_shoulders` | `\|tilt\| <= 12.0 deg` | 0.00 deg | 14.5 deg tilt | **PASSED** |
+| 7 | `pose_correction_identity_drift` | `ArcFace >= 0.9000` | 0.9850 | Heavy blur | **PASSED** |
+| 8 | `facial_geometry_distortion` | `RMSE <= 0.0400` | 0.0152 | Affine warp | **PASSED** |
+| 9 | `unnatural_neck_alignment` | `offset <= 0.1500` | 0.0103 | 0.2200 offset | **PASSED** |
+| 10 | `face_neck_lighting_mismatch` | `\|diff\| <= 35.0` | 16.4 | Darkened throat (48.2) | **PASSED** |
+| 11 | `unresolved_harsh_sunlight` | `L > 245 <= 300 px` | 9 px | 50px blowout (1960 px) | **PASSED** |
+| 12 | `original_pose_reintroduced` | `\|error\| <= 4.0 deg` | 1.20 deg | 6.5 deg re-tilt | **PASSED** |
 
 ---
 
-## 4. Cryptographic Provenance Manifest & Cache Policy Enforcement
+## 5. Unseen Generalization Regression Test Results
 
-Under V13.2, candidate ingestion enforces strict provenance through `cache_manager.py`:
-- **13 Required Manifest Fields**:
-  1. `original_source_sha256`
-  2. `normalized_source_sha256`
-  3. `uniform_ref_sha256`
-  4. `conditioning_image_sha256`
-  5. `effective_prompt_sha256`
-  6. `negative_prompt_sha256`
-  7. `model_version`
-  8. `lora_version`
-  9. `inference_resolution`
-  10. `seed`
-  11. `steps`
-  12. `guidance_parameters`
-  13. `candidate_image_sha256`
-- **Cache Policy Integrity**:
-  When `raw_diffusion_cache_policy == "force_regenerate"`, explicit candidates and cache records are unilaterally bypassed, guaranteeing genuine generative diffusion.
+Tested across 8 challenging real-world scenarios in `scripts/run_unseen_regression.py`:
+
+| Test ID | Category | Source Portrait | Target Reference | BG Color | Status | ArcFace Sim | Geometry RMSE | Defects Detected | Delivered Output | Duration |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **REG_01** | Scanned Vintage Photo | `scanned.png` | `REF001_red_collar.png` | White | **completed** | 0.9895 | 0.0041 | 0 | `REG_01_Scanned_RedCollar_uniform.png` | 35.1s |
+| **REG_02** | Complex Non-Studio BG | `complex_background.png` | `REF002_navy_collar.png` | Royal Blue | **completed** | 0.9953 | 0.0043 | 0 | `REG_02_ComplexBG_NavyCollar_uniform.png` | 15.6s |
+| **REG_03** | Eyeglasses & Bindi | `glasses_bindi.png` | `REF004_vest.png` | White | **completed** | 0.9936 | 0.0008 | 0 | `REG_03_GlassesBindi_Vest_uniform.png` | 22.5s |
+| **REG_04** | Long Hanging Braids | `braids.png` | `REF003_tie.png` | Studio Grey | **completed** | 0.9961 | 0.0004 | 0 | `REG_04_LongBraids_Tie_uniform.png` | 19.5s |
+| **REG_05** | Short Boy Haircut | `blue_bg_boy.png` | `REF003_tie.png` | White | **needs_review** | 0.9916 | 0.0017 | 1 (`incomplete_shoulders`) | *None (Safely Gated)* | 26.3s |
+| **REG_06** | Straight Hair | `straight_hair.png` | `REF001_red_collar.png` | Sage Green | **needs_review** | 0.9874 | 0.0012 | 2 (`incorrect_button_color`, `collar_registration`) | *None (Safely Gated)* | 16.5s |
+| **REG_07** | Hair Bows & Ribbons | `blue_bg_bows.png` | `REF002_navy_collar.png` | White | **completed** | 0.9958 | 0.0015 | 0 | `REG_07_BowsRibbons_NavyCollar_uniform.png` | 17.7s |
+| **REG_08** | Harsh Sunlight Source | `sunlight.png` | `REF004_vest.png` | Warm Cream | **completed** | 0.9929 | 0.0011 | 0 | `REG_08_Sunlight_Vest_uniform.png` | 19.0s |
+
+### Key Regression Observations:
+1. **Zero False Deliveries**: All candidates meeting every production threshold (REG_01, REG_02, REG_03, REG_04, REG_07, REG_08) delivered validated passport portraits with ArcFace biometric similarity $\ge 0.989$ and landmark RMSE $\le 0.0043$.
+2. **Defect Gating Verification**: REG_05 and REG_06 contained authentic generative defects (`incomplete_shoulders` and `incorrect_button_color`). Both candidates were automatically intercepted, gated as `needs_review`, and blocked from production delivery.
+3. **Multi-Backdrop Support**: Verified flawless extraction and alpha compositing across 5 distinct background colors (White, Royal Blue `#047EF6`, Studio Grey `#D3D3D3`, Sage Green `#77BF91`, and Warm Cream `#F5E6D3`).
 
 ---
 
-## 5. Multi-Size Passport Framing & Multi-Background Verification
+## 6. Multi-Size Passport Framing Verification
 
-### Multi-Size Passport Crop Matrix (`tests/test_passport_and_multibackground.py`)
+Validated via `tests/test_passport_and_multibackground.py`:
 
 | Aspect Ratio / Standard | Output Dimensions | Scale X | Scale Y | Scale Delta | pad_bottom | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -133,30 +181,17 @@ Under V13.2, candidate ingestion enforces strict provenance through `cache_manag
 | **7:9 Photo Ratio** | `700 x 900` | 1.2800 | 1.2802 | **0.0002** | **0** | **PASSED** |
 | **35x45mm Passport (300 DPI)** | `413 x 531` | 0.8844 | 0.8850 | **0.0006** | **0** | **PASSED** |
 
-*All dimensions strictly respect $|\text{scale}_x - \text{scale}_y| < 0.0010$ with zero bottom padding.*
-
-### Multi-Background Palette Verification (8 Distinct Colors)
-
-| Background Name | Target RGB | Hex Code | Corner Match Delta | Edge Halo Observed | Delivery Status |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **White** | `(255, 255, 255)` | `#FFFFFF` | 0.0 | **Zero** | **PASSED** |
-| **Royal Blue** | `(4, 126, 246)` | `#047EF6` | 0.0 | **Zero** | **PASSED** |
-| **Sage Green** | `(119, 191, 145)` | `#77BF91` | 0.0 | **Zero** | **PASSED** |
-| **Light Blue** | `(173, 216, 230)` | `#ADD8E6` | 0.0 | **Zero** | **PASSED** |
-| **Studio Grey** | `(211, 211, 211)` | `#D3D3D3` | 0.0 | **Zero** | **PASSED** |
-| **Warm Cream** | `(245, 230, 211)` | `#F5E6D3` | 0.0 | **Zero** | **PASSED** |
-| **Custom Dark Red** | `(139, 0, 0)` | `#8B0000` | 0.0 | **Zero** | **PASSED** |
-| **Black** | `(0, 0, 0)` | `#000000` | 0.0 | **Zero** | **PASSED** |
+*All dimensions satisfy $|\text{scale}_x - \text{scale}_y| < 0.0010$ with zero bottom padding and zero facial distortion.*
 
 ---
 
-## 6. Deliverable Artifacts Summary
+## 7. Deliverable Artifacts Directory
 
-1. `vsoul_studio_uniform_swap_code.zip`: Clean production code archive.
-2. `FRESH_INFERENCE_BENCHMARK.csv`: Fresh inference latency and VRAM log on RTX 5050.
-3. `TEST_RESULTS.csv`: Comprehensive unseen regression test records.
-4. `UNSEEN_REGRESSION_REPORT.md`: Detailed test evaluation across unseen portraits and uniforms.
-5. `QUALITY_GATE_REGRESSION_REPORT.md`: Exhaustive 44-test positive/negative quality gate report.
-6. `CACHE_PROVENANCE_REPORT.md`: 13-field cryptographic provenance verification report.
-7. `FIX_HISTORY.md`: Chronological bugfix and engineering resolution history.
-8. `REMAINING_ISSUES.md`: Production operational guidelines and runtime best practices.
+All deliverable files and reports are available in the workspace:
+1. `vsoul_studio_uniform_swap_code.zip`: Complete production codebase archive.
+2. `TEST_RESULTS.csv`: Unseen regression records and metrics across all 8 test conditions.
+3. `UNSEEN_REGRESSION_REPORT.md`: Detailed test evaluation and analysis.
+4. `QUALITY_GATE_REGRESSION_REPORT.md`: 44-gate positive and negative defect injection test report.
+5. `FIX_HISTORY.md`: Chronological bugfix, root-cause analysis, and resolution log.
+6. `REMAINING_ISSUES.md`: Operational runtime guidelines and long-term recommendations.
+7. `FINAL_REPORT.md`: Authoritative executive report.

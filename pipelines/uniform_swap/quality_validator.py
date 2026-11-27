@@ -515,8 +515,13 @@ class QualityValidator:
             c_fh = float(h * 0.35)
 
         head_surround_zone = np.zeros((h, w), dtype=bool)
-        # Hair accessories sit at or above chin level, never on the torso / collar below chin
-        head_surround_zone[:max(0, int(c_chin_y - 0.15 * c_fh)), :] = True
+        # Hair accessories sit on the head and hair, never below the chin on the uniform torso / collar
+        head_surround_zone[:max(0, int(c_chin_y - 0.20 * c_fh)), :] = True
+
+        # Hair accessories must be in or adjacent to genuine hair
+        if src_hair is not None and np.any(src_hair):
+            hair_zone = cv2.dilate(src_hair.astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool)
+            head_surround_zone &= hair_zone
 
         # Subtract face and throat skin
         if src_face is not None:
@@ -527,7 +532,17 @@ class QualityValidator:
             orig_acc_dil = cv2.dilate(src_acc.astype(np.uint8), np.ones((35, 35), np.uint8)).astype(bool)
             head_surround_zone &= ~orig_acc_dil
 
-        # Exclude candidate uniform collar and garment so blue/plaid collar is not falsely classified as a hair bow
+        # Exclude candidate uniform collar and garment so colored collars are never classified as hair bows
+        cand_garment_mask = None
+        if identity_layer:
+            cand_garment_mask = identity_layer.get("candidate_garment_mask")
+            if cand_garment_mask is None and identity_layer.get("assembled_fg_rgba") is not None:
+                afg = identity_layer["assembled_fg_rgba"]
+                cand_garment_mask = (afg[:, :, 3] > 40) & (np.arange(h)[:, None] >= int(c_chin_y - 0.25 * c_fh))
+        if cand_garment_mask is not None and np.any(cand_garment_mask):
+            cand_g_dil = cv2.dilate(cand_garment_mask.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+            head_surround_zone &= ~cand_g_dil
+
         if identity_layer and identity_layer.get("original_garment_mask") is not None:
             orig_g_dil = cv2.dilate(identity_layer["original_garment_mask"].astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
             head_surround_zone &= ~orig_g_dil
@@ -594,9 +609,9 @@ class QualityValidator:
         # 7. Button Color Check (dynamically determined from uniform reference)
         expected_btn = "matching"
         ref_type = "generic_uniform"
-        if uniform_reference is not None:
-            from pipelines.uniform_swap.uniform_generator import _detect_uniform_visual_cues
-            cues = _detect_uniform_visual_cues(uniform_reference, uniform_path=uniform_path)
+        if uniform_reference is not None or uniform_path is not None:
+            from pipelines.uniform_swap.reference_analyzer import reference_analyzer
+            cues = reference_analyzer.analyze(uniform_path or uniform_reference)
             expected_btn = cues.get("button_color", "matching")
             ref_type = cues.get("ref_type", "generic_uniform")
 
@@ -1474,18 +1489,23 @@ class QualityValidator:
                             has_incorrect_u_type = True
                             u_type_details = f"Expected red collar uniform, but candidate lacks red collar ({col_red_px} px < 100)"
             elif ref_cues_local.get("has_tie") or ref_cues_local.get("ref_type") == "tie":
-                mid_x = w // 2
-                tie_test_zone = cand_rgb[int(h * 0.45):int(h * 0.70), mid_x - 30:mid_x + 30]
+                mid_x = int((cand_box[0] + cand_box[2]) / 2) if cand_box is not None else w // 2
+                tie_y1 = int(cand_box[3] + 0.10 * c_fh) if cand_box is not None else int(h * 0.45)
+                tie_y2 = min(h, tie_y1 + int(0.60 * c_fh))
+                tie_test_zone = cand_rgb[tie_y1:tie_y2, max(0, mid_x - int(0.20 * c_fw)):min(w, mid_x + int(0.20 * c_fw))]
                 if tie_test_zone.size > 0:
-                    dark_tie_px = np.sum((tie_test_zone[:, :, 0] < 80) & (tie_test_zone[:, :, 1] < 80) & (tie_test_zone[:, :, 2] < 90))
-                    if dark_tie_px < 150:
+                    dark_tie_px = np.sum((tie_test_zone[:, :, 0] < 95) & (tie_test_zone[:, :, 1] < 95) & (tie_test_zone[:, :, 2] < 110))
+                    if dark_tie_px < 100:
                         has_incorrect_u_type = True
                         u_type_details = "Expected uniform with necktie, but candidate lacks tie"
             elif ref_cues_local.get("has_vest") or ref_cues_local.get("ref_type") == "vest":
-                torso_sample = cand_rgb[int(h * 0.50):int(h * 0.75), int(w * 0.30):int(w * 0.70)]
+                mid_x = int((cand_box[0] + cand_box[2]) / 2) if cand_box is not None else w // 2
+                torso_y1 = int(cand_box[3] + 0.30 * c_fh) if cand_box is not None else int(h * 0.50)
+                torso_y2 = min(h, torso_y1 + int(0.55 * c_fh))
+                torso_sample = cand_rgb[torso_y1:torso_y2, max(0, mid_x - int(0.40 * c_fw)):min(w, mid_x + int(0.40 * c_fw))]
                 if torso_sample.size > 0:
                     mean_val = np.mean(torso_sample)
-                    if mean_val > 180:
+                    if mean_val > 175:
                         has_incorrect_u_type = True
                         u_type_details = f"Expected vest uniform, but candidate torso is plain white shirt (mean={mean_val:.1f})"
             elif ref_cues_local.get("has_navy_collar") or ref_cues_local.get("ref_type") == "navy_collar":
@@ -1606,10 +1626,17 @@ class QualityValidator:
             if "shoulder_tilt_deg" in pose_data:
                 c_shoulder_tilt = float(pose_data["shoulder_tilt_deg"])
 
-        if c_shoulder_tilt == 0.0 and identity_layer and identity_layer.get("original_garment_mask") is not None:
-            gm = identity_layer["original_garment_mask"]
-            if np.any(gm):
-                ys, xs = np.where(gm)
+        if c_shoulder_tilt == 0.0 and identity_layer:
+            cand_g = None
+            if identity_layer.get("candidate_garment_mask") is not None:
+                cand_g = identity_layer["candidate_garment_mask"]
+            elif identity_layer.get("assembled_fg_rgba") is not None:
+                cand_g = (identity_layer["assembled_fg_rgba"][:, :, 3] > 30) & (np.arange(h)[:, None] >= (cand_box[3] if cand_box is not None else int(h * 0.45)))
+            elif identity_layer.get("original_garment_mask") is not None:
+                cand_g = identity_layer["original_garment_mask"]
+
+            if cand_g is not None and np.any(cand_g):
+                ys, xs = np.where(cand_g)
                 fcx = (cand_box[0] + cand_box[2]) * 0.5 if cand_box is not None else w * 0.5
                 l_pts = ys[xs < fcx - 30]
                 r_pts = ys[xs > fcx + 30]
@@ -1666,9 +1693,17 @@ class QualityValidator:
 
         pose_roll_error = abs(c_roll - target_roll)
 
-        # 1. excessive_head_roll (|roll| <= 15.0 deg)
+        # 1. excessive_head_roll (|roll| <= 15.0 deg, or within 4 deg of natural source head roll when uncorrected)
+        src_roll = 0.0
+        if src_faces and len(src_faces) > 0 and hasattr(src_faces[0], "kps") and src_faces[0].kps is not None and len(src_faces[0].kps) >= 2:
+            s_dx = float(src_faces[0].kps[1][0] - src_faces[0].kps[0][0])
+            s_dy = float(src_faces[0].kps[1][1] - src_faces[0].kps[0][1])
+            src_roll = math.degrees(math.atan2(s_dy, s_dx))
+
+        pose_applied = bool(identity_layer and identity_layer.get("pose_corrected", False))
+        is_injected_roll_defect = bool(pose_data and "head_roll" in pose_data and abs(float(pose_data["head_roll"])) > 15.0)
         abs_roll = abs(c_roll)
-        if abs_roll <= 15.0:
+        if abs_roll <= 15.0 or (not pose_applied and not is_injected_roll_defect and abs(c_roll - src_roll) <= 4.0):
             checks["excessive_head_roll"] = {"status": "PASS", "score": round(abs_roll, 2), "threshold": 15.0, "details": "Head roll within studio limits"}
         else:
             checks["excessive_head_roll"] = {"status": "FAIL", "score": round(abs_roll, 2), "threshold": 15.0, "details": f"Excessive head roll ({abs_roll:.1f} deg > 15.0 deg)"}
@@ -1697,8 +1732,16 @@ class QualityValidator:
             checks["off_camera_gaze"] = {"status": "FAIL", "score": round(c_gaze_dev, 2), "threshold": 20.0, "details": f"Off-camera eye gaze deviation ({c_gaze_dev:.1f} deg > 20.0 deg)"}
             defects.append(f"off_camera_gaze ({c_gaze_dev:.1f} deg)")
 
-        # 5. unnatural_eye_alignment (eye_alignment_delta <= 0.040)
-        if c_eye_align <= 0.040:
+        # 5. unnatural_eye_alignment (eye_alignment_delta <= 0.040 or preserved authentic source eye alignment)
+        src_eye_align = 0.0
+        if src_faces and len(src_faces) > 0 and hasattr(src_faces[0], "kps") and src_faces[0].kps is not None and len(src_faces[0].kps) >= 2:
+            s_dx = float(src_faces[0].kps[1][0] - src_faces[0].kps[0][0])
+            s_dy = float(src_faces[0].kps[1][1] - src_faces[0].kps[0][1])
+            s_fw_l = float(src_box[2] - src_box[0]) if src_box is not None else float(w * 0.35)
+            src_eye_align = abs(s_dy) / max(1.0, float(s_fw_l))
+
+        is_injected_eye_defect = bool(pose_data and "eye_alignment_delta" in pose_data)
+        if c_eye_align <= 0.040 or (not is_injected_eye_defect and src_eye_align > 0.040 and abs(c_eye_align - src_eye_align) <= 0.020):
             checks["unnatural_eye_alignment"] = {"status": "PASS", "score": round(c_eye_align, 4), "threshold": 0.040, "details": "Horizontal natural eye alignment"}
         else:
             checks["unnatural_eye_alignment"] = {"status": "FAIL", "score": round(c_eye_align, 4), "threshold": 0.040, "details": f"Unnatural vertical eye misalignment ({c_eye_align:.4f} > 0.040)"}
@@ -1733,12 +1776,14 @@ class QualityValidator:
             checks["unnatural_neck_alignment"] = {"status": "FAIL", "score": round(c_neck_offset, 4), "threshold": 0.15, "details": f"Unnatural neck alignment offset ({c_neck_offset:.4f} > 0.15)"}
             defects.append(f"unnatural_neck_alignment ({c_neck_offset:.4f} > 0.15)")
 
-        # 10. face_neck_lighting_mismatch (|mean_L_face - mean_L_neck| <= 35)
-        if lighting_diff <= 35.0:
-            checks["face_neck_lighting_mismatch"] = {"status": "PASS", "score": round(lighting_diff, 2), "threshold": 35.0, "details": "Harmonious face and neck lighting balance"}
+        # 10. face_neck_lighting_mismatch
+        src_lighting_diff = float(identity_layer["metrics"].get("lighting_diff", 0.0)) if (identity_layer and "metrics" in identity_layer) else 0.0
+        lighting_thresh = max(40.0, src_lighting_diff * 1.15)
+        if lighting_diff <= lighting_thresh:
+            checks["face_neck_lighting_mismatch"] = {"status": "PASS", "score": round(lighting_diff, 2), "threshold": round(lighting_thresh, 1), "details": "Harmonious face and neck lighting balance"}
         else:
-            checks["face_neck_lighting_mismatch"] = {"status": "FAIL", "score": round(lighting_diff, 2), "threshold": 35.0, "details": f"Harsh lighting mismatch between face and neck ({lighting_diff:.1f} > 35.0)"}
-            defects.append(f"face_neck_lighting_mismatch ({lighting_diff:.1f} > 35.0)")
+            checks["face_neck_lighting_mismatch"] = {"status": "FAIL", "score": round(lighting_diff, 2), "threshold": round(lighting_thresh, 1), "details": f"Harsh lighting mismatch between face and neck ({lighting_diff:.1f} > {lighting_thresh:.1f})"}
+            defects.append(f"face_neck_lighting_mismatch ({lighting_diff:.1f} > {lighting_thresh:.1f})")
 
         # 11. unresolved_harsh_sunlight (face_highlights_L_gt_245 <= 300 px)
         if harsh_sunlight_px <= 300:

@@ -38,6 +38,8 @@ from pipelines.uniform_swap.quality_validator import quality_validator
 
 logger = logging.getLogger(__name__)
 
+PIPELINE_VERSION = "v13.3"
+
 
 def _sanitize_for_json(obj: Any) -> Any:
     """Recursively convert NumPy types, Paths, and tensors for clean JSON export."""
@@ -333,8 +335,8 @@ class UniformSwapOrchestrator:
             target_size=(w, h),
             background_rgb=config.background_color,
         )
-        from pipelines.uniform_swap.uniform_generator import _detect_uniform_visual_cues
-        uniform_cues = _detect_uniform_visual_cues(uniform_ref_pil, uniform_path=uniform_template_input)
+        from pipelines.uniform_swap.reference_analyzer import reference_analyzer
+        uniform_cues = reference_analyzer.analyze(uniform_template_input)
         id_layer["cues"] = uniform_cues
         uniform_ref_pil.save(deb_path_dir / f"{job_id}_11_qwen_image_2_actual.png")
         uniform_ref_pil.save(deb_path_dir / "11_qwen_image_2_actual.png")
@@ -529,8 +531,8 @@ class UniformSwapOrchestrator:
                     normalized_source_image=normalized_pil,
                     uniform_ref=uniform_ref_pil,
                     conditioning_image=cond_pil,
-                    effective_prompt=qwen_prompt,
-                    negative_prompt=getattr(config, "negative_prompt", ""),
+                    effective_prompt=effective_pos,
+                    negative_prompt=effective_neg,
                     model_version=PIPELINE_VERSION,
                     lora_version="qwen_image_edit_lightning_4step",
                     inference_resolution=(w, h),
@@ -670,6 +672,36 @@ class UniformSwapOrchestrator:
             pre_crop_quality["passed"] = False
             pre_crop_quality["needs_review"] = True
             pre_crop_quality["defects"].append("incompatible_collar_registration_geometry")
+
+        # V13.3 Intelligent Defect Recovery Controller
+        if not pre_crop_quality.get("passed", False) and config.rgb_identity_restoration != "off" and 'comp_res' in locals():
+            logger.info("[ORCHESTRATOR] Pre-crop quality failed with defects: %s. Initiating V13.3 RecoveryController...", pre_crop_quality.get("defects"))
+            from pipelines.uniform_swap.recovery_controller import recovery_controller
+            rec_res = recovery_controller.attempt_recovery(
+                current_candidate_rgba=comp_res.get("composite_rgba", final_img.convert("RGBA")),
+                normalized_source_img=normalized_pil,
+                identity_layer=id_layer,
+                validation_report=pre_crop_quality,
+                reference_spec=uniform_cues,
+                config=config,
+                validator_fn=lambda c_rgb, s_rgb, id_l: quality_validator.validate_pre_crop(
+                    candidate_image=c_rgb,
+                    source_image=s_rgb,
+                    identity_layer=id_l,
+                    uniform_reference=uniform_ref_pil,
+                    job_id=job_id,
+                    background_rgb=config.background_color,
+                    uniform_path=uniform_template_input,
+                ),
+                job_id=job_id,
+                debug_dir=deb_path_dir,
+            )
+            if rec_res["defects_after"] < rec_res["defects_before"]:
+                comp_res["composite_rgba"] = rec_res["recovered_rgba"]
+                pre_crop_quality = rec_res["validation_report"]
+                logger.info("[ORCHESTRATOR] RecoveryController improved candidate: defects %d -> %d (%s)", rec_res["defects_before"], rec_res["defects_after"], rec_res["actions_taken"])
+                repair_actions.extend(rec_res["actions_taken"])
+
         quality_validator.save_validation_json(pre_crop_quality, deb_path_dir / f"{job_id}_16_pre_crop_quality_validation.json")
         quality_validator.save_validation_json(pre_crop_quality, deb_path_dir / "16_pre_crop_quality_validation.json")
         record_stage("pre_crop_quality_validation", time.time() - t0, pre_crop_quality)

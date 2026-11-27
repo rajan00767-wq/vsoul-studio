@@ -87,6 +87,7 @@ class UniformSwapConfig:
 
     # 10. Execution mode: "production", "raw_only", "diagnostic"
     execution_mode: str = "production"
+    diagnostic_mode: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.model_path, str):

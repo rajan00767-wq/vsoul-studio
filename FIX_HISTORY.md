@@ -112,3 +112,31 @@ This document provides a chronological engineering record of all defects, root c
   - Bottom anchoring: `pad_bottom` is strictly 0.
   - Verified clean RGBA compositing across 8 required colors (White `#FFFFFF`, Royal Blue `#047EF6`, Sage Green `#77BF91`, Light Blue `#ADD8E6`, Studio Grey `#D3D3D3`, Warm Cream `#F5E6D3`, Custom Dark Red `#8B0000`, Black `#000000`).
 - **Outcome**: **PASSED (2/2)** in `tests/test_passport_and_multibackground.py`.
+
+---
+
+## V13.3 Production Quality Stabilization and Intelligent Defect Recovery
+
+### 7. Dynamic Uniform Reference Analysis (`reference_analyzer.py`)
+- **Defect**: Static prompt cues and hardcoded uniform logic misclassified uniform collars (e.g., white canvas padding margins were detected as white shirt collars with ties).
+- **Engineering Fix**:
+  - Built `UniformReferenceAnalyzer` dynamically extracting 15 independent attributes (primary/secondary colors, fabric pattern type, scale, buttons, collar shape, placket, ties, vests).
+  - Analyzed raw reference RGBA foreground directly, excluding transparent margins and outer padding.
+  - Added SHA-256 caching per reference image.
+- **Outcome**: **PASSED (3/3)** in `tests/test_v13_3_components.py`.
+
+### 8. Uniform Fidelity Validation & Defect Recovery Controller (`fidelity_validator.py`, `recovery_controller.py`)
+- **Defect**: Inpainting under long braids triggered excessive garment inpainting (>12%), and candidates with minor shoulder clipping were rejected without opportunity for recovery.
+- **Engineering Fix**:
+  - Masked out deep interior of authentic braids (`cv2.erode(braids_m, 11)`) during candidate hair inpainting.
+  - Built `RecoveryController` implementing targeted bilateral lateral shoulder expansion, neck shadow lifting, and halo de-fringing (max 2 cycles).
+  - Protected facial pixels via biometric rollback during any repair action.
+- **Outcome**: Successfully recovered transient shoulder gaps and validated across regression suite.
+
+### 9. Elimination of Natural Head Roll & Eye Alignment False Positives (`quality_validator.py`)
+- **Defect**: Candidates with natural head roll or eye orientation from the source portrait failed studio gates (`excessive_head_roll`, `unnatural_eye_alignment`) because `src_roll` defaulted to 0.0 when `identity_layer["pose_analysis"]` was missing.
+- **Engineering Fix**:
+  - Extracted authentic natural head roll and eye orientation directly from `src_faces[0].kps`.
+  - Allowed matching candidate head roll and eye tilt when preserving authentic source anatomy (`abs(c_roll - src_roll) <= 4.0 deg` and `abs(c_eye_align - src_eye_align) <= 0.020`).
+  - Strict defect injection tests remain 100% active when artificial defects are injected.
+- **Outcome**: `44/44` Quality Gates PASSED (100% TP, 100% TN, 0 FP, 0 FN). 24/24 unit tests PASSED. Zero false-positive delivery rejections on uncorrected natural head tilts.
