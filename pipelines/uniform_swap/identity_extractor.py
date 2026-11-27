@@ -469,20 +469,22 @@ class IdentityExtractor:
                 else:
                     logger.info("[IDENTITY_EXTRACTOR] Ears visible; confirmed NO authentic earrings.")
 
-        # 4d. Validated Individual Bow & Hair Accessory Objects (V13.0 General-Purpose)
+        # 4d. Validated Individual Bow & Hair Accessory Objects (V13.3.3 Generalized Instance Correspondence)
         individual_bows = []
         has_confirmed_bows = False
         if acc_objects:
             for obj in acc_objects:
                 a_area = obj["area"]
-                if a_area < 500:
+                if a_area < 60:
                     continue
                 c_x, c_y = obj["centroid"]
                 side_tag = "left_bow" if c_x < fcx else "right_bow"
-                if c_y < fy1 + 0.15 * fh:
-                    side_tag = "crown_bow"
-                elif c_y > chin_y + 0.30 * fh:
+                if c_y < fy1 + 0.20 * fh:
+                    side_tag = "crown_accessory"
+                elif c_y > chin_y + 0.20 * fh:
                     side_tag = f"{side_tag}_tail"
+                elif abs(c_x - fcx) > 0.40 * fw:
+                    side_tag = f"{side_tag}_lateral"
 
                 individual_bows.append({
                     "name": f"{side_tag}_{len(individual_bows)+1}",
@@ -549,6 +551,7 @@ class IdentityExtractor:
             "has_accessories": (len(acc_objects) > 0 or has_confirmed_bows),
             "individual_bows": individual_bows,
             "braid_overlap_garment": braid_overlap_garment,
+            "face_bbox": (fx1, fy1, fx2, fy2),
             "full_person_alpha": birefnet_alpha,
             "birefnet_alpha": birefnet_alpha,
             "neck_classification": neck_cls,

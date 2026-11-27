@@ -71,6 +71,7 @@ class UniformSwapConfig:
     # rgb_identity_restoration: "off", "adaptive", "protected_source", "legacy"
     # In V12.4, defaults to "adaptive" (Protected-Source Garment Compositing)
     rgb_identity_restoration: str = "adaptive"
+    compositor_version: str = "v13_3_3"  # "v13_3_3" (anatomical registration) or "v13_3_2" (legacy flat-paste)
 
     # 8. Accessory & Badge Modes:
     accessory_preservation_mode: str = "semantic_context"

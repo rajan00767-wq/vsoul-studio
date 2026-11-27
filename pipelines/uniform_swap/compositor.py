@@ -43,7 +43,7 @@ def _blend_straight_rgba(
     a_out = ao + ab * (1.0 - ao)
     pos = a_out > 0.001
 
-    out_rgb = np.zeros_like(base_rgb, dtype=np.float32)
+    out_rgb = base_rgb.copy()
     out_rgb[pos] = (
         top_rgb.astype(np.float32)[pos] * ao[pos, None]
         + base_rgb.astype(np.float32)[pos] * ab[pos, None] * (1.0 - ao[pos, None])
@@ -52,8 +52,19 @@ def _blend_straight_rgba(
     return np.clip(out_rgb, 0, 255).astype(np.uint8), np.clip(a_out * 255.0, 0, 255).astype(np.uint8)
 
 
+def _bleed_edge_rgb(rgb: np.ndarray, alpha: np.ndarray, radius: int = 15) -> np.ndarray:
+    """Bleed boundary RGB outward into alpha < 5 pixels to eliminate Lanczos downsampling darkening."""
+    zero_a = (alpha < 5).astype(np.uint8)
+    if np.any(zero_a) and np.any(alpha >= 5):
+        dil_edge = cv2.dilate((alpha >= 5).astype(np.uint8), np.ones((radius, radius), np.uint8)) > 0
+        bleed_mask = zero_a & dil_edge
+        if np.any(bleed_mask):
+            return cv2.inpaint(rgb, bleed_mask.astype(np.uint8), inpaintRadius=max(3, radius // 2), flags=cv2.INPAINT_TELEA)
+    return rgb
+
+
 class UniformCompositor:
-    """Manages garment-only extraction and 5-layer RGBA subject compositing."""
+    """Manages garment-only extraction and 5-layer / 7-layer RGBA subject compositing."""
 
     def __init__(self) -> None:
         pass
@@ -68,6 +79,270 @@ class UniformCompositor:
         job_id: str = "qwen_uniform",
         debug_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
+        """Execute garment extraction and RGBA subject compositing with version dispatch."""
+        compositor_version = getattr(config, "compositor_version", "v13_3_3")
+        if compositor_version == "v13_3_3":
+            return self._composite_v13_3_3(
+                raw_vae_img=raw_vae_img,
+                normalized_source_img=normalized_source_img,
+                identity_layer=identity_layer,
+                raw_quality=raw_quality,
+                config=config,
+                job_id=job_id,
+                debug_dir=debug_dir,
+            )
+        return self._composite_v13_3_2(
+            raw_vae_img=raw_vae_img,
+            normalized_source_img=normalized_source_img,
+            identity_layer=identity_layer,
+            raw_quality=raw_quality,
+            config=config,
+            job_id=job_id,
+            debug_dir=debug_dir,
+        )
+
+    def _composite_v13_3_3(
+        self,
+        raw_vae_img: Image.Image,
+        normalized_source_img: Image.Image,
+        identity_layer: Dict[str, Any],
+        raw_quality: Dict[str, Any],
+        config: UniformSwapConfig,
+        job_id: str = "qwen_uniform",
+        debug_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """V13.3.3: Anatomical Garment Registration & 7-Layer Semantic Occlusion-Aware Compositor."""
+        if debug_dir is None:
+            debug_dir = Path("outputs/debug_phases")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        w, h = config.output_resolution
+        raw_rgb = np.asarray(raw_vae_img.resize((w, h), Image.Resampling.LANCZOS).convert("RGB"))
+        src_rgb = np.asarray(normalized_source_img.resize((w, h), Image.Resampling.LANCZOS).convert("RGB"))
+
+        mode = config.rgb_identity_restoration
+        exec_mode = config.execution_mode
+
+        if exec_mode == "raw_only" or mode == "off":
+            logger.info("[COMPOSITOR_V13_3_3] Mode is '%s'/'%s': bypassing compositing", exec_mode, mode)
+            repair_mask = np.zeros((h, w), dtype=np.uint8)
+            return {
+                "composite_img": raw_vae_img,
+                "composite_rgba": raw_vae_img.convert("RGBA"),
+                "assembled_fg_rgb": raw_rgb,
+                "assembled_fg_alpha": np.full((h, w), 255, dtype=np.uint8),
+                "localized_repair_mask": repair_mask,
+                "repair_mask_path": debug_dir / f"{job_id}_17_localized_repair_mask.png",
+                "actions": ["bypassed_raw_only"],
+            }
+
+        repair_actions = ["v13_3_3_anatomical_registration"]
+
+        src_rgb_to_use = identity_layer.get("illumination_corrected_rgb")
+        if src_rgb_to_use is None or src_rgb_to_use.shape != src_rgb.shape:
+            src_rgb_to_use = src_rgb.copy()
+        else:
+            src_rgb_to_use = src_rgb_to_use.copy()
+            repair_actions.append("applied_illumination_corrected_source_rgb")
+
+        # 1. Source Identity Masks
+        face_m = identity_layer.get("original_face_mask", np.zeros((h, w), dtype=bool))
+        ears_m = identity_layer.get("original_ears_mask", np.zeros((h, w), dtype=bool))
+        earring_m = identity_layer.get("original_earring_mask", np.zeros((h, w), dtype=bool))
+        hair_m = identity_layer.get("original_hair_mask", np.zeros((h, w), dtype=bool))
+        acc_m = identity_layer.get("original_accessory_mask", np.zeros((h, w), dtype=bool))
+
+        biref_src = identity_layer.get("birefnet_alpha")
+        if biref_src is None:
+            biref_src = identity_layer.get("full_person_alpha")
+        if biref_src is not None:
+            src_person_matte = (biref_src.astype(np.float32) / 255.0).clip(0.0, 1.0)
+        else:
+            src_person_matte = np.ones((h, w), dtype=np.float32)
+
+        src_chin_y = int(identity_layer.get("metrics", {}).get("chin_y", h * 0.50))
+        src_fh = float(identity_layer.get("metrics", {}).get("face_height", h * 0.35))
+        src_fcx = float(identity_layer.get("metrics", {}).get("face_center_x", w * 0.50))
+        src_fw = float(identity_layer.get("metrics", {}).get("face_width", w * 0.35))
+
+        # Face core: face, ears, and earrings bounded strictly by authentic subject matte
+        face_core = face_m.copy()
+        if ears_m is not None and np.any(ears_m):
+            ears_dil = cv2.dilate(ears_m.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            ears_dil &= (src_person_matte > 0.20)
+            face_core |= ears_dil
+        if earring_m is not None and np.any(earring_m):
+            face_core |= earring_m
+        face_core &= (src_person_matte > 0.20)
+
+        # Braids / long hair draping over chest
+        braids_m = (hair_m | acc_m) & (np.arange(h)[:, None] >= src_chin_y) & (src_person_matte > 0.15)
+        scalp_m = hair_m & ~braids_m
+
+        # 2. Candidate Parsing and Anatomical Garment Registration
+        logger.info("[COMPOSITOR_V13_3_3] Registering target garment to source student anatomy...")
+        from pipelines.schp_service import parse as parse_schp
+        from pipelines.birefnet_service import extract_matte
+        from pipelines.uniform_swap.garment_registrar import garment_registrar
+
+        cand_schp = parse_schp(raw_rgb)
+        cand_labels = cand_schp["labels"]
+        cand_matte = extract_matte(Image.fromarray(raw_rgb))
+
+        # Raw face geometry
+        app = garment_registrar._get_app()
+        raw_faces = app.get(cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)) if app is not None else None
+        if raw_faces and len(raw_faces) > 0:
+            main_rf = max(raw_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            raw_chin_y = int(main_rf.bbox[3])
+            raw_fh = float(main_rf.bbox[3] - main_rf.bbox[1])
+            raw_fcx = float(main_rf.bbox[0] + main_rf.bbox[2]) * 0.5
+        else:
+            raw_chin_y = int(h * 0.50)
+            raw_fh = float(h * 0.35)
+            raw_fcx = float(w * 0.50)
+
+        # Compute transformation M and decompose garment
+        cues = identity_layer.get("cues", {})
+        M, scale, dx, dy = garment_registrar.compute_registration_matrix(
+            raw_rgb, src_rgb, identity_layer, raw_chin_y, raw_fh, raw_fcx
+        )
+        comps = garment_registrar.decompose_garment(raw_rgb, cand_labels, cand_matte, cues, raw_chin_y, raw_fh, raw_fcx)
+        reg_g = garment_registrar.register_and_warp(comps, cand_matte, M, scale, dx, dy, (h, w), src_person_matte, src_chin_y)
+
+        # Extract dynamic visible neck skin inside collar opening
+        dyn_neck_m = garment_registrar.extract_dynamic_neck(
+            src_rgb_to_use, src_person_matte, src_chin_y, src_fh, src_fcx, face_core, reg_g
+        )
+
+        # Save Registered Garment Diagnostics (04_*)
+        Image.fromarray(reg_g.warped_rgb).save(debug_dir / f"{job_id}_04_candidate_garment_rgb.png")
+        Image.fromarray(reg_g.warped_rgb).save(debug_dir / "04_candidate_garment_rgb.png")
+        Image.fromarray(reg_g.warped_alpha).save(debug_dir / f"{job_id}_04_candidate_garment_alpha.png")
+        Image.fromarray(reg_g.warped_alpha).save(debug_dir / "04_candidate_garment_alpha.png")
+        reg_rgba = np.dstack([reg_g.warped_rgb, reg_g.warped_alpha])
+        Image.fromarray(reg_rgba).save(debug_dir / f"{job_id}_04_registered_garment_rgba.png")
+        Image.fromarray(reg_rgba).save(debug_dir / "04_registered_garment_rgba.png")
+
+        # 3. 7-Layer Semantic Occlusion-Aware Compositing
+        logger.info("[COMPOSITOR_V13_3_3] Assembling 7 semantic occlusion-aware RGBA layers...")
+
+        # Pre-bleed source and garment edges to eliminate black resampling contours
+        warped_rgb_bled = _bleed_edge_rgb(reg_g.warped_rgb, reg_g.warped_alpha, radius=15)
+        src_rgb_bled = _bleed_edge_rgb(src_rgb_to_use, (src_person_matte * 255.0).astype(np.uint8), radius=15)
+
+        # Layer 1: Registered Target Garment Body
+        fg_rgb = warped_rgb_bled.copy()
+        fg_alpha = reg_g.warped_alpha.copy()
+
+        # Layer 2: Dynamic Throat / Neck Skin (inside collar opening only)
+        if np.any(dyn_neck_m):
+            neck_alpha = cv2.GaussianBlur(dyn_neck_m.astype(np.float32) * 255.0, (5, 5), 1.5).clip(0, 255).astype(np.uint8)
+            fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, src_rgb_bled, neck_alpha)
+            repair_actions.append("layered_dynamic_throat_skin_in_collar_opening")
+
+        # Layer 3: Collar Lapels & Tie Knot (strictly OVER neck skin, never erased by neck)
+        collar_tie_m = reg_g.collar_lapels_mask | reg_g.tie_knot_mask
+        if np.any(collar_tie_m):
+            ct_alpha = cv2.GaussianBlur(collar_tie_m.astype(np.float32) * 255.0, (3, 3), 1.0).clip(0, 255).astype(np.uint8)
+            fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, warped_rgb_bled, ct_alpha)
+            repair_actions.append("layered_target_collar_and_tie_knot_over_neck")
+
+        # Layer 4: Protected Original Face Core & Ears (100% authentic pixels)
+        face_alpha = cv2.GaussianBlur(face_core.astype(np.float32) * 255.0, (3, 3), 1.0).clip(0, 255).astype(np.uint8)
+        face_alpha[face_core] = 255
+        fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, src_rgb_bled, face_alpha)
+        repair_actions.append("layered_protected_original_face_core_and_ears")
+
+        # Layer 5: Original Scalp Hair
+        if np.any(scalp_m):
+            if biref_src is not None:
+                scalp_alpha = np.where(scalp_m & (biref_src > 30), biref_src, 0).astype(np.uint8)
+            else:
+                scalp_alpha = (scalp_m.astype(np.float32) * 255.0).astype(np.uint8)
+            fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, src_rgb_bled, scalp_alpha)
+            repair_actions.append("layered_original_scalp_hair")
+
+        # Layer 6: Original Braids & Long Hair (draping over garment)
+        if np.any(braids_m):
+            if biref_src is not None:
+                braids_alpha = np.where(braids_m & (biref_src > 30), biref_src, 0).astype(np.uint8)
+            else:
+                braids_alpha = (braids_m.astype(np.float32) * 255.0).astype(np.uint8)
+            fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, src_rgb_bled, braids_alpha)
+            repair_actions.append("layered_original_braids_over_garment")
+
+        # Layer 7: Original Accessories & Ribbons (tracked instances, placed on top)
+        if np.any(acc_m):
+            acc_alpha = cv2.GaussianBlur(acc_m.astype(np.float32) * 255.0, (3, 3), 1.0).clip(0, 255).astype(np.uint8)
+            acc_alpha[acc_m] = 255
+            fg_rgb, fg_alpha = _blend_straight_rgba(fg_rgb, fg_alpha, src_rgb_bled, acc_alpha)
+            repair_actions.append("layered_authentic_hair_accessories_and_ribbons")
+
+        # Final edge color bleed on assembled foreground
+        fg_rgb = _bleed_edge_rgb(fg_rgb, fg_alpha, radius=11)
+
+        # Save Assembled Foreground RGBA (17_*)
+        assembled_rgba = np.dstack([fg_rgb, fg_alpha])
+        composite_rgba_pil = Image.fromarray(assembled_rgba, "RGBA")
+
+        Image.fromarray(assembled_rgba).save(debug_dir / f"{job_id}_17_assembled_foreground_rgba.png")
+        Image.fromarray(assembled_rgba).save(debug_dir / "17_assembled_foreground_rgba.png")
+        Image.fromarray(fg_rgb).save(debug_dir / f"{job_id}_17_assembled_foreground_rgb.png")
+        Image.fromarray(fg_rgb).save(debug_dir / "17_assembled_foreground_rgb.png")
+        Image.fromarray(fg_alpha).save(debug_dir / f"{job_id}_17_assembled_foreground_alpha.png")
+        Image.fromarray(fg_alpha).save(debug_dir / "17_assembled_foreground_alpha.png")
+
+        # Update identity_layer
+        identity_layer["assembled_fg_rgba"] = assembled_rgba
+        identity_layer["full_person_alpha"] = fg_alpha
+        identity_layer["subject_matte"] = fg_alpha.astype(np.float32) / 255.0
+
+        # Flat preview composite
+        target_bg_color = getattr(config, "background_color", (255, 255, 255))
+        if not isinstance(target_bg_color, tuple) or len(target_bg_color) != 3:
+            target_bg_color = UniformSwapConfig.parse_bg_color(target_bg_color)
+
+        sm_3ch = (fg_alpha.astype(np.float32) / 255.0)[:, :, None]
+        bg_arr = np.zeros_like(fg_rgb, dtype=np.float32)
+        bg_arr[:, :] = target_bg_color
+        precrop_rgb = np.clip(fg_rgb.astype(np.float32) * sm_3ch + bg_arr * (1.0 - sm_3ch), 0, 255).astype(np.uint8)
+        precrop_rgb[fg_alpha < 5] = target_bg_color
+        final_composite_img = Image.fromarray(precrop_rgb, "RGB")
+
+        final_composite_img.save(debug_dir / f"{job_id}_17_protected_source_composite.png")
+        final_composite_img.save(debug_dir / "17_protected_source_composite.png")
+        final_composite_img.save(debug_dir / f"{job_id}_09_white_background_composite.png")
+        final_composite_img.save(debug_dir / "09_white_background_composite.png")
+        final_composite_img.save(debug_dir / f"{job_id}_18_final_output.png")
+        final_composite_img.save(debug_dir / "18_final_output.png")
+
+        localized_repair_mask = (reg_g.warped_alpha > 0).astype(np.uint8) * 255
+        repair_mask_path = debug_dir / f"{job_id}_17_localized_repair_mask.png"
+        Image.fromarray(localized_repair_mask).save(repair_mask_path)
+        Image.fromarray(localized_repair_mask).save(debug_dir / "17_localized_repair_mask.png")
+
+        return {
+            "composite_img": final_composite_img,
+            "composite_rgba": composite_rgba_pil,
+            "assembled_fg_rgb": fg_rgb,
+            "assembled_fg_alpha": fg_alpha,
+            "localized_repair_mask": localized_repair_mask,
+            "repair_mask_path": repair_mask_path,
+            "actions": repair_actions,
+        }
+
+    def _composite_v13_3_2(
+        self,
+        raw_vae_img: Image.Image,
+        normalized_source_img: Image.Image,
+        identity_layer: Dict[str, Any],
+        raw_quality: Dict[str, Any],
+        config: UniformSwapConfig,
+        job_id: str = "qwen_uniform",
+        debug_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """Legacy flat-paste V13.3.2 compositing (preserved for rollback and regression testing)."""
         """Execute garment-only extraction and 5-layer RGBA subject compositing."""
         if debug_dir is None:
             debug_dir = Path("outputs/debug_phases")

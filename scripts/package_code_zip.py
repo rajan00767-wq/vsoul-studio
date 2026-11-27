@@ -38,13 +38,9 @@ def main():
     included_files.sort()
     print(f"Total files selected for zip: {len(included_files)}")
 
-    with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for f in included_files:
             zf.write(f, str(f).replace(os.sep, "/"))
-
-    if zip_path.exists():
-        zip_path.unlink()
-    temp_zip.rename(zip_path)
 
     print(f"Successfully generated {zip_path.name}: {zip_path.stat().st_size:,} bytes")
 
@@ -83,7 +79,15 @@ def main():
             "tests/test_v13_3_2_edge_decontamination.py",
             "tests/test_v13_3_2_bow_and_seam.py",
             "tests/test_non_destructive_reporting.py",
+            "tests/test_v13_3_3_garment_registrar.py",
+            "pipelines/uniform_swap/garment_registrar.py",
             "scripts/build_v13_3_2_comparison_sheets.py",
+            "scripts/build_v13_3_3_comparison_sheets.py",
+            "scripts/test_v13_3_3_compositor.py",
+            "V13_3_3_ROOT_CAUSE_REPORT.md",
+            "V13_3_3_COMPOSITING_ARCHITECTURE.md",
+            "V13_3_3_PROGRESS.md",
+            "V13_3_3_VISUAL_REGRESSION_REPORT.md",
             "V13_3_2_HANDOVER_STATUS.md",
             "V13_3_2_PROGRESS.md",
             "V13_3_2_FRESH_INFERENCE_REPORT.md",

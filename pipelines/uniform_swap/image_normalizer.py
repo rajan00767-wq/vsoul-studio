@@ -721,7 +721,9 @@ def produce_passport_crop(
         new_w = w + pad_left + pad_right
         new_h = h + pad_top
         if is_rgba:
-            padded_canvas = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+            # V13.3.3: Pad with target background RGB at alpha 0 rather than (0, 0, 0, 0)
+            # to strictly prevent Lanczos resampling from creating black shoulder and crown outlines
+            padded_canvas = Image.new("RGBA", (new_w, new_h), (*background_rgb, 0))
         else:
             padded_canvas = Image.new("RGB", (new_w, new_h), background_rgb)
         padded_canvas.paste(image, (pad_left, pad_top))
@@ -741,6 +743,20 @@ def produce_passport_crop(
     scale_factor_x = float(out_w) / float(crop_w)
     scale_factor_y = float(out_h) / float(crop_h)
     scale_factor = scale_factor_x
+
+    # V13.3.3: Pre-condition transparent boundaries before Lanczos resampling
+    if is_rgba:
+        c_arr = np.asarray(cropped_pil)
+        c_rgb = c_arr[:, :, :3].copy()
+        c_alpha = c_arr[:, :, 3]
+        zero_a = (c_alpha < 5).astype(np.uint8)
+        # Bleed edge colors into transparent boundary to prevent edge darkening
+        if np.any(zero_a) and np.any(c_alpha >= 5):
+            dil_edge = cv2.dilate((c_alpha >= 5).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+            bleed_mask = zero_a & dil_edge
+            if np.any(bleed_mask):
+                c_rgb = cv2.inpaint(c_rgb, bleed_mask.astype(np.uint8), inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+            cropped_pil = Image.fromarray(np.dstack([c_rgb, c_alpha]), "RGBA")
 
     cropped_resized_pil = cropped_pil.resize(output_size, Image.Resampling.LANCZOS)
 

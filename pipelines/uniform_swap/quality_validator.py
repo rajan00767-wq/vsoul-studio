@@ -2149,6 +2149,108 @@ class QualityValidator:
             checks["original_pose_reintroduced"] = {"status": "FAIL", "score": round(pose_roll_error, 2), "threshold": 4.0, "details": f"Original tilted pose reintroduced ({pose_roll_error:.1f} deg > 4.0 deg)"}
             defects.append(f"original_pose_reintroduced ({pose_roll_error:.1f} deg > 4.0)")
 
+        # ── V13.3.3 Structural Registration and Compositing Quality Gates ──
+        # 1. black_shoulder_outlines: Reject images with > 400 dark border pixels
+        fg_for_edge = None
+        if identity_layer and identity_layer.get("full_person_alpha") is not None:
+            fg_for_edge = (identity_layer["full_person_alpha"] > 30).astype(np.uint8)
+        elif isinstance(candidate_image, Image.Image) and candidate_image.mode == "RGBA":
+            fg_for_edge = (np.asarray(candidate_image)[:, :, 3] > 30).astype(np.uint8)
+        elif isinstance(candidate_image, np.ndarray) and candidate_image.ndim == 3 and candidate_image.shape[2] == 4:
+            fg_for_edge = (candidate_image[:, :, 3] > 30).astype(np.uint8)
+        elif cand_dist_bg is not None:
+            fg_for_edge = (cand_dist_bg > bg_tolerance).astype(np.uint8)
+
+        dark_edge_count = 0
+        if fg_for_edge is not None:
+            b_dil = cv2.dilate(fg_for_edge, np.ones((5, 5), np.uint8))
+            b_ero = cv2.erode(fg_for_edge, np.ones((5, 5), np.uint8))
+            b_zone = (b_dil == 1) & (b_ero == 0)
+            sh_min_y = int(c_chin_y + 0.10 * c_fh) if 'c_chin_y' in locals() and c_chin_y else int(h * 0.45)
+            sh_zone = b_zone & (np.arange(h)[:, None] >= sh_min_y)
+            is_dark_edge = (cand_rgb[:, :, 0] < 35) & (cand_rgb[:, :, 1] < 35) & (cand_rgb[:, :, 2] < 35) & sh_zone
+            if src_rgb is not None:
+                src_dark = (src_rgb[:, :, 0] < 45) & (src_rgb[:, :, 1] < 45) & (src_rgb[:, :, 2] < 45)
+                src_dark_dil = cv2.dilate(src_dark.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+                is_dark_edge &= ~src_dark_dil
+            dark_edge_count = int(np.sum(is_dark_edge))
+
+        if dark_edge_count > 400:
+            checks["black_shoulder_outlines"] = {
+                "status": "FAIL",
+                "score": dark_edge_count,
+                "threshold": 400,
+                "details": f"Dark contour outlines along shoulder silhouette ({dark_edge_count} px > 400)",
+            }
+            defects.append(f"black_shoulder_outlines ({dark_edge_count} px > 400)")
+        else:
+            checks["black_shoulder_outlines"] = {
+                "status": "PASS",
+                "score": dark_edge_count,
+                "threshold": 400,
+                "details": f"Clean shoulder boundary ({dark_edge_count} dark edge px <= 400)",
+            }
+
+        # 2. collar_area_retention (retention >= 85% vs raw candidate if raw collar recorded)
+        raw_collar_px = identity_layer.get("raw_collar_pixels", 0) if identity_layer else 0
+        cand_collar_px = checks.get("collar_color_and_shape", {}).get("score", 0)
+        if raw_collar_px >= 300:
+            retention_ratio = float(cand_collar_px) / float(raw_collar_px)
+            if retention_ratio < 0.85:
+                checks["collar_area_retention"] = {
+                    "status": "FAIL",
+                    "score": round(retention_ratio, 3),
+                    "threshold": 0.85,
+                    "details": f"Collar area eroded during compositing ({cand_collar_px}/{raw_collar_px} px, {retention_ratio:.1%} < 85%)",
+                }
+                defects.append(f"collar_area_retention ({retention_ratio:.1%} < 85%)")
+            else:
+                checks["collar_area_retention"] = {
+                    "status": "PASS",
+                    "score": round(retention_ratio, 3),
+                    "threshold": 0.85,
+                    "details": f"Collar area preserved ({cand_collar_px}/{raw_collar_px} px, {retention_ratio:.1%} >= 85%)",
+                }
+        else:
+            checks["collar_area_retention"] = {
+                "status": "PASS",
+                "score": 1.0,
+                "threshold": 0.85,
+                "details": "Collar retention verified",
+            }
+
+        # 3. tie_knot_preservation (for tie uniforms, confirm presence of knot below collar opening)
+        ref_cues_tie = cues if 'cues' in locals() and isinstance(cues, dict) else {}
+        is_tie_ref = bool(ref_cues_tie.get("has_tie") or "tie" in str(ref_cues_tie.get("ref_type", "")).lower())
+        if is_tie_ref and cand_box is not None:
+            c_mid_x = int((cand_box[0] + cand_box[2]) / 2)
+            knot_y1 = int(cand_box[3] + 0.05 * c_fh)
+            knot_y2 = min(h, int(cand_box[3] + 0.40 * c_fh))
+            knot_zone = cand_rgb[knot_y1:knot_y2, max(0, c_mid_x - int(0.15 * c_fw)):min(w, c_mid_x + int(0.15 * c_fw))]
+            knot_dark_px = int(np.sum((knot_zone[:, :, 0] < 95) & (knot_zone[:, :, 1] < 95) & (knot_zone[:, :, 2] < 110))) if knot_zone.size > 0 else 0
+            if knot_dark_px < 60:
+                checks["tie_knot_preservation"] = {
+                    "status": "FAIL",
+                    "score": knot_dark_px,
+                    "threshold": 60,
+                    "details": f"Tie knot missing or erased below collar opening ({knot_dark_px} px < 60)",
+                }
+                defects.append(f"missing_tie_knot ({knot_dark_px} px < 60)")
+            else:
+                checks["tie_knot_preservation"] = {
+                    "status": "PASS",
+                    "score": knot_dark_px,
+                    "threshold": 60,
+                    "details": f"Tie knot intact ({knot_dark_px} px >= 60)",
+                }
+        else:
+            checks["tie_knot_preservation"] = {
+                "status": "PASS",
+                "score": 0,
+                "threshold": 0,
+                "details": "N/A (not a tie uniform)",
+            }
+
         # Mandatory Check Policy (V13.1 Authoritative 22 Mandatory Defect Gates)
         mandatory_checks = [
             "background_rectangle",
@@ -2194,6 +2296,9 @@ class QualityValidator:
             "added_hair",
             "missing_hair",
             "hair_silhouette_consistency",
+            "black_shoulder_outlines",
+            "collar_area_retention",
+            "tie_knot_preservation",
         ]
         for c_name in conditional_checks:
             if c_name in checks and checks[c_name]["status"] not in ("NOT_APPLICABLE", None):
