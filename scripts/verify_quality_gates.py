@@ -393,9 +393,19 @@ def run_verification():
 
     all_verified = (fn_count == 0 and fp_count == 0)
 
-    # Write report QUALITY_GATE_REGRESSION_REPORT.md
+    # Write separate non-destructive outputs (do NOT overwrite authored QUALITY_GATE_REGRESSION_REPORT.md)
+    import datetime
+    import json
+
+    now = datetime.datetime.now()
+    ts_str = now.strftime("%Y%m%d_%H%M%S")
+    summary_md_path = Path("QUALITY_GATE_TEST_SUMMARY.md")
+    summary_json_path = Path("QUALITY_GATE_TEST_SUMMARY.json")
+
     report_lines = [
-        "# V13.2 Quality Gate Regression & Independent Verification Report",
+        "# V13.3.2 Quality Gate Test Summary",
+        "",
+        f"**Execution Timestamp**: {now.isoformat()}",
         "",
         "## Executive Summary",
         f"- **Total Gates Audited**: 22 Mandatory Quality Gates",
@@ -410,7 +420,7 @@ def run_verification():
         f"- **Overall Accuracy**: **{accuracy * 100:.2f}%**",
         f"- **Production Delivery Rejection Rate on Defects**: **{rejection_rate * 100:.2f}% (100% of defective images blocked)**",
         "",
-        "## Specific V13.2 Audit Remediations",
+        "## Specific V13.2 / V13.3 Audit Remediations",
         "1. **`collar_registration_failure`**: Replaced clean baseline with genuine collar translation/misalignment defect (+85px down shift) while preserving authentic face and facial landmarks (facial RMSE 0.0010 < 0.025, but collar geometry triggered FAIL and blocked delivery).",
         "2. **`incorrect_uniform_type`**: Tested candidate with mismatched plain garment when REF001 red collar uniform was requested. Triggered FAIL and blocked delivery.",
         "3. **`unresolved_requested_restoration`**: Requested glare restoration on candidate containing specular blown-out highlight on face. Triggered FAIL and blocked delivery.",
@@ -443,9 +453,37 @@ def run_verification():
         "- **Enforced Production Gating**: Final delivery rejection is strictly asserted (`passed=False` and `defects!=[]`), ensuring zero defective portraits reach customer delivery.",
     ])
 
-    with open("QUALITY_GATE_REGRESSION_REPORT.md", "w", encoding="utf-8") as f:
+    # 1. Write QUALITY_GATE_TEST_SUMMARY.md
+    with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines))
 
+    # 2. Write QUALITY_GATE_TEST_SUMMARY.json
+    summary_data = {
+        "timestamp": now.isoformat(),
+        "total_conditions_tested": total_pos + total_neg,
+        "true_positives": tp_count,
+        "true_negatives": tn_count,
+        "false_positives": fp_count,
+        "false_negatives": fn_count,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "specificity": round(specificity, 4),
+        "overall_accuracy": round(accuracy, 4),
+        "delivery_rejection_rate": round(rejection_rate, 4),
+        "all_verified": all_verified,
+        "gates": results,
+    }
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary_data, f, indent=2)
+
+    # 3. Write timestamped historical execution report
+    hist_dir = Path("reports/quality_gate_runs")
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    hist_path = hist_dir / f"quality_gates_run_{ts_str}.md"
+    with open(hist_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(report_lines))
+
+    # Note: QUALITY_GATE_REGRESSION_REPORT.md is deliberately NOT touched (preserved engineering audit)
     return all_verified, results
 
 

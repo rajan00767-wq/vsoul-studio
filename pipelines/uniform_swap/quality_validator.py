@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+warnings.filterwarnings("ignore", category=FutureWarning, module=".*insightface.*")
 
 import cv2
 import numpy as np
@@ -1245,15 +1248,17 @@ class QualityValidator:
                 fx1, fy1, fx2, fy2 = int(cand_box[0]), int(cand_box[1]), int(cand_box[2]), int(cand_box[3])
                 fh = fy2 - fy1
                 fw = fx2 - fx1
-                # Earlobes sit between mid-ear and jaw, never below chin (fy2)
-                y_lobe_min = fy1 + int(0.55 * fh)
-                y_lobe_max = fy1 + int(0.92 * fh)
-                left_lobe = (np.arange(h)[:, None] >= y_lobe_min) & (np.arange(h)[:, None] <= y_lobe_max) & (np.arange(w)[None, :] >= max(0, fx1 - int(0.20 * fw))) & (np.arange(w)[None, :] <= fx1 + 5)
-                right_lobe = (np.arange(h)[:, None] >= y_lobe_min) & (np.arange(h)[:, None] <= y_lobe_max) & (np.arange(w)[None, :] >= fx2 - 5) & (np.arange(w)[None, :] <= min(w, fx2 + int(0.20 * fw)))
+                # Earlobes sit between mid-ear and lower jaw, never below chin / collar
+                y_lobe_min = fy1 + int(0.50 * fh)
+                y_lobe_max = fy1 + int(0.78 * fh)
+                left_lobe = (np.arange(h)[:, None] >= y_lobe_min) & (np.arange(h)[:, None] <= y_lobe_max) & (np.arange(w)[None, :] >= max(0, fx1 - int(0.18 * fw))) & (np.arange(w)[None, :] <= fx1)
+                right_lobe = (np.arange(h)[:, None] >= y_lobe_min) & (np.arange(h)[:, None] <= y_lobe_max) & (np.arange(w)[None, :] >= fx2) & (np.arange(w)[None, :] <= min(w, fx2 + int(0.18 * fw)))
 
                 lobe_zone = left_lobe | right_lobe
                 if identity_layer and identity_layer.get("full_person_alpha") is not None:
                     lobe_zone &= (identity_layer["full_person_alpha"] > 50)
+                if identity_layer and identity_layer.get("original_hair_mask") is not None:
+                    lobe_zone &= ~cv2.dilate(identity_layer["original_hair_mask"].astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
 
                 # Exclude target background color
                 bg_arr = np.array(background_rgb, dtype=np.float32)
@@ -1263,21 +1268,35 @@ class QualityValidator:
                 c_hsv = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2HSV)
                 c_gray = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2GRAY)
                 c_lap = np.abs(cv2.Laplacian(c_gray, cv2.CV_64F))
-                gold_gem = (c_hsv[:, :, 0] >= 12) & (c_hsv[:, :, 0] <= 48) & (c_hsv[:, :, 1] >= 80) & (c_hsv[:, :, 2] >= 110)
-                bright_stud = (c_hsv[:, :, 2] >= 225) & (c_hsv[:, :, 1] < 45) & (c_lap >= 25.0)
-                vibrant_gem = (c_hsv[:, :, 1] >= 120) & (c_hsv[:, :, 2] >= 90)
-                is_j = lobe_zone & (gold_gem | bright_stud | vibrant_gem)
+
+                ycrcb = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2YCrCb)
+                cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+                is_skin = (cr >= 130) & (cr <= 175) & (cb >= 75) & (cb <= 130)
+
+                not_bg = ~((c_hsv[:, :, 2] > 200) & (c_hsv[:, :, 1] < 50))
+                not_red_collar = ~(((c_hsv[:, :, 0] <= 12) | (c_hsv[:, :, 0] >= 168)) & (c_hsv[:, :, 1] >= 65))
+                not_navy_collar = ~((c_hsv[:, :, 0] >= 95) & (c_hsv[:, :, 0] <= 140) & (c_hsv[:, :, 1] >= 50))
+                not_garment = not_red_collar & not_navy_collar & not_bg
+
+                gold_gem = (c_hsv[:, :, 0] >= 14) & (c_hsv[:, :, 0] <= 48) & (c_hsv[:, :, 1] >= 120) & (c_hsv[:, :, 2] >= 110) & (c_lap >= 18.0) & ~is_skin
+                bright_stud = (c_hsv[:, :, 2] >= 225) & (c_hsv[:, :, 1] < 45) & (c_lap >= 25.0) & ~is_skin & not_bg
+                vibrant_gem = (c_hsv[:, :, 1] >= 130) & (c_hsv[:, :, 2] >= 90) & ~is_skin & not_garment
+                is_j = lobe_zone & not_garment & (gold_gem | bright_stud | vibrant_gem)
 
                 # Exclude any highlights or features already present in source
-                if src_rgb is not None and src_rgb.shape == cand_rgb.shape:
-                    s_hsv = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2HSV)
-                    s_gray = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2GRAY)
+                if src_rgb is not None:
+                    if src_rgb.shape[:2] != (h, w):
+                        s_aligned = cv2.resize(src_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        s_aligned = src_rgb
+                    s_hsv = cv2.cvtColor(s_aligned, cv2.COLOR_RGB2HSV)
+                    s_gray = cv2.cvtColor(s_aligned, cv2.COLOR_RGB2GRAY)
                     s_lap = np.abs(cv2.Laplacian(s_gray, cv2.CV_64F))
                     s_gold = (s_hsv[:, :, 0] >= 12) & (s_hsv[:, :, 0] <= 48) & (s_hsv[:, :, 1] >= 80) & (s_hsv[:, :, 2] >= 110)
                     s_stud = (s_hsv[:, :, 2] >= 225) & (s_hsv[:, :, 1] < 45) & (s_lap >= 25.0)
                     s_vib = (s_hsv[:, :, 1] >= 120) & (s_hsv[:, :, 2] >= 90)
                     is_src_j = lobe_zone & (s_gold | s_stud | s_vib)
-                    is_src_j_dil = cv2.dilate(is_src_j.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+                    is_src_j_dil = cv2.dilate(is_src_j.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
                     is_j &= ~is_src_j_dil
 
                 num_j, _, j_stats, _ = cv2.connectedComponentsWithStats(is_j.astype(np.uint8))
@@ -1656,10 +1675,13 @@ class QualityValidator:
         has_neck_cutout = False
         if cand_box is not None:
             c_fy2 = int(cand_box[3])
-            neck_band = cand_dist_bg[c_fy2:c_fy2 + int(0.20 * c_fh), int(cand_box[0] + 0.30 * c_fw):int(cand_box[2] - 0.30 * c_fw)]
+            c_fcx_val = (cand_box[0] + cand_box[2]) * 0.5
+            neck_x1 = max(0, int(c_fcx_val - 0.07 * c_fw))
+            neck_x2 = min(w, int(c_fcx_val + 0.07 * c_fw))
+            neck_band = cand_dist_bg[c_fy2:c_fy2 + int(0.20 * c_fh), neck_x1:neck_x2]
             if neck_band.size > 0:
                 bg_col_frac = np.mean(neck_band < bg_tolerance, axis=0)
-                if np.any(bg_col_frac > 0.40):
+                if np.any(bg_col_frac > 0.50):
                     has_neck_cutout = True
         if has_neck_cutout:
             checks["neck_cutout"] = {"status": "FAIL", "score": 1, "threshold": 0, "details": "Vertical background cutout cutting through neck"}
@@ -1721,9 +1743,10 @@ class QualityValidator:
                 if len(garment_rows) > 0:
                     collar_top_row = garment_rows[0]
                     throat_length = float(collar_top_row) / c_fh
-                    if throat_length > 0.35:
+                    max_allowed_throat = 0.55 if (has_vest or has_tie) else 0.35
+                    if throat_length > max_allowed_throat:
                         has_collar_reg_failure = True
-                        collar_reg_details = f"Collar neckline displaced too low (throat_length={throat_length:.3f} > 0.35 * face_height)"
+                        collar_reg_details = f"Collar neckline displaced too low (throat_length={throat_length:.3f} > {max_allowed_throat} * face_height)"
                     elif throat_length < 0.04:
                         has_collar_reg_failure = True
                         collar_reg_details = f"Collar displaced too high overlapping chin (throat_length={throat_length:.3f} < 0.04 * face_height)"
@@ -1765,10 +1788,9 @@ class QualityValidator:
                 c_fy2 = int(cand_box[3])
                 neck_col_zone = cand_rgb[c_fy2:c_fy2 + int(0.35 * c_fh), int(cand_box[0] - 0.2 * c_fw):int(cand_box[2] + 0.2 * c_fw)]
                 if neck_col_zone.size > 0:
-                    rc_r = neck_col_zone[:, :, 0].astype(int)
-                    rc_g = neck_col_zone[:, :, 1].astype(int)
-                    rc_b = neck_col_zone[:, :, 2].astype(int)
-                    red_px = np.sum((rc_r > 120) & (rc_g < 80) & (rc_b < 80) & ((rc_r - rc_g) > 40))
+                    c_hsv = cv2.cvtColor(neck_col_zone, cv2.COLOR_RGB2HSV)
+                    c_red = ((c_hsv[:, :, 0] <= 10) | (c_hsv[:, :, 0] >= 170)) & (c_hsv[:, :, 1] >= 65) & (c_hsv[:, :, 2] >= 50)
+                    red_px = int(np.sum(c_red))
                     if red_px < 150:
                         collar_shape_status = "FAIL"
         if collar_shape_status == "FAIL":

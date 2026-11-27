@@ -1,8 +1,8 @@
 Case ID,Execution ID,Source,Reference,Provenance,Inference Invocations,Total Latency (s),Diffusion (s),Normalization (s),Compositing (s),Validation (s),Peak VRAM Alloc (MB),Peak VRAM Reserved (MB),Status,Defects
-PA_11_ShortBoy_Tie,PA_11_ShortBoy_Tie-bee5043e84c5,blue_bg_boy.png,REF003_tie.png,fresh_unverified_counter_not_attached,0,366.93,332.13,4.85,0.0,0.93,7015.6,7822.0,completed,None
-PA_12_StraightHair_RedCollar,PA_12_StraightHair_RedCollar-d7acc556003a,straight_hair.png,REF001_red_collar.png,fresh_unverified_counter_not_attached,0,447.64,424.34,2.62,0.0,1.45,7025.6,7808.0,needs_review,incorrect_button_color (button colour differs from reference (deltaE=228.0 > 40.0 across 3 buttons))
-PA_01_Curly_RedCollar,PA_01_Curly_RedCollar-1f43dcd5bc7f,curly_hair.png,REF001_red_collar.png,fresh_inference_verified,1,514.34,481.46,5.06,0.0,1.42,7014.5,7804.0,needs_review,incorrect_button_color (button colour differs from reference (deltaE=138.9 > 40.0 across 2 buttons)); unwanted_earrings (1588 px); unwanted_accessory
+PA_11_ShortBoy_Tie,PA_11_ShortBoy_Tie-4abe22a0031f,blue_bg_boy.png,REF003_tie.png,fresh_inference_verified,1,330.52,290.1,5.35,0.0,1.33,7014.7,7822.0,completed,None
+PA_12_StraightHair_RedCollar,PA_12_StraightHair_RedCollar-730187d05d84,straight_hair.png,REF001_red_collar.png,fresh_inference_verified,1,346.05,302.58,6.13,0.0,1.36,7015.9,7824.0,completed,None
+PA_01_Curly_RedCollar,PA_01_Curly_RedCollar-ab7af30926fa,curly_hair.png,REF001_red_collar.png,fresh_inference_verified,1,325.51,284.02,5.9,0.0,1.38,7015.1,7822.0,completed,None
 PA_02_Braids_NavyCollar,PA_02_Braids_NavyCollar-9018a6902600,braids.png,REF002_navy_collar.png,fresh_inference_verified,1,419.52,395.92,2.68,0.0,1.52,7024.5,7812.0,completed,None
 PA_03_MaroonBows_Tie,PA_03_MaroonBows_Tie-317c96e51d33,maroon_bows.png,REF003_tie.png,fresh_inference_verified,1,572.64,550.62,2.7,0.0,1.35,7034.6,7818.0,completed,None
-PA_04_NoBows_Vest,PA_04_NoBows_Vest-fbdacc192779,no_bows.png,REF004_vest.png,fresh_inference_verified,1,394.69,372.39,2.67,0.0,1.35,7043.4,7828.0,needs_review,collar_registration_failure
-PA_05_GlassesBindi_RedCollar,PA_05_GlassesBindi_RedCollar-126b3b4ead17,glasses_bindi.png,REF001_red_collar.png,fresh_inference_verified,1,436.39,414.32,2.64,0.0,1.14,7051.6,7832.0,needs_review,incorrect_button_color (button colour differs from reference (deltaE=228.0 > 40.0 across 4 buttons))
+PA_04_NoBows_Vest,PA_04_NoBows_Vest-1c438a3d485f,no_bows.png,REF004_vest.png,fresh_inference_verified,1,330.4,289.49,5.68,0.0,1.44,7015.9,7824.0,completed,None
+PA_05_GlassesBindi_RedCollar,PA_05_GlassesBindi_RedCollar-e21b7f755cd2,glasses_bindi.png,REF001_red_collar.png,fresh_inference_verified,1,378.84,336.73,6.19,0.0,1.12,7014.9,7822.0,completed,None

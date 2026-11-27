@@ -65,9 +65,26 @@ class IdentityExtractor:
 
         # Hair proximity zone: accessories sit directly on or touching the hair/braid silhouette
         hair_dil = cv2.dilate(hair_mask.astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)
-        corner_bg = np.concatenate([rgb[:30, :30], rgb[:30, -30:]])
-        is_light_bg = float(np.mean(corner_bg)) > 180.0
-        is_ambient_bg = ((rgb[:, :, 0] > 195) & (rgb[:, :, 1] > 195) & (rgb[:, :, 2] > 195)) if is_light_bg else np.zeros((h, w), dtype=bool)
+        # 2. Chromatic and textural distinction from scalp/hair
+        # Bows, ribbons and clips contrast strongly with natural hair in hue, saturation, or value.
+        # Scalp hair itself and ambient backdrop fringes must NEVER be classified as an accessory.
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        hue = hsv[:, :, 0]
+
+        corner_bg = np.concatenate([rgb[:30, :30], rgb[:30, -30:], rgb[-30:, :30], rgb[-30:, -30:]])
+        bg_rgb_est = np.median(corner_bg.reshape(-1, 3), axis=0)
+        bg_hsv_est = cv2.cvtColor(np.array([[bg_rgb_est.astype(np.uint8)]], np.uint8), cv2.COLOR_RGB2HSV)[0, 0]
+        is_colored_bg = (bg_hsv_est[1] >= 40)
+
+        if is_colored_bg:
+            bg_h_diff = np.abs(hue.astype(float) - float(bg_hsv_est[0]))
+            bg_h_diff = np.minimum(bg_h_diff, 180.0 - bg_h_diff)
+            bg_dist_px = np.linalg.norm(rgb.astype(float) - bg_rgb_est[None, None, :], axis=2)
+            is_ambient_bg = (bg_h_diff <= 18.0) & (sat >= 30) & (bg_dist_px < 65.0)
+        else:
+            is_ambient_bg = (np.linalg.norm(rgb.astype(float) - bg_rgb_est[None, None, :], axis=2) < 40.0) | ((val > 195) & (sat < 35))
 
         # Distinguish garment fabric from accessories resting on the torso:
         # Measure garment core color (away from hair)
@@ -87,14 +104,6 @@ class IdentityExtractor:
         # Note: SCHP label 1 is HAT/HOOD and must NOT be classified as hair accessories!
         sem_acc = np.isin(schp_labels, (4, 18))
 
-        # 2. Chromatic and textural distinction from scalp/hair
-        # Bows, ribbons and clips contrast strongly with natural hair in hue, saturation, or value.
-        # Scalp hair itself must NEVER be classified as an accessory.
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1]
-        val = hsv[:, :, 2]
-        hue = hsv[:, :, 0]
-
         if np.any(hair_mask):
             hair_h = float(np.median(hue[hair_mask]))
             hair_sat = float(np.median(sat[hair_mask]))
@@ -106,12 +115,12 @@ class IdentityExtractor:
         color_diff = np.minimum(color_diff, 180.0 - color_diff)
 
         # Colored accessories (blue, red, green, pink, yellow, maroon ribbons/bows):
-        # Must have significant hue deviation (> 14 deg) from natural hair OR higher saturation (> 35 above hair)
-        is_chromatic_diff = (color_diff > 14.0) | ((sat.astype(float) - hair_sat) > 35.0)
-        chromatic_cand = is_chromatic_diff & (sat >= 50) & (val >= 40) & acc_corridor
+        # Must have significant hue deviation (> 25 deg) from natural hair OR high saturation (> 80)
+        is_chromatic_diff = ((color_diff > 25.0) & (sat >= 70)) | (sat >= 90)
+        chromatic_cand = is_chromatic_diff & (val >= 40) & acc_corridor
         # Bright light accessories (white/pearlescent barrettes, clips, ribbons):
         # Must be located within genuine hair boundary and distinct from ambient backdrop
-        bright_cand = (val >= 210) & ((val - hair_v) > 65.0) & hair_mask & ~is_ambient_bg
+        bright_cand = (val >= 210) & ((val - hair_v) > 65.0) & (sat < 45) & hair_mask & ~is_ambient_bg
 
         # Foreground check via BiRefNet alpha
         if birefnet_alpha is not None:
@@ -158,11 +167,25 @@ class IdentityExtractor:
             comp_rgb = rgb[closed_comp]
             med_rgb = np.median(comp_rgb, axis=0).astype(np.uint8) if len(comp_rgb) > 0 else np.array([0, 0, 0], dtype=np.uint8)
 
-            # V12.5 Task 4: Do not classify dark dull scalp hair, scan discoloration,
-            # or ambient white backdrop as hair accessories!
-            is_ambient_white = is_light_bg and (med_rgb[0] > 190 and med_rgb[1] > 190 and med_rgb[2] > 190)
-            is_dull_dark = (med_rgb[0] < 90) and (med_rgb[1] < 80) and (med_rgb[2] < 75) and (int(max(med_rgb)) - int(min(med_rgb)) < 25)
-            if is_ambient_white or is_dull_dark:
+            # Filter out ambient backdrop, matting fringe, or natural dull scalp hair:
+            comp_hsv = cv2.cvtColor(np.array([[med_rgb]], np.uint8), cv2.COLOR_RGB2HSV)[0, 0]
+            if is_colored_bg:
+                h_diff_bg = min(abs(int(comp_hsv[0]) - int(bg_hsv_est[0])), 180 - abs(int(comp_hsv[0]) - int(bg_hsv_est[0])))
+                comp_dist_bg = float(np.linalg.norm(med_rgb.astype(float) - bg_rgb_est))
+                if h_diff_bg <= 18 and comp_dist_bg < 65.0:
+                    continue  # Backdrop spill / hair fringe
+            else:
+                if float(np.linalg.norm(med_rgb.astype(float) - bg_rgb_est)) < 40.0:
+                    continue
+                if comp_hsv[1] < 35 and comp_hsv[2] > 185:
+                    continue  # White/light backdrop
+
+            # Filter natural scalp hair (low saturation dull brown/black/grey hair):
+            r_c, g_c, b_c = int(med_rgb[0]), int(med_rgb[1]), int(med_rgb[2])
+            max_c, min_c = max(r_c, g_c, b_c), min(r_c, g_c, b_c)
+            sat_ratio = (max_c - min_c) / max(1, max_c)
+            is_dull_scalp_hair = (max_c < 125) and (sat_ratio < 0.52) and (r_c - g_c < 32) and (g_c - b_c < 25)
+            if is_dull_scalp_hair:
                 continue
 
             obj_entry = {
@@ -452,7 +475,7 @@ class IdentityExtractor:
         if acc_objects:
             for obj in acc_objects:
                 a_area = obj["area"]
-                if a_area < 80:
+                if a_area < 500:
                     continue
                 c_x, c_y = obj["centroid"]
                 side_tag = "left_bow" if c_x < fcx else "right_bow"

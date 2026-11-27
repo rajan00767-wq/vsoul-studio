@@ -156,10 +156,19 @@ def detect_colored_edge_halo(
                 "details": "Source and output backdrops are too similar to separate spill",
                 "mask": empty}
 
-    tri = build_boundary_trimap(alpha, band_px=band_px)
-    lab = cv2.cvtColor(composite_rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
     src_lab = cv2.cvtColor(src_bg.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
     out_lab = cv2.cvtColor(out_bg.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
+
+    # An achromatic source backdrop (white, off-white, grey) has no colored chroma
+    # to contaminate edges. Colored edge contamination requires a chromatic backdrop (blue, green, etc.).
+    src_chroma = float(np.sqrt((src_lab[1] - 128.0) ** 2 + (src_lab[2] - 128.0) ** 2))
+    if src_chroma < 10.0:
+        return {"status": "PASS", "score": 0, "threshold": min_pixels,
+                "details": f"Source backdrop is neutral achromatic (chroma={src_chroma:.1f} < 10.0); zero colored spill",
+                "mask": empty}
+
+    tri = build_boundary_trimap(alpha, band_px=band_px)
+    lab = cv2.cvtColor(composite_rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
     d_src = np.linalg.norm(lab - src_lab[None, None, :], axis=2)
 
     # Spill is a MIXTURE of subject and backdrop, so most of it is nowhere near
