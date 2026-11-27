@@ -1,142 +1,193 @@
-# Comprehensive Pipeline Fix History: V12.8 through V13.2
+# FIX_HISTORY
 
-This document provides a chronological engineering record of all defects, root cause diagnoses, code modifications, and verification outcomes leading to production stabilization.
-
----
-
-## V13.2 — Independent Verification, Universal Uniform Generalization & Identity-Preserving Studio Portrait Reposing
-
-### 1. Mandatory Quality Gate Defect Injection Suite (`scripts/verify_quality_gates.py` & `quality_validator.py`)
-- **Defect**: An independent audit noted that earlier gate tests for `collar_registration_failure`, `incorrect_uniform_type`, and `unresolved_requested_restoration` lacked genuine negative defect injections.
-- **Root Cause**:
-  1. `collar_registration_failure`: Relied on facial landmark geometry RMSE instead of anatomical neck/throat collar positioning, causing misregistered collars with good facial landmarks to pass.
-  2. `incorrect_uniform_type`: Checked only red collar thresholds rather than validating against all uniform reference attributes.
-  3. `unresolved_requested_restoration`: Did not verify that specific requested identity defects (glare, blemish, scratches) were removed.
-- **Engineering Fix**:
-  1. Implemented anatomical collar registration measurement in `quality_validator.py`: Measures visible throat length bounds `[0.04 * fh, 0.35 * fh]` and horizontal center offset `<= 0.16 * fw` independently of facial ArcFace similarity.
-  2. Implemented dynamic uniform candidate validation against reference cues (`has_red_collar`, `has_navy_collar`, `has_tie`, `has_vest`).
-  3. Implemented requested restoration verification: Inspects specular glare (L > 248) and localized defect masks.
-  4. Constructed an exhaustive dual-condition test suite testing both positive clean conditions (22/22) and negative defect injections (22/22).
-- **Outcome**: **44 / 44 PASSED (100% Accuracy)**:
-  - True Positives (TP): 22 / 22 (100% defect detection).
-  - True Negatives (TN): 22 / 22 (Zero false alarms on clean baseline).
-  - False Positives (FP): 0. False Negatives (FN): 0.
-  - Precision: 100.00%. Recall: 100.00%. Specificity: 100.00%.
-  - Final Delivery Rejection Rate on Defects: 100.00%.
+Chronological record of defects, root causes and resolutions. Every entry below
+was reproduced against a real generated artifact before it was changed, and
+re-measured against that same artifact afterwards.
 
 ---
 
-### 2. Strict `force_regenerate` Cache Policy Enforcement (`orchestrator.py` & `cache_manager.py`)
-- **Defect**: In earlier implementations, passing an explicit `cached_raw_candidate` could potentially bypass generative diffusion even when `raw_diffusion_cache_policy == "force_regenerate"`.
-- **Root Cause**: The orchestrator evaluated `cached_raw_candidate` before inspecting the cache policy override.
-- **Engineering Fix**:
-  - In `pipelines/uniform_swap/orchestrator.py`, strictly enforced:
-    ```python
-    if config.raw_diffusion_cache_policy == "force_regenerate":
-        cached_raw_candidate = None
-        raw_vae_img = None
-        cache_hit = False
-        fresh_inference = True
-    ```
-  - Added unit test suite `tests/test_force_regenerate_policy.py` verifying:
-    1. `test_force_regenerate_cannot_be_bypassed_by_explicit_candidate`: PASS.
-    2. `test_production_accepts_verified_provenance_manifest`: PASS.
-    3. `test_production_rejects_candidate_without_manifest`: PASS.
-    4. `test_production_rejects_mismatched_reference_provenance`: PASS.
-    5. `test_diagnostic_mode_permits_legacy_candidate`: PASS.
-- **Outcome**: 5 / 5 automated unit tests PASSED. Cache bypass is strictly impossible.
+## V13.3.1 (2026-11-27)
+
+### FIX-01 — `incomplete_shoulders` false positive on garments near the backdrop colour
+
+**Symptom**: REG_05 (`blue_bg_boy.png` + `REF003_tie.png`) was gated
+`needs_review` with `incomplete_shoulders`, blocking delivery of a portrait
+whose shoulders are visibly complete.
+
+**Reproduction**: `outputs/unseen_regression/REG_05_ShortBoy_Tie_debug/19_final_quality_validation.json`
+→ `{"status": "FAIL", "score": 70, "threshold": 280}`.
+
+**Root cause**: `quality_validator.py` gate 6 measured
+
+```python
+shoulder_fg = np.sum(cand_dist_bg[int(h * 0.85), :] > bg_tolerance)
+```
+
+`cand_dist_bg` is distance from the *configured background colour*. REG_05 is a
+white shirt on a white backdrop. Measured on the delivered RGBA:
+
+| measurement at y = 0.85 h | value |
+| :--- | ---: |
+| alpha foreground width | 800 / 800 px |
+| colour-distance width (tol 30) | 70 px |
+
+The gate was measuring shirt-vs-backdrop contrast and calling it anatomy. It
+would fire on any white, cream or pale-grey uniform, and on any garment near
+the customer's chosen backdrop colour.
+
+**Fix**: `_measure_shoulder_extent()` measures from the person alpha
+(`full_person_alpha`, else the candidate's own alpha channel), intersected with
+a **tight** colour tolerance of 4 rather than 30. Erased regions sit exactly on
+the backdrop value; real fabric never does (REG_05: 796 px differ by >4, only
+70 px by >30). The threshold is now anatomy-relative (1.6 × measured face
+width) instead of a fixed 0.35 × canvas width, so narrow children, broad
+adults, rotated shoulders and different passport output sizes are judged
+against the subject's own build.
+
+**Verification**: REG_05 real artifact 800 ≥ 547 → PASS; alpha-clipped variant
+127 < 547 → FAIL; RGB-painted-out variant still FAIL. Gate injection still
+detected (44/44). Fresh re-run PA_11 delivered with **0 defects**.
 
 ---
 
-### 3. Cryptographic Candidate Provenance Enforcement (`cache_manager.py`)
-- **Defect**: Candidate images supplied externally lacked cryptographic proof of origin, risking delivery of unverified or mismatched candidates.
-- **Root Cause**: Candidates were matched by filename or heuristic color matching rather than end-to-end cryptographic hashing.
-- **Engineering Fix**:
-  - Implemented 13-field cryptographic provenance manifest in `cache_manager.py`:
-    `original_source_sha256`, `normalized_source_sha256`, `uniform_ref_sha256`, `conditioning_image_sha256`, `effective_prompt_sha256`, `negative_prompt_sha256`, `model_version`, `lora_version`, `inference_resolution`, `seed`, `steps`, `guidance_parameters`, `candidate_image_sha256`.
-  - In production mode, any candidate lacking a verified manifest or with mismatched SHA256 hashes is strictly rejected. Legacy candidates are allowed only in explicit `diagnostic_mode=True`.
-- **Outcome**: Cryptographic proof of candidate provenance enforced across all production pipelines.
+### FIX-02 — `collar_registration_failure` false positive from sleeve trim
+
+**Symptom**: REG_06 (`straight_hair.png` + `REF001_red_collar.png`) gated with
+`Collar center offset horizontally from facial axis (offset=0.339 > 0.16)`,
+although the collar is correctly placed.
+
+**Root cause**: the check took the centroid of *every* red pixel in a window
+±0.50 face widths wide. REF001 has a red Peter Pan collar **and red sleeve
+cuffs**. The red histogram across that window was bimodal:
+
+```
+x:  226  254  283  311  340  368  397  425  454  482  511  539
+n:   41   57    0    0   27  111  188   44    0  162 1002  993
+         ^ collar (near the face axis)              ^ sleeve cuff
+```
+
+76% of the red was sleeve trim. A centroid over two separated clusters lands
+between them, far from the axis. The check also only ran for red collars and
+reported facial-landmark RMSE as its score.
+
+**Fix**: `_measure_collar_symmetry()` compares left- and right-side collar
+attachment about the facial axis, inside the neck corridor only
+(y ∈ [chin − 0.20 fh, chin + 0.25 fh], x within ±0.55 fw, which excludes cuffs
+and shoulder piping). It is colour-agnostic: the collar colour comes from the
+reference analyzer's measured CIELAB value, so pointed, rounded, Peter Pan,
+mandarin, polo and open collars in any colour are handled identically. When the
+reference collar is not separable from its own body fabric it returns
+**UNCERTAIN**, never an unmeasured pass.
+
+**Verification**: REG_06 real artifact imbalance 0.048 → PASS; one-sided collar
+1.000 → FAIL; green collar → PASS; collar-equals-body → UNCERTAIN. The
+collar-displacement injection is still caught by the throat-length branch.
 
 ---
 
-### 4. Universal Uniform Generalization & Decoupled Garment Assumptions (`uniform_generator.py` & `compositor.py`)
-- **Defect**: Hardcoded assumptions assumed red collar implied absence of red placket, and synthesized black buttons unconditionally.
-- **Root Cause**: Heuristics were tied to `REF001` test cases rather than extracted reference attributes.
-- **Engineering Fix**:
-  - In `uniform_generator.py`, decoupled visual cue extraction: Removed filename strings and extracted 15 independent attributes (`collar_shape`, `collar_color`, `placket_presence`, `placket_color`, `button_presence`, `button_color`, `button_size`, `button_spacing`, `closure_type`, `fabric_pattern`, `pocket`, `badge`, `tie`, `vest`, `sleeve_trim`).
-  - In `compositor.py`, red plackets are inpainted only if reference collar is red AND reference placket is NOT red (`ref_has_red_collar and not ref_has_red_placket`). Genuine red placket designs are fully preserved.
-  - Black buttons are synthesized only if the reference genuinely contains visible black buttons (`ref_has_buttons and ref_btn_color == "black"`).
-  - Restricted inpainting: Telea repair is capped at <= 12% of garment area. Larger repairs are gated to `needs_review`.
-- **Outcome**: Zero test-ID or filename specific production logic. Generalizes across arbitrary uniform reference designs.
+### FIX-03 — `incorrect_button_color` measured fabric, not buttons
+
+**Symptom**: REG_06 gated `incorrect_button_color (white buttons generated
+instead of black)`.
+
+**Root cause**: the check counted *pixels* brighter than 195 inside a 60 px
+strip and failed when >1500 of them appeared with <20 dark pixels. Measured on
+REG_06 with the real detected face box: **dark = 1, white = 4856** — every one
+of those 4856 pixels a white square of REF001's gingham check. The threshold
+was a property of the fabric, not of the buttons. The branch also only existed
+for `expected_btn == "black"`; white, gold or fabric-matched buttons were never
+checked and silently passed.
+
+**Fix**: buttons are detected as **blobs** by `measure_button_blobs()`, shared
+by the reference analyzer and the candidate validator so both sides measure
+identically: components thresholded on CIELAB deviation from the placket's own
+median cloth colour, filtered by size, roundness, solidity and proximity to the
+placket centreline, sampled at the blob **interior** (the rim blends button and
+cloth), then the colour the largest blobs agree on. Comparison is ΔE76 against
+the reference's measured button colour, with **UNCERTAIN** when fewer than two
+buttons can be isolated. No colour is hardcoded.
+
+Two intermediate implementations were rejected by measurement before this one:
+a plain dominant-colour estimate returned the gingham (REF001 → RGB 188,196,216
+instead of near-black), and Otsu over a local-contrast image returned the
+fabric again on PA_12 (reported *white* buttons for a placket whose buttons are
+plainly dark navy, RGB 46,54,67).
+
+**Verification**: REF001 reference buttons measure RGB (27,29,33) ≈ black, which
+matches the visible garment. PA_12's candidate buttons measure (46,54,67) and
+correctly compare as a match. White-on-mid-tone vs black reference → FAIL; gold
+vs gold → PASS; no buttons → UNCERTAIN; black buttons on gingham → measured
+dark, not bright.
 
 ---
 
-### 5. Identity-Preserving Studio Reposing & 12 Studio Quality Gates (`pose_analyzer.py` & `quality_validator.py`)
-- **Defect**: Tilted head poses, uneven shoulders, and off-camera gaze degraded studio portrait uniformity.
-- **Root Cause**: Pipeline previously accepted whatever pose was in the source image or attempted diffusion-based rotation which caused identity drift.
-- **Engineering Fix**:
-  - Created `pose_analyzer.py`:
-    1. InsightFace Buffalo_L 2D-106 and 3D-68 biometric pose estimation: Computes head roll, yaw, pitch, gaze deviation, shoulder tilt, and neck alignment offset.
-    2. Adaptive routing:
-       - Route A (Studio Ready): `|roll| <= 3.0 deg` -> Direct pass.
-       - Route B (Geometric Alignment Transform): `3.0 deg < |roll| <= 15.0 deg` -> Aspect-ratio-preserving 2D similarity transform around facial center.
-       - Route C (Needs Review): `|roll| > 15.0 deg` -> Flagged for manual review.
-    3. Produced 9 authoritative Corrected Identity Master artifacts.
-    4. Bilateral shadow lifting and specular highlight compression with natural chin cast shadow retention.
-  - Implemented 12 Authoritative Studio Quality Gates in `quality_validator.py`:
-    1. `excessive_head_roll`: `|roll| > 15.0 deg`
-    2. `excessive_head_yaw`: `|yaw| > 20.0 deg`
-    3. `excessive_head_pitch`: `|pitch| > 20.0 deg`
-    4. `off_camera_gaze`: `gaze_deviation_deg > 20.0 deg`
-    5. `unnatural_eye_alignment`: `eye_alignment_delta > 0.040`
-    6. `asymmetric_shoulders`: `shoulder_tilt_deg > 12.0 deg`
-    7. `pose_correction_identity_drift`: ArcFace similarity < 0.90
-    8. `facial_geometry_distortion`: Landmark RMSE > 0.040
-    9. `unnatural_neck_alignment`: `neck_alignment_offset > 0.15`
-    10. `face_neck_lighting_mismatch`: `|mean_L_face - mean_L_neck| > 35`
-    11. `unresolved_harsh_sunlight`: Face specular highlights with L > 245 over > 300 px
-    12. `original_pose_reintroduced`: Candidate roll deviates from corrected target by > 4.0 deg
-- **Outcome**: **13 / 13 PASSED** in `tests/test_studio_quality_gates.py` (clean baseline passes 100%, all 12 negative defect injections trigger FAIL).
+### FIX-04 — Recovery could ship a defect the candidate never had
+
+**Root cause**: `RecoveryController` accepted any attempt whose defect **count**
+decreased. An attempt removing two defects while introducing a third was
+therefore accepted, shipping a new defect.
+
+**Fix**: any attempt that introduces a defect type absent from the pre-repair
+set is rejected and rolled back, compared on `_defect_key()` so the same defect
+at a different measurement is not mistaken for a new one.
 
 ---
 
-### 6. Multi-Size Passport Crop Verification & Multi-Background Independence (`image_normalizer.py`)
-- **Defect**: Aspect-ratio rounding could induce slight vertical vs horizontal scaling distortion, and bottom padding risked floating torsos.
-- **Engineering Fix**:
-  - Implemented integer crop optimization in `produce_passport_crop` minimizing `|out_w / crop_w - out_h / crop_h|`.
-  - Guaranteed $|\text{scale}_x - \text{scale}_y| < 0.001$ strictly across all customer dimensions:
-    - `800x1024` (Standard baseline)
-    - `800x1000` (4:5 Aspect Ratio)
-    - `700x900` (7:9 Aspect Ratio)
-    - `413x531` (Standard 35x45mm at 300 DPI)
-  - Bottom anchoring: `pad_bottom` is strictly 0.
-  - Verified clean RGBA compositing across 8 required colors (White `#FFFFFF`, Royal Blue `#047EF6`, Sage Green `#77BF91`, Light Blue `#ADD8E6`, Studio Grey `#D3D3D3`, Warm Cream `#F5E6D3`, Custom Dark Red `#8B0000`, Black `#000000`).
-- **Outcome**: **PASSED (2/2)** in `tests/test_passport_and_multibackground.py`.
+### FIX-05 — Shoulder "reconstruction" was rectangular expansion
+
+**Root cause**: `_repair_incomplete_shoulders` pushed every torso row out to
+fixed canvas fractions (0.12 w / 0.88 w) — the naive expansion the V13.3.1
+specification prohibits. It squares the silhouette, overrides the subject's
+build, and on a rotated portrait widens each side by a different wrong amount.
+
+**Fix**: the outer shoulder contour is convex — it widens as it descends, then
+flattens, and never narrows and widens again. The repair computes the **lower
+convex hull** of each side's edge profile; rows bulging inside that hull are
+the clipped stretch, and the hull supplies the slope to restore them to.
+Gross one-sided loss (reach asymmetry > 0.45 about the face axis) and
+deficits > 18% of torso area are **declined** and routed to review rather than
+inpainted into visible distortion.
+
+A running-extreme envelope and a straight-line fit were both tried and rejected
+by measurement: for a monotonically widening edge the running extreme always
+equals the current value and detects nothing, and a line fitted through a
+contour that plateaus predicts an ever-widening body and "repairs" an intact
+silhouette. Verified against ground truth: hull 75.0 vs true 75, 58.8 vs 59.
 
 ---
 
-## V13.3 Production Quality Stabilization and Intelligent Defect Recovery
+### FIX-06 — Uniform fidelity hardcoded to red and navy
 
-### 7. Dynamic Uniform Reference Analysis (`reference_analyzer.py`)
-- **Defect**: Static prompt cues and hardcoded uniform logic misclassified uniform collars (e.g., white canvas padding margins were detected as white shirt collars with ties).
-- **Engineering Fix**:
-  - Built `UniformReferenceAnalyzer` dynamically extracting 15 independent attributes (primary/secondary colors, fabric pattern type, scale, buttons, collar shape, placket, ties, vests).
-  - Analyzed raw reference RGBA foreground directly, excluding transparent margins and outer padding.
-  - Added SHA-256 caching per reference image.
-- **Outcome**: **PASSED (3/3)** in `tests/test_v13_3_components.py`.
+**Root cause**: `fidelity_validator.py` branched on the literal strings `"red"`
+and `"navy blue"` with hand-tuned RGB/HSV windows. Every other collar colour
+fell through to `{"status": "PASS", "score": 1, "threshold": 1}` — an
+unmeasured pass. This is why "universal uniform support" could be asserted
+while only two colours were ever verified.
 
-### 8. Uniform Fidelity Validation & Defect Recovery Controller (`fidelity_validator.py`, `recovery_controller.py`)
-- **Defect**: Inpainting under long braids triggered excessive garment inpainting (>12%), and candidates with minor shoulder clipping were rejected without opportunity for recovery.
-- **Engineering Fix**:
-  - Masked out deep interior of authentic braids (`cv2.erode(braids_m, 11)`) during candidate hair inpainting.
-  - Built `RecoveryController` implementing targeted bilateral lateral shoulder expansion, neck shadow lifting, and halo de-fringing (max 2 cycles).
-  - Protected facial pixels via biometric rollback during any repair action.
-- **Outcome**: Successfully recovered transient shoulder gaps and validated across regression suite.
+**Fix**: CIELAB ΔE76 comparison against the reference's measured collar colour
+(tolerance 28, which absorbs fabric shading and white balance while separating
+one garment colour from another), falling back to the legacy branches only for
+specs predating `collar_lab`, and returning **UNCERTAIN** when nothing can be
+measured. Button fidelity routes through the same shared blob detector.
 
-### 9. Elimination of Natural Head Roll & Eye Alignment False Positives (`quality_validator.py`)
-- **Defect**: Candidates with natural head roll or eye orientation from the source portrait failed studio gates (`excessive_head_roll`, `unnatural_eye_alignment`) because `src_roll` defaulted to 0.0 when `identity_layer["pose_analysis"]` was missing.
-- **Engineering Fix**:
-  - Extracted authentic natural head roll and eye orientation directly from `src_faces[0].kps`.
-  - Allowed matching candidate head roll and eye tilt when preserving authentic source anatomy (`abs(c_roll - src_roll) <= 4.0 deg` and `abs(c_eye_align - src_eye_align) <= 0.020`).
-  - Strict defect injection tests remain 100% active when artificial defects are injected.
-- **Outcome**: `44/44` Quality Gates PASSED (100% TP, 100% TN, 0 FP, 0 FN). 24/24 unit tests PASSED. Zero false-positive delivery rejections on uncorrected natural head tilts.
+---
+
+### FIX-07 — Regression runner could not prove fresh inference
+
+**Root cause**: `scripts/run_unseen_regression.py` runs with
+`raw_diffusion_cache_policy="authoritative_cache"`, `diagnostic_mode=True` and
+an explicit `cached_raw_candidate`, so it replays stored candidates and never
+invokes Qwen. Its 15–35 s timings were published as pipeline performance.
+`scripts/benchmark_fresh_inference.py` has a related defect: when a prior trace
+exists it parses that instead of running, yet still writes
+`Fresh Inference: True` together with **hardcoded** VRAM constants
+(`peak_alloc = 5824.0`), which is why every row of the old
+`FRESH_INFERENCE_BENCHMARK.csv` shares identical VRAM figures.
+
+**Fix**: new `scripts/run_production_acceptance.py` pins
+`force_regenerate` / `diagnostic_mode=False` / `cached_raw_candidate=None`,
+counts real generator invocations by patching `UniformGenerator.generate` on the
+**class** (the orchestrator binds the singleton at import, so patching the
+module attribute would never be seen), checks the raw candidate file was
+rewritten during the run, records SHA-256 hashes and a unique execution id per
+case, writes a JSONL provenance manifest, and is resumable.

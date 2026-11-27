@@ -1,4 +1,26 @@
-"""Unseen Generalization Regression Test Suite (V13.3 Section 15).
+"""Unseen Generalization Regression Test Suite (CACHE REPLAY - NOT FRESH INFERENCE).
+
+!! READ THIS BEFORE QUOTING ANY TIMING FROM THIS SCRIPT !!
+
+This suite runs with ``raw_diffusion_cache_policy="authoritative_cache"``,
+``diagnostic_mode=True`` and an explicit ``cached_raw_candidate``. It therefore
+REPLAYS previously generated Qwen candidates and does not invoke the model.
+Its per-case durations (15-35 s) cover compositing, validation and cropping
+only. Fresh inference on the same hardware measures 367-514 s - an order of
+magnitude more - so presenting these numbers as pipeline performance, as the
+V13.3 reports did, is wrong.
+
+Keep using this suite for fast iteration on compositing and gating logic. For
+anything that must prove the model actually ran, use:
+
+    .venv/Scripts/python.exe scripts/run_production_acceptance.py
+
+which pins force_regenerate / diagnostic_mode=False / no cached candidate,
+counts real generator invocations and records candidate provenance.
+
+Original description follows.
+
+Unseen Generalization Regression Test Suite (V13.3 Section 15).
 
 Tests comprehensive generalization across unseen real-world conditions:
 1. Scanned historical photo inputs (T041 scanned.png)
@@ -85,7 +107,11 @@ def create_comparison_sheet(
 
 def run_unseen_regression():
     print("=" * 105)
-    print("V13.3 UNSEEN GENERALIZATION REGRESSION TEST SUITE & INTELLIGENT RECOVERY")
+    print("UNSEEN GENERALIZATION REGRESSION SUITE - CACHE REPLAY MODE")
+    print("=" * 105)
+    print("WARNING: this suite replays cached Qwen candidates and does NOT run inference.")
+    print("         Durations below are compositing + validation only, NOT inference latency.")
+    print("         For verified fresh inference use scripts/run_production_acceptance.py")
     print("=" * 105)
 
     test_matrix = [
@@ -278,7 +304,12 @@ def run_unseen_regression():
     # Generate UNSEEN_REGRESSION_REPORT.md
     report_md = Path("UNSEEN_REGRESSION_REPORT.md")
     with open(report_md, "w", encoding="utf-8") as f:
-        f.write("# V13.3 Unseen Generalization Regression Test Report\n\n")
+        f.write("# Unseen Generalization Regression Test Report (CACHE REPLAY)\n\n")
+        f.write("> **These timings are not inference performance.** This suite replays cached Qwen\n")
+        f.write("> candidates (`authoritative_cache`, `diagnostic_mode=True`) and never invokes the\n")
+        f.write("> model. Durations cover compositing, validation and cropping only. Verified fresh\n")
+        f.write("> inference on the same hardware measures 367-514 s per image - see\n")
+        f.write("> `PERFORMANCE_PROFILING_REPORT.md` and `scripts/run_production_acceptance.py`.\n\n")
         f.write("## Overview\n")
         f.write("Comprehensive regression evaluation across unseen real-world portraits, challenging conditions, ")
         f.write("multiple uniform categories (red collar, navy collar, necktie, vest), and multiple background colors.\n\n")

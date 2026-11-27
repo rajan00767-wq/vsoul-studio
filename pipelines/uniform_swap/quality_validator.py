@@ -20,6 +20,243 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _candidate_foreground_mask(
+    candidate_image: Any,
+    identity_layer: Optional[Dict[str, Any]],
+    cand_dist_bg: np.ndarray,
+    bg_tolerance: float,
+) -> Tuple[Optional[np.ndarray], str]:
+    """Return the best available person/foreground mask and the basis used.
+
+    Preference order: the pipeline's own person alpha, then the candidate's own
+    alpha channel, then (last resort) distance from the backdrop colour. The
+    colour fallback is unreliable whenever the garment is near the backdrop
+    colour - a white shirt on a white backdrop measures as background - so the
+    basis string is reported in the check details and callers relax thresholds
+    when it is in play.
+    """
+    if identity_layer and identity_layer.get("full_person_alpha") is not None:
+        return (np.asarray(identity_layer["full_person_alpha"]) > 30), "person_alpha"
+    if isinstance(candidate_image, Image.Image) and candidate_image.mode == "RGBA":
+        return (np.asarray(candidate_image)[:, :, 3] > 30), "candidate_alpha"
+    if isinstance(candidate_image, np.ndarray) and candidate_image.ndim == 3 and candidate_image.shape[2] == 4:
+        return (candidate_image[:, :, 3] > 30), "candidate_alpha"
+    if cand_dist_bg is not None:
+        return (cand_dist_bg > bg_tolerance), "background_colour_distance"
+    return None, "unavailable"
+
+
+def _measure_button_fidelity(
+    cand_rgb: np.ndarray,
+    ref_cues: Dict[str, Any],
+    cand_box: Optional[Any],
+    h: int,
+    w: int,
+) -> Dict[str, Any]:
+    """Compare candidate placket buttons against the reference's measured buttons.
+
+    Buttons are found as small, compact connected components along the placket
+    centreline that contrast with their immediate surroundings - not as a raw
+    count of dark or light pixels, which on a patterned fabric measures the
+    pattern. Works for any button colour; returns UNCERTAIN when too few blobs
+    are present to judge, so an unmeasurable attribute is never silently passed.
+    """
+    from pipelines.uniform_swap.reference_analyzer import _lab_delta
+
+    if cand_box is None:
+        return {"status": "UNCERTAIN", "score": 0, "threshold": 0, "details": "No face box; placket not locatable"}
+    if not ref_cues.get("button_presence", False):
+        return {"status": "PASS", "score": 0, "threshold": 0, "details": "Reference specifies no visible buttons"}
+
+    ref_btn_lab = ref_cues.get("button_lab")
+    c_chin_y = int(cand_box[3])
+    c_fh = float(cand_box[3] - cand_box[1])
+    c_fw = float(cand_box[2] - cand_box[0])
+    c_mid_x = int((cand_box[0] + cand_box[2]) / 2)
+
+    half = max(12, int(0.10 * c_fw))
+    y1 = int(np.clip(c_chin_y + 0.15 * c_fh, 0, h - 1))
+    y2 = int(np.clip(c_chin_y + 0.95 * c_fh, y1 + 1, h))
+    x1 = int(np.clip(c_mid_x - half, 0, w - 1))
+    x2 = int(np.clip(c_mid_x + half, x1 + 1, w))
+    strip = cand_rgb[y1:y2, x1:x2]
+    if strip.size == 0:
+        return {"status": "UNCERTAIN", "score": 0, "threshold": 0, "details": "Empty placket strip"}
+
+    from pipelines.uniform_swap.reference_analyzer import measure_button_blobs
+
+    cand_btn_lab, blob_count = measure_button_blobs(
+        strip,
+        min_area=max(9.0, 0.00035 * c_fh * c_fw),
+        max_area=max(20.0, 0.020 * c_fh * c_fw),
+        blur_sigma=0.02 * c_fh,
+    )
+    if cand_btn_lab is None:
+        return {
+            "status": "UNCERTAIN", "score": blob_count, "threshold": 2,
+            "details": f"Only {blob_count} button-like blob(s) found on the placket; button colour not measurable",
+        }
+
+    if ref_btn_lab is None:
+        return {
+            "status": "UNCERTAIN", "score": blob_count, "threshold": 2,
+            "details": "Reference button colour was not measurable; candidate buttons not compared",
+        }
+
+    delta = _lab_delta(cand_btn_lab, ref_btn_lab)
+    # DeltaE76 ~40 separates a genuine colour swap (black vs white is >90) from
+    # the shading, white-balance and fabric-shadow spread of a correct button.
+    if delta is not None and delta > 40.0:
+        return {
+            "status": "FAIL", "score": round(delta, 1), "threshold": 40.0,
+            "details": f"button colour differs from reference (deltaE={delta:.1f} > 40.0 across {blob_count} buttons)",
+        }
+    return {
+        "status": "PASS", "score": round(delta, 1) if delta is not None else 0,
+        "threshold": 40.0,
+        "details": f"Button colour matches reference (deltaE={delta:.1f}, {blob_count} buttons)" if delta is not None else "Buttons verified",
+    }
+
+
+def _measure_collar_symmetry(
+    cand_rgb: np.ndarray,
+    ref_cues: Dict[str, Any],
+    c_chin_y: int,
+    c_fh: float,
+    c_fcx: float,
+    c_fw: float,
+    h: int,
+    w: int,
+) -> Dict[str, Any]:
+    """Compare left and right collar attachment about the facial axis.
+
+    Colour-agnostic: the collar colour comes from whatever the reference
+    analyzer measured in CIELAB, so pointed, rounded, Peter Pan, mandarin, polo
+    and open collars in any colour are handled the same way. Only runs when the
+    reference's collar is measurably distinct from its own body fabric,
+    otherwise the collar cannot be isolated from the shirt and the honest answer
+    is UNCERTAIN rather than a pass.
+
+    The search window stops at +-0.55 face widths so sleeve trim, cuffs and
+    shoulder piping - which share the collar's colour on many uniforms - stay
+    out of the measurement.
+    """
+    from pipelines.uniform_swap.reference_analyzer import _lab_delta
+
+    collar_lab = ref_cues.get("collar_lab")
+    if collar_lab is None or not ref_cues.get("collar_contrasts_body", False):
+        return {
+            "status": "UNCERTAIN", "score": 0.0, "threshold": 0.35,
+            "details": "Reference collar not separable from body fabric; symmetry not measured",
+        }
+
+    # The collar band sits around the chin line. Measured on REG_06, extending
+    # this window to +0.45 face heights swept in the chest-level red placket tab
+    # and the sleeve trim, which re-created the very bimodal-cluster error this
+    # check replaced. Keep it to the neck corridor.
+    y0 = int(np.clip(c_chin_y - 0.20 * c_fh, 0, h - 1))
+    y1 = int(np.clip(c_chin_y + 0.25 * c_fh, y0 + 1, h))
+    x0 = int(np.clip(c_fcx - 0.55 * c_fw, 0, w - 1))
+    x1 = int(np.clip(c_fcx + 0.55 * c_fw, x0 + 1, w))
+    zone = cand_rgb[y0:y1, x0:x1]
+    if zone.size == 0:
+        return {"status": "UNCERTAIN", "score": 0.0, "threshold": 0.35, "details": "Empty collar zone"}
+
+    zone_lab = cv2.cvtColor(zone, cv2.COLOR_RGB2LAB).astype(np.float32)
+    target = np.array(collar_lab, dtype=np.float32)
+    dist = np.linalg.norm(zone_lab - target[None, None, :], axis=2)
+    is_collar = dist < 28.0
+
+    axis_x = int(round(c_fcx)) - x0
+    left = is_collar[:, :max(0, axis_x)]
+    right = is_collar[:, max(0, axis_x):]
+    l_px, r_px = int(left.sum()), int(right.sum())
+    total = l_px + r_px
+    min_px = max(60, int(0.004 * c_fw * c_fh))
+    if total < min_px:
+        return {
+            "status": "UNCERTAIN", "score": total, "threshold": min_px,
+            "details": f"Too little collar-coloured area to measure symmetry ({total} px < {min_px} px)",
+        }
+
+    imbalance = abs(l_px - r_px) / float(total)
+    if imbalance > 0.60:
+        return {
+            "status": "FAIL", "score": round(imbalance, 3), "threshold": 0.60,
+            "details": f"Collar attaches asymmetrically about the facial axis (left={l_px} px, right={r_px} px, imbalance={imbalance:.3f} > 0.60)",
+        }
+    return {
+        "status": "PASS", "score": round(imbalance, 3), "threshold": 0.60,
+        "details": f"Collar symmetric about facial axis (left={l_px} px, right={r_px} px, imbalance={imbalance:.3f})",
+    }
+
+
+def _measure_shoulder_extent(
+    candidate_image: Any,
+    identity_layer: Optional[Dict[str, Any]],
+    cand_dist_bg: np.ndarray,
+    bg_tolerance: float,
+    c_chin_y: int,
+    c_fh: float,
+    c_fw: float,
+    has_face_box: bool,
+    h: int,
+    w: int,
+) -> Tuple[int, int, str]:
+    """Measure shoulder width and the width a complete shoulder line requires.
+
+    Returns ``(measured_px, required_px, basis)``.
+
+    Anatomy-relative rather than canvas-relative: the shoulder line is taken at
+    roughly one face-height below the chin (clamped into the canvas), and the
+    requirement is expressed as a multiple of the measured face width. A child
+    with narrow shoulders and an adult with broad shoulders both have a shoulder
+    span of about 2.2-3.0 face widths, whereas a fixed 0.35 * canvas_width
+    requirement changes meaning with every output size and every crop tightness.
+    Without a face box there is nothing to scale against, so it falls back to the
+    old canvas fraction.
+    """
+    fg, basis = _candidate_foreground_mask(candidate_image, identity_layer, cand_dist_bg, bg_tolerance)
+    if fg is None:
+        return 0, 0, "unavailable"
+
+    # Alpha alone is not enough either: a candidate whose shoulders have been
+    # painted out in RGB can still carry a stale full-body alpha, and that is
+    # exactly how the shoulder defect injection in scripts/verify_quality_gates.py
+    # behaves. Combine them, but with a TIGHT colour tolerance rather than the
+    # default 30. Measured at y=0.85h: erased shoulders are flat backdrop and
+    # give 159 px at every tolerance, while REG_05's genuine white shirt gives
+    # 796 px at tol>4 and only 70 px at tol>30. Real fabric is never exactly
+    # the backdrop value; an erased region is.
+    if cand_dist_bg is not None and basis != "background_colour_distance":
+        fg = fg & (cand_dist_bg > 4.0)
+        basis = f"{basis}+tight_colour"
+
+    if has_face_box and c_fh > 1.0 and c_fw > 1.0:
+        y_shoulder = int(np.clip(c_chin_y + 0.95 * c_fh, 0, h - 1))
+        # 1.6 face widths is deliberately permissive: it separates a genuinely
+        # clipped/floating torso from a narrow but complete child's shoulder
+        # line, which is what this gate is for.
+        required = int(min(w * 0.90, 1.6 * c_fw))
+    else:
+        y_shoulder = int(h * 0.85)
+        required = int(w * 0.35)
+
+    # Take the widest row in a short band so a single ragged alpha row, or a
+    # row that happens to fall in the gap under the chin, does not decide it.
+    y0 = int(np.clip(y_shoulder - 0.05 * h, 0, h - 1))
+    y1 = int(np.clip(y_shoulder + 0.05 * h, y0 + 1, h))
+    band = fg[y0:y1, :]
+    measured = int(band.sum(axis=1).max()) if band.size else 0
+
+    if basis == "background_colour_distance":
+        # Colour distance under-reports garments close to the backdrop colour, so
+        # only a near-total absence of subject is treated as a real defect here.
+        required = int(required * 0.5)
+
+    return measured, required, basis
+
+
 class QualityCheckFailure(RuntimeError):
     """Raised when an unrecoverable visual or biometric defect is detected."""
     pass
@@ -615,24 +852,20 @@ class QualityValidator:
             expected_btn = cues.get("button_color", "matching")
             ref_type = cues.get("ref_type", "generic_uniform")
 
-        if expected_btn == "black" and cand_box is not None:
-            c_chin_y = int(cand_box[3])
-            c_fh = float(cand_box[3] - cand_box[1])
-            c_mid_x = int((cand_box[0] + cand_box[2]) / 2)
-            placket_y1 = min(h, int(c_chin_y + 0.15 * c_fh))
-            placket_y2 = min(h, int(c_chin_y + 0.85 * c_fh))
-            placket_box = cand_rgb[placket_y1:placket_y2, max(0, c_mid_x - 30):min(w, c_mid_x + 30)]
-
-            dark_button_px = int(np.sum((placket_box[:, :, 0] < 55) & (placket_box[:, :, 1] < 55) & (placket_box[:, :, 2] < 55)))
-            white_button_px = int(np.sum((placket_box[:, :, 0] > 195) & (placket_box[:, :, 1] > 195) & (placket_box[:, :, 2] > 195)))
-
-            if dark_button_px < 20 and white_button_px > 1500:
-                checks["button_color"] = {"status": "FAIL", "score": white_button_px, "threshold": 1500, "details": "Uniform buttons are incorrectly white instead of black"}
-                defects.append("incorrect_button_color (white buttons generated instead of black)")
-            else:
-                checks["button_color"] = {"status": "PASS", "score": dark_button_px, "threshold": 20, "details": "Correct black/dark tailored buttons"}
-        else:
-            checks["button_color"] = {"status": "PASS", "score": 0, "threshold": 0, "details": f"Matching/dynamic buttons for {ref_type}"}
+        # V13.3.1: this previously counted PIXELS brighter than 195 inside a
+        # 60 px-wide strip and called >1500 of them "white buttons". Measured on
+        # REG_06 that strip held 4856 such pixels - all of them the white squares
+        # of REF001's gingham CHECK FABRIC, with zero buttons involved - so a
+        # correct candidate was gated. Fabric is not a button. Buttons are small
+        # compact blobs in a vertical run, so detect blobs and compare the blob
+        # colour in CIELAB against whatever colour the reference's buttons
+        # actually are. Nothing here forces black.
+        btn = _measure_button_fidelity(cand_rgb, cues if 'cues' in locals() and isinstance(cues, dict) else {}, cand_box, h, w)
+        checks["button_color"] = btn
+        if btn["status"] == "FAIL":
+            defects.append(f"incorrect_button_color ({btn['details']})")
+        elif btn["status"] == "UNCERTAIN":
+            warnings.append(f"button_fidelity_uncertain ({btn['details']})")
 
         # 8. Uniform Pattern Consistency Check (Plaid)
         if cand_box is not None:
@@ -1165,14 +1398,30 @@ class QualityValidator:
             checks["rectangular_garment_boundary"] = {"status": "PASS", "score": 0, "threshold": 0, "details": "Natural anatomical shoulder contour"}
 
         # 6. incomplete_shoulders
-        y_shoulder = int(h * 0.85)
-        shoulder_fg = int(np.sum(cand_dist_bg[y_shoulder, :] > bg_tolerance))
-        min_shoulder_w = int(w * 0.35)
+        # V13.3.1: this used to measure "distance from the background COLOUR" at a
+        # fixed y = 0.85h. Measured on REG_05 (white shirt, white backdrop): the
+        # subject's shoulders span the full 800 px canvas, but only 70 px differ
+        # from white, so the gate reported "70 px < 280 px" and gated a perfectly
+        # good portrait. Any garment close to the chosen backdrop colour hit this.
+        # Shoulder EXTENT is an alpha question, not a colour question - gate 7
+        # below already reasons that way, so this now agrees with it.
+        shoulder_fg, min_shoulder_w, shoulder_basis = _measure_shoulder_extent(
+            candidate_image=candidate_image,
+            identity_layer=identity_layer,
+            cand_dist_bg=cand_dist_bg,
+            bg_tolerance=bg_tolerance,
+            c_chin_y=c_chin_y,
+            c_fh=c_fh,
+            c_fw=c_fw,
+            has_face_box=(cand_box is not None),
+            h=h,
+            w=w,
+        )
         if shoulder_fg < min_shoulder_w:
-            checks["incomplete_shoulders"] = {"status": "FAIL", "score": shoulder_fg, "threshold": min_shoulder_w, "details": f"Shoulder width {shoulder_fg} px < {min_shoulder_w} px"}
+            checks["incomplete_shoulders"] = {"status": "FAIL", "score": shoulder_fg, "threshold": min_shoulder_w, "details": f"Shoulder width {shoulder_fg} px < {min_shoulder_w} px (measured on {shoulder_basis})"}
             defects.append("incomplete_shoulders")
         else:
-            checks["incomplete_shoulders"] = {"status": "PASS", "score": shoulder_fg, "threshold": min_shoulder_w, "details": f"Complete natural shoulders ({shoulder_fg} px)"}
+            checks["incomplete_shoulders"] = {"status": "PASS", "score": shoulder_fg, "threshold": min_shoulder_w, "details": f"Complete natural shoulders ({shoulder_fg} px, measured on {shoulder_basis})"}
 
         # 7. foreground_alpha_hole
         # Evaluate using true person alpha mask when available to prevent white shirt checks triggering as holes
@@ -1406,22 +1655,25 @@ class QualityValidator:
                     has_collar_reg_failure = True
                     collar_reg_details = "No garment collar detected below chin (collar registration displaced/missing)"
             
-            # Check collar center alignment if red collar
+            # Collar symmetry about the facial axis, for ANY collar colour.
+            #
+            # V13.3.1: this used to run only for red collars, and took the
+            # centroid of every red pixel in a window half a face-width to each
+            # side of the face axis. Measured on REG_06 (REF001, which has red
+            # collar AND red sleeve cuffs), the red histogram across that window
+            # was bimodal: ~370 px of collar near the axis and ~2000 px of
+            # SLEEVE CUFF at the right edge. The centroid landed between the two
+            # clusters, reporting offset=0.320 and gating a correctly registered
+            # collar. Sleeves are not collars; measure each side's collar
+            # attachment separately inside the neck corridor and compare them.
             ref_cues_local = cues if 'cues' in locals() and isinstance(cues, dict) else {}
-            if ref_cues_local.get("has_red_collar") or ref_cues_local.get("ref_type") == "red_collar":
-                neck_zone = cand_rgb[c_chin_y:min(h, c_chin_y + int(0.40 * c_fh)), max(0, int(c_fcx - 0.50 * c_fw)):min(w, int(c_fcx + 0.50 * c_fw))]
-                if neck_zone.size > 0:
-                    nz_r = neck_zone[:, :, 0].astype(int)
-                    nz_g = neck_zone[:, :, 1].astype(int)
-                    nz_b = neck_zone[:, :, 2].astype(int)
-                    is_red_col = (nz_r > 120) & (nz_g < 85) & (nz_b < 85) & ((nz_r - nz_g) > 40)
-                    if np.sum(is_red_col) > 100:
-                        nz_ys, nz_xs = np.where(is_red_col)
-                        col_cx = max(0, int(c_fcx - 0.50 * c_fw)) + float(np.mean(nz_xs))
-                        center_offset = abs(col_cx - c_fcx) / c_fw
-                        if center_offset > 0.16:
-                            has_collar_reg_failure = True
-                            collar_reg_details = f"Collar center offset horizontally from facial axis (offset={center_offset:.3f} > 0.16)"
+            sym = _measure_collar_symmetry(cand_rgb, ref_cues_local, c_chin_y, c_fh, c_fcx, c_fw, h, w)
+            if sym["status"] == "FAIL":
+                has_collar_reg_failure = True
+                collar_reg_details = sym["details"]
+            elif sym["status"] == "UNCERTAIN":
+                warnings.append(f"collar_symmetry_uncertain ({sym['details']})")
+            checks["collar_symmetry"] = sym
 
         if has_collar_reg_failure:
             checks["collar_registration_failure"] = {"status": "FAIL", "score": round(geometry_rmse, 4), "threshold": 0.040, "details": collar_reg_details}

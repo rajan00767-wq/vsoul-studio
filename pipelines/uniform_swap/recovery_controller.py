@@ -29,6 +29,42 @@ from pipelines.uniform_swap.config import UniformSwapConfig
 logger = logging.getLogger(__name__)
 
 
+def _contour_hull(values: np.ndarray) -> np.ndarray:
+    """Lower convex hull of a 1-D edge profile, sampled at every index.
+
+    Used to recover the shoulder contour a clipped silhouette should have had:
+    points sitting above the hull are the clipped stretch, and the hull itself
+    supplies the slope to restore them to.
+    """
+    n = len(values)
+    if n < 3:
+        return values.astype(np.float32).copy()
+    stack: List[int] = []
+    for i in range(n):
+        while len(stack) >= 2:
+            a, b = stack[-2], stack[-1]
+            # Drop b when it lies on or above the line a-i (not a hull vertex).
+            cross = (b - a) * (values[i] - values[a]) - (i - a) * (values[b] - values[a])
+            if cross <= 0:
+                stack.pop()
+            else:
+                break
+        stack.append(i)
+    xs = np.asarray(stack, dtype=np.float32)
+    return np.interp(np.arange(n, dtype=np.float32), xs, values[stack]).astype(np.float32)
+
+
+def _defect_key(defect: str) -> str:
+    """Defect identity without its measured numbers.
+
+    Defect strings carry their measurements, e.g.
+    ``"missing_crown_bow_1 (559 px < 1524)"``. Comparing raw strings would treat
+    the same defect at a slightly different measurement as a brand-new one, so
+    rollback detection compares only the part before the parenthesis.
+    """
+    return str(defect).split("(")[0].strip()
+
+
 class RecoveryController:
     """Manages targeted, defect-specific automatic recovery attempts."""
 
@@ -132,6 +168,20 @@ class RecoveryController:
                 attempt, best_defect_count, new_defect_count, ", ".join(new_defects)
             )
 
+            # V13.3.1: a repair that removes two defects while introducing a new
+            # one still reduces the count, so a count comparison alone can let a
+            # repair ship a defect the candidate did not have before. Reject any
+            # attempt that introduces a defect type that was not already present,
+            # and roll back to the previous best.
+            introduced = [d for d in new_defects if _defect_key(d) not in {_defect_key(x) for x in current_defects}]
+            if introduced:
+                logger.info(
+                    "[RECOVERY_CONTROLLER] Attempt %d introduced new defect(s) %s - rolling back.",
+                    attempt, introduced,
+                )
+                actions_taken.append(f"attempt_{attempt}_rolled_back_introduced_{len(introduced)}_new_defects")
+                continue
+
             # Accept if strictly improved
             if new_defect_count < best_defect_count or (new_defect_count == 0 and best_defect_count > 0):
                 best_rgba = repaired_rgba_pil
@@ -161,35 +211,124 @@ class RecoveryController:
         w: int,
         h: int,
     ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """Extend garment laterally to ensure natural shoulder coverage down to torso boundary."""
+        """Reconstruct a clipped shoulder line along its own anatomical slope.
+
+        V13.3.1: the previous implementation pushed every torso row out to fixed
+        canvas fractions (0.12 w and 0.88 w). That is the naive rectangular
+        expansion the spec rules out: it squares off the silhouette, ignores the
+        subject's build and shoulder slope, and on a rotated portrait widens the
+        two sides by different amounts in the wrong places.
+
+        Instead, the existing shoulder contour is measured where it is intact,
+        a straight slope is fitted to each side independently, and only rows
+        that fall short of their OWN extrapolated contour are filled - so the
+        natural slope, the subject's width and an asymmetric pose all survive.
+        Reconstruction is capped; beyond that the honest answer is that this
+        cannot be repaired without visible distortion, and the caller gates it.
+        """
         actions: List[str] = []
-        chin_y = int(identity_layer.get("metrics", {}).get("chin_y", h * 0.45))
-        fh = float(identity_layer.get("metrics", {}).get("face_height", h * 0.35))
-        torso_y = int(chin_y + 0.25 * fh)
+        metrics = identity_layer.get("metrics", {}) or {}
+        chin_y = int(metrics.get("chin_y", h * 0.45))
+        fh = float(metrics.get("face_height", h * 0.35))
+        torso_y = int(np.clip(chin_y + 0.25 * fh, 0, h - 1))
+        if torso_y >= h - 4:
+            return rgb, alpha, actions
 
-        expanded_px = 0
-        fill_mask = np.zeros((h, w), dtype=bool)
-
+        rows, lefts, rights = [], [], []
         for y in range(torso_y, h):
-            row_alpha = alpha[y, :]
-            fg_xs = np.where(row_alpha > 30)[0]
-            if len(fg_xs) > 20:
-                l_x, r_x = int(fg_xs.min()), int(fg_xs.max())
-                target_l = max(0, min(l_x, int(w * 0.12)))
-                target_r = min(w, max(r_x, int(w * 0.88)))
-                if target_l < l_x:
-                    fill_mask[y, target_l:l_x] = True
-                    alpha[y, target_l:l_x] = 255
-                    expanded_px += (l_x - target_l)
-                if target_r > r_x:
-                    fill_mask[y, r_x:target_r] = True
-                    alpha[y, r_x:target_r] = 255
-                    expanded_px += (target_r - r_x)
+            xs = np.where(alpha[y, :] > 30)[0]
+            if len(xs) > 20:
+                rows.append(y)
+                lefts.append(int(xs.min()))
+                rights.append(int(xs.max()))
+        if len(rows) < 12:
+            return rgb, alpha, actions
 
-        if expanded_px > 0:
-            rgb = cv2.inpaint(rgb, fill_mask.astype(np.uint8), inpaintRadius=11, flags=cv2.INPAINT_TELEA)
-            actions.append(f"extended_shoulders_laterally ({expanded_px} px)")
+        lefts_a = np.asarray(lefts, dtype=np.float32)
+        rights_a = np.asarray(rights, dtype=np.float32)
+        # Anatomical centre, not the silhouette's own midpoint: when one side is
+        # missing, the midpoint of what remains slides towards the surviving
+        # side and the two reaches come out equal, hiding the very asymmetry
+        # this is looking for.
+        centre = float(metrics.get("face_center_x", w * 0.5))
 
+        # Gross one-sided loss: a whole missing side has no intact neighbouring
+        # rows to extrapolate from, and inventing one would be fabrication, not
+        # reconstruction. Decline, so the caller gates the case for review.
+        reach_l = float(np.median(centre - lefts_a))
+        reach_r = float(np.median(rights_a - centre))
+        if max(reach_l, reach_r) > 1e-3:
+            asym = abs(reach_l - reach_r) / max(reach_l, reach_r)
+            if asym > 0.45:
+                logger.info(
+                    "[RECOVERY_CONTROLLER] Shoulder reach asymmetry %.2f (left=%.0f px, right=%.0f px) "
+                    "exceeds 0.45; declining reconstruction to avoid inventing a shoulder.",
+                    asym, reach_l, reach_r,
+                )
+                actions.append(
+                    f"declined_shoulder_reconstruction_too_large (reach asymmetry {asym:.2f})")
+                return rgb, alpha, actions
+
+        fill_mask = np.zeros((h, w), dtype=bool)
+        filled_px = 0
+        # Within the torso band a shoulder contour only ever widens or holds as
+        # it descends - it never narrows. So a row is clipped exactly when its
+        # edge sits INSIDE a row above it, and the contour it should reach is
+        # the running extreme from the top down.
+        #
+        # This replaces both the original fixed-canvas expansion and a
+        # straight-line fit: a line through a contour that widens and then
+        # plateaus predicts an ever-widening body and "repairs" an intact
+        # silhouette, and a symmetric local window flags every row of a
+        # normally widening shoulder because the rows below it are wider.
+        tol = max(3.0, 0.01 * w)
+        for side, edges, sign in (("left", lefts_a, 1.0), ("right", rights_a, -1.0)):
+            # The outer shoulder contour is convex: it widens as it descends and
+            # then flattens, never narrows and widens again. The taut line under
+            # that curve - its convex hull - is therefore the contour the
+            # silhouette should have, and a clipped run is exactly the stretch
+            # that bulges INSIDE that line.
+            #
+            # A running extreme cannot do this job: for a left edge that
+            # decreases monotonically with y, the running minimum always equals
+            # the current value, so it reports no deficit no matter how much has
+            # been cut away.
+            hull = _contour_hull(edges * sign)
+            target_all = hull * sign
+            for i, y in enumerate(rows):
+                target_f = float(target_all[i])
+                if (edges[i] - target_f) * sign <= tol:
+                    continue
+                target = int(np.clip(round(target_f), 0, w - 1))
+                actual = int(edges[i])
+                lo, hi = (target, actual) if side == "left" else (actual + 1, target + 1)
+                lo, hi = max(0, lo), min(w, hi)
+                if hi <= lo:
+                    continue
+                fill_mask[y, lo:hi] = True
+                alpha[y, lo:hi] = 255
+                filled_px += (hi - lo)
+
+        if filled_px == 0:
+            return rgb, alpha, actions
+
+        # Cap: reconstructing a large fraction of the torso is not a localized
+        # repair any more, and inpainting it produces duplicated fabric and
+        # visible seams. Leave it to the caller to gate for review.
+        torso_area = max(1, int(np.count_nonzero(alpha[torso_y:, :] > 30)))
+        if filled_px > 0.18 * torso_area:
+            logger.info(
+                "[RECOVERY_CONTROLLER] Shoulder deficit %d px exceeds 18%% of torso (%d px); "
+                "declining reconstruction to avoid visible distortion.", filled_px, torso_area,
+            )
+            alpha[fill_mask] = 0
+            actions.append(f"declined_shoulder_reconstruction_too_large ({filled_px} px)")
+            return rgb, alpha, actions
+
+        # Inpaint from the surrounding garment so fabric scale and sleeve
+        # geometry follow the existing cloth rather than being stretched.
+        rgb = cv2.inpaint(rgb, fill_mask.astype(np.uint8), inpaintRadius=11, flags=cv2.INPAINT_TELEA)
+        actions.append(f"reconstructed_shoulder_contour_along_fitted_slope ({filled_px} px)")
         return rgb, alpha, actions
 
     def _repair_neck_lighting_and_seam(

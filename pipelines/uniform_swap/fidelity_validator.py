@@ -91,7 +91,34 @@ class UniformFidelityValidator:
         collar_zone = garment_mask & (np.arange(h)[:, None] >= (chin_y - int(0.05 * fh))) & (np.arange(h)[:, None] <= (chin_y + int(0.35 * fh))) & (np.abs(np.arange(w)[None, :] - fcx) <= int(fw * 0.9))
         collar_px = max(1, int(np.sum(collar_zone)))
 
-        if expected_collar_col == "red" or reference_spec.get("has_red_collar"):
+        # V13.3.1: collar colour is compared in CIELAB against the colour the
+        # reference analyzer MEASURED, for any colour at all.
+        #
+        # Before this, only the literal strings "red" and "navy blue" were
+        # checked, each against its own hand-tuned RGB/HSV window, and every
+        # other collar - green, maroon, grey, yellow, a check collar, anything
+        # a school actually issues - fell through to an `else` that recorded
+        # {"status": "PASS", "score": 1, "threshold": 1} without measuring a
+        # single pixel. That unmeasured pass is why "universal uniform support"
+        # could be claimed while only two colours were ever verified.
+        collar_lab = reference_spec.get("collar_lab")
+        if collar_lab is not None and np.any(collar_zone):
+            zone_lab = cv2.cvtColor(candidate_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)[collar_zone]
+            target = np.array(collar_lab, dtype=np.float32)
+            dists = np.linalg.norm(zone_lab - target[None, :], axis=1)
+            # DeltaE76 <= 28 tolerates fabric shading, studio white balance and
+            # JPEG colour drift while still separating one garment colour from
+            # another.
+            matching_px = int(np.sum(dists < 28.0))
+            frac = matching_px / float(max(1, collar_px))
+            if matching_px < 60 or frac < 0.06:
+                defects.append(f"incorrect_collar_color (reference collar colour absent; {matching_px} px within deltaE 28)")
+                checks["collar_color"] = {"status": "FAIL", "score": matching_px, "threshold": 60,
+                                          "details": f"Reference collar colour absent ({matching_px} px, {frac:.3f} of collar zone)"}
+            else:
+                checks["collar_color"] = {"status": "PASS", "score": matching_px, "threshold": 60,
+                                          "details": f"Collar matches reference colour ({matching_px} px, {frac:.3f} of collar zone)"}
+        elif expected_collar_col == "red" or reference_spec.get("has_red_collar"):
             cr = candidate_rgb[collar_zone, 0].astype(int)
             cg = candidate_rgb[collar_zone, 1].astype(int)
             cb = candidate_rgb[collar_zone, 2].astype(int)
@@ -112,7 +139,11 @@ class UniformFidelityValidator:
             else:
                 checks["collar_color"] = {"status": "PASS", "score": navy_collar_px, "threshold": 60, "details": "Authentic navy collar detected"}
         else:
-            checks["collar_color"] = {"status": "PASS", "score": 1, "threshold": 1, "details": f"Collar color verified for {expected_ref_type}"}
+            # No measured reference colour and no legacy branch applies. An
+            # unmeasurable attribute is reported as UNCERTAIN, never as a pass.
+            checks["collar_color"] = {"status": "UNCERTAIN", "score": 0, "threshold": 0,
+                                      "details": f"Collar colour not measurable for {expected_ref_type}; not verified"}
+            warnings.append("collar_color_uncertain (reference collar colour was not measurable)")
 
         # ── 2. Necktie Check ──
         if has_tie:
@@ -153,8 +184,22 @@ class UniformFidelityValidator:
             checks["vest_fidelity"] = {"status": "PASS", "score": 0, "threshold": 0, "details": "No vest expected"}
 
         # ── 4. Button Color Check ──
+        # V13.3.1: prefer the measured CIELAB button colour and the shared blob
+        # detector, so buttons of any colour are compared on equal terms. The
+        # literal "black" branch below remains only as a fallback for specs
+        # produced before button_lab existed.
         expected_btn_col = reference_spec.get("button_color", "matching")
-        if expected_btn_col == "black":
+        if reference_spec.get("button_lab") is not None and face_bbox is not None:
+            from pipelines.uniform_swap.quality_validator import _measure_button_fidelity
+            spec = dict(reference_spec)
+            spec.setdefault("button_presence", True)
+            btn_res = _measure_button_fidelity(candidate_rgb, spec, list(face_bbox), h, w)
+            checks["button_fidelity"] = btn_res
+            if btn_res["status"] == "FAIL":
+                defects.append(f"incorrect_button_color ({btn_res['details']})")
+            elif btn_res["status"] == "UNCERTAIN":
+                warnings.append(f"button_fidelity_uncertain ({btn_res['details']})")
+        elif expected_btn_col == "black":
             placket_strip = garment_mask & (np.arange(h)[:, None] >= (chin_y + int(0.20 * fh))) & (np.arange(h)[:, None] <= (chin_y + int(0.80 * fh))) & (np.abs(np.arange(w)[None, :] - fcx) <= int(fw * 0.12))
             p_r = candidate_rgb[placket_strip, 0]
             p_g = candidate_rgb[placket_strip, 1]

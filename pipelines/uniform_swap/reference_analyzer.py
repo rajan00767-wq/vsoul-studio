@@ -48,6 +48,186 @@ def _compute_image_sha256(image_input: Union[str, Path, Image.Image, np.ndarray]
     return hashlib.sha256(str(image_input).encode("utf-8")).hexdigest()
 
 
+def _dominant_lab(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    k: int = 3,
+    max_samples: int = 4000,
+) -> Optional[List[float]]:
+    """Dominant CIELAB colour of ``mask``, robust to patterned fabric.
+
+    A mean is useless on a check or striped garment - averaging red trim over a
+    blue/white gingham yields a colour present nowhere in the image. k-means over
+    a sample of the region and taking the largest cluster returns a colour the
+    fabric actually has. Returns None when the region is too small to decide,
+    which callers must surface as UNCERTAIN rather than as a pass.
+    """
+    if mask is None or not np.any(mask):
+        return None
+    px = rgb[mask].astype(np.uint8)
+    if len(px) < 40:
+        return None
+    if len(px) > max_samples:
+        idx = np.random.default_rng(0).choice(len(px), max_samples, replace=False)
+        px = px[idx]
+    lab = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    k_eff = int(min(k, max(1, len(lab) // 20)))
+    if k_eff <= 1:
+        return [float(v) for v in np.median(lab, axis=0)]
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(lab, k_eff, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    counts = np.bincount(labels.flatten(), minlength=k_eff)
+    return [float(v) for v in centers[int(np.argmax(counts))]]
+
+
+def _distinctive_lab(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    reference_lab: Optional[List[float]],
+    k: int = 4,
+    min_fraction: float = 0.10,
+    max_samples: int = 4000,
+) -> Optional[List[float]]:
+    """Colour of ``mask`` that most distinguishes it from ``reference_lab``.
+
+    The collar band of a garment photo contains the collar AND the shoulders of
+    the shirt body around it. The *dominant* colour of that band is therefore
+    usually just the body fabric: on REF001 the band's dominant cluster is the
+    light-blue gingham, not the red Peter Pan collar that actually defines the
+    design. This picks the cluster furthest from the body colour that still
+    covers at least ``min_fraction`` of the band, so trim is not lost to the
+    fabric it sits on, while a collar genuinely made of the body fabric still
+    resolves to that fabric.
+    """
+    if reference_lab is None:
+        return _dominant_lab(rgb, mask, k=k, max_samples=max_samples)
+    if mask is None or not np.any(mask):
+        return None
+    px = rgb[mask].astype(np.uint8)
+    if len(px) < 40:
+        return None
+    if len(px) > max_samples:
+        idx = np.random.default_rng(0).choice(len(px), max_samples, replace=False)
+        px = px[idx]
+    lab = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    k_eff = int(min(k, max(1, len(lab) // 20)))
+    if k_eff <= 1:
+        return [float(v) for v in np.median(lab, axis=0)]
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(lab, k_eff, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    counts = np.bincount(labels.flatten(), minlength=k_eff)
+    ref = np.array(reference_lab, dtype=np.float32)
+    best, best_d = None, -1.0
+    for i in range(k_eff):
+        if counts[i] / float(len(lab)) < min_fraction:
+            continue
+        d = float(np.linalg.norm(centers[i] - ref))
+        if d > best_d:
+            best, best_d = centers[i], d
+    if best is None:
+        return _dominant_lab(rgb, mask, k=k, max_samples=max_samples)
+    return [float(v) for v in best]
+
+
+def measure_button_blobs(
+    strip_rgb: np.ndarray,
+    min_area: float,
+    max_area: float,
+    blur_sigma: float,
+) -> Tuple[Optional[List[float]], int]:
+    """Measure the CIELAB colour of the buttons in a placket strip.
+
+    Shared by the reference analyzer and the candidate validator so both sides
+    measure buttons the same way.
+
+    Buttons are picked out by SIZE and SOLIDITY along the placket centreline.
+    The pattern of a check fabric also produces round, locally contrasting
+    blobs - on REF001 the gingham grid intersections gave 21 of them - but
+    those are small and sit all across the strip, whereas a button is one of
+    the largest compact components on the centreline. Selecting the largest
+    well-filled blobs and taking the colour they agree on gets the button
+    rather than the cloth it is sewn to.
+
+    Returns ``(lab, count)``; lab is None whenever fewer than two buttons can be
+    isolated, which callers must report as UNCERTAIN rather than as a pass.
+    """
+    if strip_rgb.size == 0 or strip_rgb.shape[0] < 8 or strip_rgb.shape[1] < 4:
+        return None, 0
+
+    # Buttons are the pixels that depart furthest from the cloth, so threshold
+    # on CIELAB distance from the strip's median colour. An Otsu threshold over
+    # a local-contrast image does not work here: on a gingham placket the grid
+    # lines carry more total local contrast than the buttons, so the largest
+    # components it returns are cloth, and the measured "button colour" comes
+    # back as the fabric. Measured on PA_12, that reported white buttons for a
+    # placket whose buttons are plainly dark navy.
+    strip_lab = cv2.cvtColor(strip_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    cloth = np.median(strip_lab.reshape(-1, 3), axis=0)
+    dev = np.linalg.norm(strip_lab - cloth[None, None, :], axis=2)
+    thresh = max(20.0, float(np.percentile(dev, 92)))
+    binary = (dev >= thresh).astype(np.uint8) * 255
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    strip_w = strip_rgb.shape[1]
+    cands: List[Tuple[np.ndarray, float]] = []
+    for i in range(1, n):
+        area = float(stats[i, cv2.CC_STAT_AREA])
+        bw, bh = float(stats[i, cv2.CC_STAT_WIDTH]), float(stats[i, cv2.CC_STAT_HEIGHT])
+        if not (min_area <= area <= max_area) or bw < 2 or bh < 2:
+            continue
+        if not (0.45 <= bw / bh <= 2.2):
+            continue
+        # Buttons sit ON the placket centreline. The strip is wider than the
+        # placket on most garments, so without this the check fabric either
+        # side of a navy placket supplies "blobs" that outvote the buttons.
+        cx = float(stats[i, cv2.CC_STAT_LEFT]) + bw * 0.5
+        if abs(cx - strip_w * 0.5) > strip_w * 0.25:
+            continue
+        if area / (bw * bh) < 0.40:
+            continue  # a button is a filled disc, not a thin pattern fragment
+        # Sample the blob's INTERIOR, not the component itself. The local
+        # contrast image responds at the button's rim, so averaging the
+        # component returns the rim - a blend of button and surrounding cloth.
+        # Measured on the clean baseline, two genuinely black buttons came back
+        # as (119,109,134) and (136,137,167) that way, i.e. not black at all.
+        bx, by = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        ix0, iy0 = bx + int(bw * 0.3), by + int(bh * 0.3)
+        ix1, iy1 = bx + int(np.ceil(bw * 0.7)), by + int(np.ceil(bh * 0.7))
+        core = strip_lab[max(0, iy0):max(iy0 + 1, iy1), max(0, ix0):max(ix0 + 1, ix1)]
+        if core.size == 0:
+            continue
+        cands.append((np.median(core.reshape(-1, 3), axis=0), area))
+
+    if len(cands) < 2:
+        return None, len(cands)
+
+    # Keep the largest blobs, then the colour they agree on. Pattern fragments
+    # that survive the size and solidity filters disagree with each other and
+    # with the buttons, so they drop out of the agreeing group.
+    cands.sort(key=lambda c: -c[1])
+    top = cands[:max(2, min(6, len(cands)))]
+    labs = [c[0] for c in top]
+    best_group: List[np.ndarray] = []
+    for anchor in labs:
+        group = [l for l in labs if float(np.linalg.norm(l - anchor)) < 30.0]
+        if len(group) > len(best_group):
+            best_group = group
+    if len(best_group) < 2:
+        return None, len(best_group)
+    final = np.median(np.stack(best_group), axis=0)
+    return [float(v) for v in final], len(best_group)
+
+
+def _lab_delta(a: Optional[List[float]], b: Optional[List[float]]) -> Optional[float]:
+    """Euclidean CIELAB distance (DeltaE76), or None when either side is unknown."""
+    if a is None or b is None:
+        return None
+    return float(np.linalg.norm(np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)))
+
+
 class UniformReferenceAnalyzer:
     """Reusable, dynamic uniform reference analyzer with reference-hash caching."""
 
@@ -141,12 +321,17 @@ class UniformReferenceAnalyzer:
             "collar_shape": collar_info["collar_shape"],
             "collar_color": collar_info["color_name"],
             "collar_colour": collar_info["color_name"],
+            "collar_lab": collar_info.get("collar_lab"),
+            "body_lab": collar_info.get("body_lab"),
+            "collar_contrasts_body": collar_info.get("collar_contrasts_body", False),
             "collar_opening_geometry": collar_info["opening_geometry"],
             "sleeve_type": sleeve_info["sleeve_type"],
             "sleeve_border_color": sleeve_info["sleeve_border_color"],
             "button_presence": placket_info["has_buttons"],
             "button_color": placket_info["button_color"],
             "button_colour": placket_info["button_color"],
+            "button_lab": placket_info.get("button_lab"),
+            "button_blob_count": placket_info.get("button_blob_count", 0),
             "button_placement": placket_info["button_placement"],
             "button_spacing": placket_info["button_spacing"],
             "button_size": placket_info["button_size"],
@@ -417,11 +602,29 @@ class UniformReferenceAnalyzer:
         throat_mask = fg & (np.arange(h)[:, None] >= throat_y1) & (np.arange(h)[:, None] <= throat_y2)
         opening_geo = "natural open neckline" if np.sum(throat_mask) > 100 else "closed collar"
 
+        # V13.3.1: a measured CIELAB colour for the collar, so downstream
+        # validation can compare ANY collar colour by perceptual distance
+        # instead of branching on the literal strings "red" / "navy blue".
+        # The collar's own colour is whatever dominates the collar band once
+        # the shirt body colour is excluded, so this is taken as the dominant
+        # cluster of the band rather than its mean (a mean of red-on-check is
+        # a muddy pink that matches nothing).
+        body_mask = fg & (np.arange(h)[:, None] >= y_min + int(0.35 * gh)) & (np.arange(h)[:, None] <= y_min + int(0.75 * gh))
+        body_lab = _dominant_lab(rgb, body_mask)
+        collar_lab = _distinctive_lab(rgb, collar_mask, body_lab)
+        collar_contrasts_body = bool(
+            collar_lab is not None and body_lab is not None
+            and float(np.linalg.norm(np.array(collar_lab) - np.array(body_lab))) > 18.0
+        )
+
         return {
             "color_name": color_name,
             "collar_shape": collar_shape,
             "collar_type": collar_type,
             "opening_geometry": opening_geo,
+            "collar_lab": collar_lab,
+            "body_lab": body_lab,
+            "collar_contrasts_body": collar_contrasts_body,
             "red_fraction": float(red_frac),
             "navy_fraction": float(navy_frac),
             "white_fraction": float(white_frac),
@@ -486,12 +689,27 @@ class UniformReferenceAnalyzer:
         else:
             button_color = "matching"
 
+        # V13.3.1: measure the buttons' actual CIELAB colour as blobs, so the
+        # candidate can be compared against ANY button colour rather than only
+        # against the "black" / "white" labels above. Returns None when the
+        # buttons cannot be isolated, which downstream must report as UNCERTAIN.
+        button_lab, button_blob_count = measure_button_blobs(
+            rgb[max(0, p_y1):max(p_y1 + 1, p_y2), max(0, p_x1):max(p_x1 + 1, p_x2)],
+            min_area=max(9.0, 0.00008 * gh * gw),
+            max_area=max(20.0, 0.004 * gh * gw),
+            blur_sigma=0.01 * gh,
+        )
+        if button_lab is not None:
+            has_buttons = True
+
         return {
             "has_placket": True,
             "placket_color": placket_color,
             "placket_design": f"vertical {placket_color} front button placket" if placket_color != "matching" else "front button placket",
             "has_buttons": has_buttons,
             "button_color": button_color,
+            "button_lab": button_lab,
+            "button_blob_count": button_blob_count,
             "button_placement": "center vertical front",
             "button_spacing": "regular",
             "button_size": "standard_small",

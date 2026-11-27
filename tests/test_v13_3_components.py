@@ -81,23 +81,45 @@ class TestV133Components(unittest.TestCase):
         self.assertTrue(any("incorrect_collar_color" in d for d in res_red["defects"]))
 
     def test_03_recovery_controller_shoulder_repair(self):
-        """Verify RecoveryController expands narrowed shoulders without re-running diffusion."""
+        """Shoulder repair restores a clipped contour and leaves a valid one alone.
+
+        V13.3.1: this test previously asserted that a narrow but UNBROKEN
+        rectangular torso gets pushed out to fixed canvas fractions
+        (<= 0.22 w and >= 0.78 w). That is the naive rectangular expansion the
+        V13.3.1 specification prohibits - it squares off the silhouette and
+        overrides the subject's actual build, so a genuinely slight child would
+        be widened into someone else's shoulders. The repair is now driven by
+        the silhouette's own contour, so the contract asserted here changed.
+        """
         h, w = 1024, 800
         rgb = np.full((h, w, 3), 100, dtype=np.uint8)
-        alpha = np.zeros((h, w), dtype=np.uint8)
-        # Narrow shoulder alpha (stops at 30% and 70%)
-        alpha[450:950, int(w * 0.32):int(w * 0.68)] = 255
 
-        id_layer = {
-            "metrics": {"chin_y": 450, "face_height": 300},
-        }
-        rgb_rep, alpha_rep, acts = recovery_controller._repair_incomplete_shoulders(
-            rgb, alpha, id_layer, w, h
+        # 1. A narrow but intact torso is NOT widened.
+        intact = np.zeros((h, w), dtype=np.uint8)
+        intact[450:950, int(w * 0.32):int(w * 0.68)] = 255
+        id_layer = {"metrics": {"chin_y": 450, "face_height": 300, "face_center_x": w / 2.0}}
+        _, alpha_same, acts_same = recovery_controller._repair_incomplete_shoulders(
+            rgb.copy(), intact.copy(), id_layer, w, h
         )
-        # Alpha should now extend into left margin <= 0.22*w and right margin >= 0.78*w
-        self.assertTrue(np.any(alpha_rep[600:900, :int(w * 0.22)] > 0))
-        self.assertTrue(np.any(alpha_rep[600:900, int(w * 0.78):] > 0))
-        self.assertTrue(len(acts) > 0)
+        self.assertEqual(acts_same, [], "an intact narrow torso must not be stretched outwards")
+        self.assertEqual(int(np.abs(alpha_same.astype(int) - intact.astype(int)).sum()), 0)
+
+        # 2. A torso whose contour is cut mid-way IS reconstructed.
+        clipped = np.zeros((h, w), dtype=np.uint8)
+        for y in range(450, 950):
+            half = int(min(0.16 * w + (y - 450) * 0.35, 0.34 * w))
+            clipped[y, int(w / 2 - half):int(w / 2 + half)] = 255
+        cut_lo, cut_hi = 700, 820
+        xs = np.where(clipped[cut_lo] > 30)[0]
+        for y in range(cut_lo, cut_hi):
+            clipped[y, :xs.min()] = 0
+            clipped[y, xs.max() + 1:] = 0
+        _, alpha_rep, acts = recovery_controller._repair_incomplete_shoulders(
+            rgb.copy(), clipped.copy(), id_layer, w, h
+        )
+        self.assertTrue(any("reconstructed_shoulder_contour" in a for a in acts), acts)
+        widened = int((alpha_rep[cut_hi - 1] > 30).sum()) - int((clipped[cut_hi - 1] > 30).sum())
+        self.assertGreater(widened, 0, "the clipped rows must regain their contour")
 
 
 if __name__ == "__main__":
